@@ -530,6 +530,26 @@ def test_chunked_upload_splits_large_file(tmp_path):
     assert ends == [False] * (len(ends) - 1) + [True]
 
 
+def test_chunked_upload_honors_file_name_override(tmp_path):
+    """A passed `file_name` becomes the cloud file_name; the extension is still
+    derived from the on-disk path, independent of the renamed stem."""
+    path = tmp_path / "IMG_0042.cr3"
+    path.write_bytes(b"raw")
+
+    client = _FakeDataClient()
+    asyncio.run(
+        ColorCorrection._file_upload_chunked(
+            client, str(path),
+            part_id="p", component_name="cc", tags=None,
+            file_name="sku-front.cr3",
+        )
+    )
+
+    meta = client.sent[0][0].metadata
+    assert meta.file_name == "sku-front.cr3"
+    assert meta.file_extension == ".cr3"
+
+
 def test_chunked_upload_empty_file_sends_one_chunk(tmp_path):
     """An empty file still sends one (empty) FileData message, matching the
     SDK's behavior, so the stream is closed properly."""
@@ -558,14 +578,20 @@ def test_chunked_upload_empty_file_sends_one_chunk(tmp_path):
 
 
 def _uploader_component(tmp_path, monkeypatch, fail_paths=()):
-    """Component with upload wired to a fake cloud; uploads of `fail_paths` fail."""
+    """Component with upload wired to a fake cloud; uploads of `fail_paths` fail.
+
+    Each call records the (path, file_name) forwarded to the chunked uploader on
+    ``cc._uploaded_names`` so tests can assert how names were derived.
+    """
     cc = _component(_FakeSource(None), output_dir=str(tmp_path))
     cc._part_id = "part-1"
+    cc._uploaded_names = []
 
     async def fake_get_data_client():
         return _FakeDataClient()
 
     async def fake_upload_chunked(client, path, **kwargs):
+        cc._uploaded_names.append((path, kwargs.get("file_name")))
         if path in fail_paths:
             raise RuntimeError("simulated upload failure")
         return "fake-binary-id"
@@ -585,6 +611,41 @@ def test_upload_keeps_files_by_default(tmp_path, monkeypatch):
     assert out["uploaded"] == [str(path)]
     assert out["deleted"] == []
     assert path.exists()
+
+
+def test_upload_name_replaces_stem_without_collision(tmp_path, monkeypatch):
+    """An operator `name` replaces the capture stem on every file in the set,
+    keeping the full post-stem suffix - so the default config's `_16.png` and
+    `.png` siblings stay distinct rather than both collapsing to one name."""
+    names = ["IMG_0042.cr3", "IMG_0042_16.png", "IMG_0042.png", "IMG_0042.json"]
+    paths = []
+    for n in names:
+        p = tmp_path / n
+        p.write_bytes(b"x")
+        paths.append(str(p))
+    cc = _uploader_component(tmp_path, monkeypatch)
+
+    asyncio.run(cc._upload({"paths": paths, "name": "sku-front"}))
+
+    forwarded = {fn for _, fn in cc._uploaded_names}
+    assert forwarded == {
+        "sku-front.cr3",
+        "sku-front_16.png",
+        "sku-front.png",
+        "sku-front.json",
+    }
+
+
+def test_upload_without_name_forwards_none(tmp_path, monkeypatch):
+    """No `name` opt leaves the file_name to the chunked uploader's basename
+    fallback (forwarded as None), preserving today's behavior."""
+    path = tmp_path / "IMG_0042.cr3"
+    path.write_bytes(b"raw")
+    cc = _uploader_component(tmp_path, monkeypatch)
+
+    asyncio.run(cc._upload({"paths": [str(path)]}))
+
+    assert cc._uploaded_names == [(str(path), None)]
 
 
 def test_delete_after_upload_removes_only_successful(tmp_path, monkeypatch):

@@ -1644,6 +1644,12 @@ class ColorCorrection(Camera, EasyResource):
         ``opts``:
           ``paths``               list of file paths on disk to upload (required)
           ``tags``                tags to attach to every uploaded file (e.g. SKU)
+          ``name``                operator-chosen file name stem (no dir, no
+                                  extension) that replaces the camera capture
+                                  stem on every file in this set; each file keeps
+                                  its full post-stem suffix (``_16.png``,
+                                  ``.cr3``, ``.json``, ...). When absent, the
+                                  camera's on-disk basename is used.
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
@@ -1656,6 +1662,17 @@ class ColorCorrection(Camera, EasyResource):
         paths = [str(p) for p in raw_paths]
         tags = [str(t) for t in (opts.get("tags") or [])]
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
+
+        name = opts.get("name")
+        name = str(name) if name else None      # falsy/empty -> keep current behavior
+        # All paths in one upload call share the capture stem (e.g. "IMG_0042").
+        # commonprefix over splitext-stems lands cleanly on the bare stem even
+        # when _16 variants and a .json sidecar are mixed in - a basename-level
+        # commonprefix would land mid-token on extension-only sets.
+        capture_stem = (
+            os.path.commonprefix([os.path.splitext(os.path.basename(p))[0] for p in paths])
+            if name else None
+        )
 
         part_id = opts.get("part_id") or self._part_id
         if not part_id:
@@ -1678,6 +1695,10 @@ class ColorCorrection(Camera, EasyResource):
                     f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
                 )
                 t_upload = time.perf_counter()
+                file_name = (
+                    name + os.path.basename(path)[len(capture_stem):]
+                    if name else None
+                )
                 await asyncio.wait_for(
                     self._file_upload_chunked(
                         data_client,
@@ -1685,6 +1706,7 @@ class ColorCorrection(Camera, EasyResource):
                         part_id=str(part_id),
                         component_name=str(component_name),
                         tags=tags or None,
+                        file_name=file_name,
                     ),
                     timeout=self._upload_file_timeout_s,
                 )
@@ -1796,6 +1818,7 @@ class ColorCorrection(Camera, EasyResource):
         part_id: str,
         component_name: str,
         tags: Optional[List[str]],
+        file_name: Optional[str] = None,
     ) -> str:
         """
         Stream a file to Viam over the client-streaming FileUpload RPC in
@@ -1809,7 +1832,7 @@ class ColorCorrection(Camera, EasyResource):
             component_type="rdk:component:camera",
             component_name=component_name,
             type=DataType.DATA_TYPE_FILE,
-            file_name=os.path.basename(path),
+            file_name=file_name or os.path.basename(path),
             file_extension=os.path.splitext(path)[1],  # e.g. ".cr3", ".tif"
             tags=tags,
         )

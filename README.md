@@ -23,3 +23,26 @@ detects this and, on Debian/Ubuntu, auto-installs the system packages:
 
 On non-apt systems, install the LibRaw and glib equivalents for your OS
 (e.g. `brew install libraw` on macOS) and re-run.
+
+## Running the tests
+
+The unit tests live in `tests/` and import the module straight from `src/`
+(`tests/conftest.py` puts `src` on `sys.path`, mirroring `run.sh`). They need
+Python ≥3.10.
+
+Build the environment, add the dev dependencies (`pytest`, kept in
+`requirements-dev.txt` rather than `requirements.txt`), and run from the repo
+root:
+
+```sh
+./setup.sh                              # creates ./venv and installs requirements.txt
+venv/bin/pip install -r requirements-dev.txt
+venv/bin/python -m pytest
+```
+
+To run a single file or filter by name:
+
+```sh
+venv/bin/python -m pytest tests/test_color_correction.py
+venv/bin/python -m pytest tests/test_color_correction.py -k upload
+```

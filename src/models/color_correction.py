@@ -57,7 +57,10 @@ Two ways to get corrected images out of this component:
    ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
    since RAW is soft before sharpening), ``demosaic`` ("DHT" - RAW demosaic
    algorithm, sharper than libraw's stock AHD), ``write_sidecar`` (true),
-   ``delete_after_upload`` (false).
+   ``delete_after_upload`` (false), and ``nines_api_key`` /
+   ``nines_organization_slug`` / ``nines_base_url`` (Nines partner-API
+   delivery: enables the ``sku`` option on ``upload`` and the ``nines_upload``
+   command below).
 
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
@@ -101,6 +104,8 @@ import base64
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
@@ -173,6 +178,37 @@ DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
 # 16-bit TIFF (~250 MB). The FileUpload RPC is client-streaming, so we send
 # the file ourselves in chunks safely under that cap.
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# Nines partner-API delivery (the REST API documented in the nines-webapp
+# repo's partner-api-guide.md): products ("reference items") are upserted by
+# `external_id` - our SKU - and imagery is appended to them.
+NINES_DEFAULT_BASE_URL = "https://review-app.ninesstyle.com"
+
+# Content types the Nines image-append endpoint accepts, by file extension.
+# The RAW master, TIFFs, and JSON sidecar of a capture set are Viam-archival
+# only - Nines rejects them.
+NINES_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+class NinesAPIError(RuntimeError):
+    """A failed Nines partner-API call; ``status`` is the HTTP status code, or
+    ``None`` when the API was unreachable."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+def _read_base64(path: str) -> str:
+    """Whole-file base64 for the Nines inline image form (run in a thread)."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
 # ---------------------------------------------------------------------------
 # ColorChecker Classic reference values (24 patches)
@@ -757,6 +793,11 @@ class ColorCorrection(Camera, EasyResource):
         if demosaic is not None and demosaic not in DEMOSAIC_ALGORITHMS:
             raise ValueError(f"`demosaic` must be one of {list(DEMOSAIC_ALGORITHMS)}")
 
+        for key in ("nines_api_key", "nines_organization_slug", "nines_base_url"):
+            value = attrs.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"`{key}` must be a string")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -815,6 +856,26 @@ class ColorCorrection(Camera, EasyResource):
         # file is confirmed in the cloud, the local copy is redundant. Files
         # that fail to upload are kept for retry.
         self._delete_after_upload: bool = bool(attrs.get("delete_after_upload", False))
+
+        # Optional Nines partner-API delivery (the REST API in the nines-webapp
+        # repo's partner-api-guide.md). With an API key and organization slug
+        # configured, `upload` calls that carry a `sku` also upsert the Nines
+        # product for that SKU and append the shot's delivery image to it, and
+        # the `nines_upload` command sends arbitrary on-disk images. Left
+        # unconfigured, `upload` behaves exactly as before.
+        self._nines_api_key: Optional[str] = (
+            attrs.get("nines_api_key") or os.environ.get("NINES_API_KEY") or None
+        )
+        self._nines_org_slug: Optional[str] = (
+            attrs.get("nines_organization_slug") or None
+        )
+        self._nines_base_url: str = str(
+            attrs.get("nines_base_url") or NINES_DEFAULT_BASE_URL
+        ).rstrip("/")
+        # Upserted reference-item ids by SKU, so a multi-shot submit upserts
+        # the product once. Reset on reconfigure: the ids are scoped to the
+        # org slug / base URL, which may just have changed.
+        self._nines_item_ids: Dict[str, str] = {}
 
         # The `upload` DoCommand authenticates to the cloud with the API key
         # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
@@ -934,13 +995,18 @@ class ColorCorrection(Camera, EasyResource):
         if "upload" in command:
             resp["upload"] = await self._upload(command.get("upload") or {})
 
+        if "nines_upload" in command:
+            resp["nines_upload"] = await self._nines_upload(
+                command.get("nines_upload") or {}
+            )
+
         if "delete" in command:
             resp["delete"] = self._delete_local(command.get("delete") or {})
 
         if not resp:
             raise ValueError(
                 "no recognized command; supported: calibrate_color, capture, "
-                "capture_result, develop, upload, delete"
+                "capture_result, develop, upload, nines_upload, delete"
             )
         return resp
 
@@ -1653,6 +1719,16 @@ class ColorCorrection(Camera, EasyResource):
                                   its full post-stem suffix (``_16.png``,
                                   ``.cr3``, ``.json``, ...). When absent, the
                                   camera's on-disk basename is used.
+          ``sku``                 product code for Nines delivery: when set (and
+                                  ``nines_api_key`` / ``nines_organization_slug``
+                                  are configured), the Nines product with this
+                                  ``external_id`` is upserted and the set's
+                                  delivery image (the full-res JPEG, by
+                                  preference) is appended to it. Reported under
+                                  ``nines`` in the response. A Nines failure
+                                  never marks the Viam uploads as failed, and
+                                  keeps the delivery image on disk for retry
+                                  even with ``delete_after_upload``.
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
@@ -1665,6 +1741,7 @@ class ColorCorrection(Camera, EasyResource):
         paths = [str(p) for p in raw_paths]
         tags = [str(t) for t in (opts.get("tags") or [])]
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
+        sku = str(opts.get("sku") or "").strip() or None
 
         name = opts.get("name")
         name = str(name) if name else None      # falsy/empty -> keep current behavior
@@ -1689,7 +1766,6 @@ class ColorCorrection(Camera, EasyResource):
 
         uploaded: List[str] = []
         failed: List[Dict[str, str]] = []
-        deleted: List[str] = []
         for i, path in enumerate(paths):
             try:
                 size = os.path.getsize(path)
@@ -1699,7 +1775,7 @@ class ColorCorrection(Camera, EasyResource):
                 )
                 t_upload = time.perf_counter()
                 file_name = (
-                    name + os.path.basename(path)[len(capture_stem):]
+                    self._renamed_basename(path, name, capture_stem)
                     if name else None
                 )
                 await asyncio.wait_for(
@@ -1726,12 +1802,30 @@ class ColorCorrection(Camera, EasyResource):
                 )
                 self.logger.error(f"failed to upload {path}: {msg}")
                 failed.append({"path": path, "error": msg})
-                continue
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
                 self.logger.error(f"failed to upload {path}: {exc}")
                 failed.append({"path": path, "error": str(exc)})
-                continue
-            if delete_after:
+
+        # Nines delivery runs before the delete pass so `delete_after_upload`
+        # can't remove the delivery image out from under it. It's independent
+        # of the Viam results: an archival failure doesn't block delivery, and
+        # a delivery failure is reported under `nines`, never in `failed`.
+        nines: Optional[Dict[str, ValueTypes]] = None
+        nines_keep: Optional[str] = None
+        if sku:
+            nines, nines_keep = await self._nines_deliver_for_upload(
+                sku, paths, name, capture_stem
+            )
+
+        deleted: List[str] = []
+        if delete_after:
+            for path in uploaded:
+                if path == nines_keep:
+                    self.logger.info(
+                        f"keeping {os.path.basename(path)} on disk for a Nines "
+                        "retry despite delete_after_upload"
+                    )
+                    continue
                 try:
                     os.remove(path)
                     deleted.append(path)
@@ -1745,12 +1839,15 @@ class ColorCorrection(Camera, EasyResource):
             + (f" with tags {tags}" if tags else "")
             + (f", deleted {len(deleted)} local cop(ies)" if delete_after else "")
         )
-        return {
+        result: Dict[str, ValueTypes] = {
             "uploaded": uploaded,
             "count": len(uploaded),
             "failed": failed,
             "deleted": deleted,
         }
+        if nines is not None:
+            result["nines"] = nines
+        return result
 
     def _delete_local(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
@@ -1861,6 +1958,284 @@ class ColorCorrection(Camera, EasyResource):
                 await stream.recv_trailing_metadata()
                 raise TypeError("FileUpload response cannot be empty")
             return response.binary_data_id
+
+    # ------------------------------------------------------------------
+    # Nines partner-API delivery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _renamed_basename(
+        path: str, name: Optional[str], capture_stem: Optional[str]
+    ) -> str:
+        """
+        Apply the operator-chosen upload ``name`` to one file of a capture set:
+        the shared ``capture_stem`` prefix is swapped for ``name``, preserving
+        the file's post-stem suffix (``_16.tif``, ``.json``, ...). With no
+        ``name`` the on-disk basename is returned unchanged. Used for both the
+        Viam cloud file name and the Nines image filename, so the two sides
+        agree on what a shot is called.
+        """
+        base = os.path.basename(path)
+        if not name or capture_stem is None:
+            return base
+        return name + base[len(capture_stem):]
+
+    @property
+    def _nines_configured(self) -> bool:
+        return bool(self._nines_api_key and self._nines_org_slug)
+
+    @staticmethod
+    def _nines_pick_image(paths: Sequence[str]) -> Optional[str]:
+        """
+        Choose the one file of a capture set to deliver to Nines. The partner
+        API wants exactly one full-resolution original per view and accepts
+        only jpeg/png/webp/gif - so out of a set that also carries the RAW
+        master, TIFFs, and the sidecar, prefer the full-res JPEG, then the
+        8-bit PNG, then the 16-bit PNG, then webp/gif. Returns ``None`` when
+        nothing in the set is eligible.
+        """
+        def rank(path: str) -> Optional[Tuple[int, str]]:
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in NINES_CONTENT_TYPES:
+                return None
+            if ext in (".jpg", ".jpeg"):
+                order = 0
+            elif ext == ".png":
+                order = 2 if path.lower().endswith("_16.png") else 1
+            elif ext == ".webp":
+                order = 3
+            else:  # .gif
+                order = 4
+            return order, path
+
+        ranked = sorted(r for r in map(rank, paths) if r is not None)
+        return ranked[0][1] if ranked else None
+
+    def _nines_request(
+        self, method: str, path: str, body: Mapping[str, Any], timeout_s: float
+    ) -> Dict[str, Any]:
+        """
+        One JSON request to the Nines partner API. Synchronous (urllib) - call
+        it via ``asyncio.to_thread``. Raises :class:`NinesAPIError` carrying
+        the HTTP status and the API's ``error`` description on a non-2xx
+        response, or without a status when the API was unreachable.
+        """
+        request = urllib.request.Request(
+            f"{self._nines_base_url}{path}",
+            data=json.dumps(body).encode(),
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self._nines_api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_s) as resp:
+                return json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = json.loads(exc.read().decode()).get("error", "")
+            except Exception:  # noqa: BLE001 - error bodies aren't guaranteed JSON
+                pass
+            raise NinesAPIError(
+                f"Nines API {method} {path} failed with {exc.code}"
+                + (f": {detail}" if detail else ""),
+                status=exc.code,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise NinesAPIError(
+                f"Nines API {method} {path} unreachable: {exc.reason}"
+            ) from exc
+
+    async def _nines_upsert_item(self, sku: str, product_name: Optional[str]) -> str:
+        """
+        Upsert the Nines reference item whose ``external_id`` is ``sku`` and
+        cache its id. Deliberately sends no ``images`` field - on an existing
+        product that would *replace* all of its imagery; appending happens
+        through the non-destructive images endpoint only.
+        """
+        response = await asyncio.to_thread(
+            self._nines_request,
+            "POST",
+            "/api/v1/reference_items",
+            {
+                "shots_organization_slug": self._nines_org_slug,
+                "name": product_name or sku,
+                "external_id": sku,
+            },
+            self._upload_dial_timeout_s,
+        )
+        item_id = str(response.get("id") or "")
+        if not item_id:
+            raise NinesAPIError("Nines upsert returned no reference item id")
+        self._nines_item_ids[sku] = item_id
+        self.logger.info(
+            f"Nines reference item {item_id} "
+            f"({'created' if response.get('created') else 'updated'}) "
+            f"for SKU {sku!r}"
+        )
+        return item_id
+
+    async def _nines_deliver(
+        self,
+        sku: str,
+        images: Sequence[Tuple[str, str, List[str]]],
+        product_name: Optional[str] = None,
+    ) -> Dict[str, ValueTypes]:
+        """
+        Deliver on-disk image files to the Nines product identified by ``sku``:
+        upsert the reference item (once per SKU since the last reconfigure),
+        then append every image non-destructively as inline base64. ``images``
+        is ``[(path, upload_filename, tags)]``; every file must carry a
+        jpeg/png/webp/gif extension. Raises on any API failure - callers decide
+        whether that fails their operation.
+        """
+        cached = sku in self._nines_item_ids
+        item_id = self._nines_item_ids.get(sku) or await self._nines_upsert_item(
+            sku, product_name
+        )
+
+        payload: List[Dict[str, Any]] = []
+        for path, filename, tags in images:
+            image: Dict[str, Any] = {
+                "data": await asyncio.to_thread(_read_base64, path),
+                "filename": filename,
+                "content_type": NINES_CONTENT_TYPES[os.path.splitext(path)[1].lower()],
+            }
+            if tags:
+                image["tags"] = tags
+            payload.append(image)
+
+        async def append(rid: str) -> Dict[str, Any]:
+            return await asyncio.to_thread(
+                self._nines_request,
+                "POST",
+                f"/api/v1/reference_items/{rid}/images",
+                {"shots_organization_slug": self._nines_org_slug, "images": payload},
+                self._upload_file_timeout_s,
+            )
+
+        try:
+            response = await append(item_id)
+        except NinesAPIError as exc:
+            # A cached id can go stale (product deleted on the Nines side);
+            # re-upsert once and retry rather than wedging every later shot of
+            # the session on the dead id.
+            if not (cached and exc.status == 404):
+                raise
+            self.logger.warning(
+                f"cached Nines item {item_id} for SKU {sku!r} is gone (404); "
+                "re-upserting and retrying"
+            )
+            self._nines_item_ids.pop(sku, None)
+            item_id = await self._nines_upsert_item(sku, product_name)
+            response = await append(item_id)
+
+        return {
+            "reference_item_id": item_id,
+            "external_id": sku,
+            "added_count": response.get("added_count"),
+            "images_count": response.get("images_count"),
+        }
+
+    async def _nines_deliver_for_upload(
+        self,
+        sku: str,
+        paths: Sequence[str],
+        name: Optional[str],
+        capture_stem: Optional[str],
+    ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
+        """
+        The ``upload``-integrated Nines delivery: pick the one delivery image
+        out of the capture set and append it to the SKU's product, tagged with
+        its final filename stem. Returns ``(nines_result, keep_path)`` where
+        ``keep_path`` names a file the delete pass must leave on disk for a
+        retry (the delivery image, when delivery failed). Never raises: a
+        Nines problem is reported in the result, not allowed to fail the Viam
+        half of the submit.
+        """
+        if not self._nines_configured:
+            self.logger.info(
+                f"`upload` got sku {sku!r} but Nines delivery is not configured"
+            )
+            return {
+                "skipped": "Nines delivery not configured: set `nines_api_key` "
+                           "and `nines_organization_slug`"
+            }, None
+
+        delivery = self._nines_pick_image(paths)
+        if delivery is None:
+            return {
+                "error": "no Nines-compatible image (jpeg/png/webp/gif) in "
+                         "this upload set"
+            }, None
+
+        filename = self._renamed_basename(delivery, name, capture_stem)
+        try:
+            result = await self._nines_deliver(
+                sku, [(delivery, filename, [os.path.splitext(filename)[0]])]
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never fails the upload
+            self.logger.error(f"Nines delivery failed for SKU {sku!r}: {exc}")
+            return {"error": str(exc)}, delivery
+        self.logger.info(
+            f"delivered {filename} to Nines item "
+            f"{result.get('reference_item_id')} (SKU {sku!r}, "
+            f"{result.get('images_count')} image(s) total)"
+        )
+        return result, None
+
+    async def _nines_upload(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Deliver image files already on disk to the Nines partner API - the
+        manual / retry counterpart to the ``sku`` option on ``upload``. Sends
+        exactly the files listed (no best-of-set picking, no Viam upload, no
+        local deletion), appended to the SKU's product non-destructively.
+
+        ``opts``:
+          ``sku``           product code upserted as the Nines ``external_id``
+                            (required)
+          ``paths``         image files to append; each must be jpeg/png/webp/gif
+                            (required)
+          ``tags``          Nines tags applied to every appended image
+                            (e.g. ["front"])
+          ``product_name``  product display name used if the SKU doesn't exist
+                            on the Nines side yet (default: the sku)
+
+        Requires the ``nines_api_key`` and ``nines_organization_slug`` config
+        attributes. Returns ``{"reference_item_id", "external_id",
+        "added_count", "images_count"}``.
+        """
+        sku = str(opts.get("sku") or "").strip()
+        if not sku:
+            raise ValueError("`nines_upload` needs a `sku`")
+        raw_paths = opts.get("paths") or []
+        if not raw_paths:
+            raise ValueError("`nines_upload` needs a non-empty `paths` list")
+        if not self._nines_configured:
+            raise ValueError(
+                "Nines delivery is not configured: set the `nines_api_key` and "
+                "`nines_organization_slug` config attributes (the key may also "
+                "come from the NINES_API_KEY env var)"
+            )
+        paths = [str(p) for p in raw_paths]
+        ineligible = [
+            p for p in paths
+            if os.path.splitext(p)[1].lower() not in NINES_CONTENT_TYPES
+        ]
+        if ineligible:
+            raise ValueError(
+                "not Nines-compatible (the API accepts jpeg/png/webp/gif): "
+                f"{ineligible}"
+            )
+        tags = [str(t) for t in (opts.get("tags") or [])]
+        product_name = opts.get("product_name")
+        return await self._nines_deliver(
+            sku,
+            [(p, os.path.basename(p), tags) for p in paths],
+            product_name=str(product_name) if product_name else None,
+        )
 
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None

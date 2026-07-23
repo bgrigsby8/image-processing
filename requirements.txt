@@ -5,7 +5,10 @@ pillow
 rawpy
 tifffile
 # contrib build needed for the cv2.mcc ColorChecker detector (color_correction).
-# detect_colorchecker handles the process() signature change between 4.x and
-# 5.x; verified against 4.8-4.13 and 5.0.
-opencv-contrib-python-headless
+# Pinned <5: the 5.0.0.93 linux wheels' mcc detector finds no chart in frames
+# that 4.8-4.13 detect on every platform (the macOS 5.0 wheel works, so it's a
+# platform build issue, not just the process() signature change - which
+# detect_colorchecker handles either way). Re-test on both platforms with
+# debug_calibration.py before lifting the pin.
+opencv-contrib-python-headless<5
 gphoto2; platform_system != "Windows"

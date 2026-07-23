@@ -69,6 +69,9 @@ installs those automatically on Debian/Ubuntu.
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
+| `nines_api_key`  | string       | Optional  | Nines partner-API key (`nines_live_…`). Falls back to the `NINES_API_KEY` env var. Nines delivery (the `sku` option on `upload`, and `nines_upload`) is enabled only when this and `nines_organization_slug` are both set. |
+| `nines_organization_slug` | string | Optional | Sent as `shots_organization_slug` on every Nines call — the brand you upload for (list valid slugs with the API's `GET /api/v1/organizations`). |
+| `nines_base_url` | string       | Optional  | Nines API base URL. Default `https://review-app.ninesstyle.com`. |
 
 If no `ccm` is given, the component passes images through unchanged (identity
 matrix); the RAW develop still runs (demosaic + export) but applies no color
@@ -195,19 +198,57 @@ capture's stem) and a tag like the SKU.
 {
   "upload": {
     "paths": ["/photos/IMG_0042.CR3", "/photos/IMG_0042_16.tif", "/photos/IMG_0042.jpg"],
-    "tags": ["sku:ABC123", "ABC123"]
+    "tags": ["sku:ABC123", "ABC123"],
+    "sku": "ABC123"
   }
 }
 ```
 
-Options: `paths` (required), `tags`, `part_id` (override the configured/env part
-id), `component_name` (camera to associate the data with; defaults to this
-component's name), `delete_after_upload` (override the config attribute).
-Authentication uses the `VIAM_API_KEY` / `VIAM_API_KEY_ID`
-that Viam injects into the module process — no credentials need configuring, but
-the machine must be cloud-connected. Returns `{"uploaded": [...paths], "count":
-N, "failed": [{"path", "error"}], "deleted": [...paths]}` — a failed file is
-reported but does not abort the others, and is never deleted locally.
+Options: `paths` (required), `tags`, `name` (operator-chosen stem replacing the
+capture stem on every file), `sku` (deliver to Nines — see below), `part_id`
+(override the configured/env part id), `component_name` (camera to associate
+the data with; defaults to this component's name), `delete_after_upload`
+(override the config attribute). Authentication uses the `VIAM_API_KEY` /
+`VIAM_API_KEY_ID` that Viam injects into the module process — no credentials
+need configuring, but the machine must be cloud-connected. Returns
+`{"uploaded": [...paths], "count": N, "failed": [{"path", "error"}], "deleted":
+[...paths]}` — a failed file is reported but does not abort the others, and is
+never deleted locally.
+
+When `sku` is set and the `nines_*` attributes are configured, the set's
+delivery image — the full-res JPEG by preference (then 8-bit PNG, 16-bit PNG,
+webp/gif; the RAW/TIFF/sidecar are Viam-archival only) — is also appended to
+the Nines product whose `external_id` is the SKU, creating the product on
+first use. The result lands under a `nines` key in the response:
+`{"reference_item_id", "external_id", "added_count", "images_count"}` on
+success, `{"error": …}` on failure, or `{"skipped": …}` when Nines isn't
+configured. A Nines failure never marks the Viam uploads failed, and the
+delivery image is kept on disk for retry even with `delete_after_upload`.
+
+### Deliver to Nines (manual / retry)
+
+Appends image files already on disk to a Nines product — the manual
+counterpart to the `sku` option on `upload`. Sends exactly the files listed
+(each must be jpeg/png/webp/gif), non-destructively, with no Viam upload and
+no local deletion. Requires the `nines_api_key` and `nines_organization_slug`
+attributes.
+
+```json
+{
+  "nines_upload": {
+    "sku": "ABC123",
+    "paths": ["/photos/front.jpg", "/photos/back.jpg"],
+    "tags": ["on-model"],
+    "product_name": "Northwood Chore Coat"
+  }
+}
+```
+
+Options: `sku` (required — the product's `external_id`, upserted on first
+use), `paths` (required), `tags` (applied to every appended image),
+`product_name` (display name if the product doesn't exist yet; defaults to
+the sku). Returns `{"reference_item_id", "external_id", "added_count",
+"images_count"}`.
 
 ### Delete local files
 

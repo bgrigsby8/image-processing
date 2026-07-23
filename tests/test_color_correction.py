@@ -327,6 +327,10 @@ def _component(source, output_dir=None):
     cc._delete_after_upload = False
     cc._upload_dial_timeout_s = 30.0
     cc._upload_file_timeout_s = 180.0
+    cc._nines_api_key = None
+    cc._nines_org_slug = None
+    cc._nines_base_url = "https://nines.test"
+    cc._nines_item_ids = {}
     cc._pending_captures = {}
     cc._capture_seq = 0
     return cc
@@ -734,3 +738,345 @@ def test_delete_requires_paths(tmp_path):
     cc = _component(_FakeSource(None), output_dir=str(tmp_path))
     with pytest.raises(ValueError, match="paths"):
         asyncio.run(cc.do_command({"delete": {}}))
+
+
+# ---------------------------------------------------------------------------
+# Nines partner-API delivery: `upload` with a `sku` upserts the Nines product
+# (external_id = SKU) and appends the set's delivery image; `nines_upload`
+# sends exactly the listed files. Exercised against a recording fake of
+# `_nines_request` - no HTTP.
+# ---------------------------------------------------------------------------
+
+import base64
+import os
+
+from models.color_correction import NinesAPIError
+
+
+class _FakeNinesAPI:
+    """Records every `_nines_request` call; scripted upsert/append responses.
+
+    ``dead_item_ids`` 404 their appends (a product deleted server-side);
+    ``append_error`` fails every append.
+    """
+
+    def __init__(self, item_id="ritem_1", append_error=None, dead_item_ids=()):
+        self.item_id = item_id
+        self.append_error = append_error
+        self.dead_item_ids = dead_item_ids
+        self.calls = []
+
+    def __call__(self, method, path, body, timeout_s):
+        self.calls.append((method, path, body, timeout_s))
+        if path == "/api/v1/reference_items":
+            return {"id": self.item_id, "external_id": body["external_id"],
+                    "created": True, "updated": False, "images_count": 0}
+        if path.endswith("/images"):
+            rid = path.split("/")[-2]
+            if rid in self.dead_item_ids:
+                raise NinesAPIError(
+                    f"Nines API POST {path} failed with 404: not found",
+                    status=404,
+                )
+            if self.append_error is not None:
+                raise self.append_error
+            return {"id": rid, "added_count": len(body["images"]),
+                    "images_count": len(body["images"]) + 2}
+        raise AssertionError(f"unexpected Nines path {path}")
+
+
+def _nines_component(tmp_path, monkeypatch, **fake_kwargs):
+    """Uploader component with Nines configured and `_nines_request` faked."""
+    cc = _uploader_component(tmp_path, monkeypatch)
+    cc._nines_api_key = "nines_live_test"
+    cc._nines_org_slug = "viam-org"
+    fake = _FakeNinesAPI(**fake_kwargs)
+    monkeypatch.setattr(cc, "_nines_request", fake)
+    return cc, fake
+
+
+def _shot_set(tmp_path, stem="IMG_0042"):
+    """A capture set on disk: RAW master, 16-bit TIFF, JPEG, sidecar."""
+    paths = []
+    for n in (f"{stem}.cr3", f"{stem}_16.tif", f"{stem}.jpg", f"{stem}.json"):
+        p = tmp_path / n
+        p.write_bytes(f"bytes-of-{n}".encode())
+        paths.append(str(p))
+    return paths
+
+
+def test_nines_pick_image_prefers_full_res_jpeg():
+    pick = ColorCorrection._nines_pick_image
+    files = ["/d/a.cr3", "/d/a_16.tif", "/d/a_16.png", "/d/a.png", "/d/a.jpg",
+             "/d/a.json"]
+    assert pick(files) == "/d/a.jpg"
+    # Without a JPEG: 8-bit PNG beats the 16-bit variant.
+    assert pick([p for p in files if not p.endswith(".jpg")]) == "/d/a.png"
+    assert pick(["/d/a.cr3", "/d/a_16.png"]) == "/d/a_16.png"
+    # RAW/TIFF/sidecar alone: nothing Nines accepts.
+    assert pick(["/d/a.cr3", "/d/a_16.tif", "/d/a.json"]) is None
+    assert pick([]) is None
+
+
+def test_renamed_basename_swaps_stem_and_keeps_suffix():
+    rename = ColorCorrection._renamed_basename
+    assert rename("/d/IMG_0042_16.tif", "front", "IMG_0042") == "front_16.tif"
+    assert rename("/d/IMG_0042.json", "front", "IMG_0042") == "front.json"
+    # No operator name: the on-disk basename passes through.
+    assert rename("/d/IMG_0042.jpg", None, None) == "IMG_0042.jpg"
+    assert rename("/d/IMG_0042.jpg", "", None) == "IMG_0042.jpg"
+
+
+def test_upload_with_sku_upserts_and_appends_jpeg(tmp_path, monkeypatch):
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    out = asyncio.run(
+        cc._upload({"paths": paths, "name": "front", "sku": "NWC-1042"})
+    )
+
+    # Upsert first: keyed by the SKU, small-call timeout, and never an
+    # `images` field (that would replace an existing product's imagery).
+    method, upsert_path, body, timeout = fake.calls[0]
+    assert (method, upsert_path) == ("POST", "/api/v1/reference_items")
+    assert body["external_id"] == "NWC-1042"
+    assert body["name"] == "NWC-1042"
+    assert body["shots_organization_slug"] == "viam-org"
+    assert "images" not in body
+    assert timeout == cc._upload_dial_timeout_s
+
+    # Then one non-destructive append of just the delivery JPEG, renamed to
+    # the operator's stem and tagged with it.
+    method, append_path, body, timeout = fake.calls[1]
+    assert append_path == "/api/v1/reference_items/ritem_1/images"
+    assert body["shots_organization_slug"] == "viam-org"
+    assert timeout == cc._upload_file_timeout_s
+    (img,) = body["images"]
+    assert img["filename"] == "front.jpg"
+    assert img["content_type"] == "image/jpeg"
+    assert base64.b64decode(img["data"]) == b"bytes-of-IMG_0042.jpg"
+    assert img["tags"] == ["front"]
+
+    assert out["nines"]["reference_item_id"] == "ritem_1"
+    assert out["nines"]["external_id"] == "NWC-1042"
+    assert out["nines"]["added_count"] == 1
+    assert out["failed"] == []
+
+
+def test_upload_same_sku_upserts_once(tmp_path, monkeypatch):
+    """The reference-item id is cached per SKU, so a multi-shot submit hits
+    the upsert endpoint once and the append endpoint per shot."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0001"),
+                            "sku": "NWC-1042"}))
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0002"),
+                            "sku": "NWC-1042"}))
+
+    upserts = [c for c in fake.calls if c[1] == "/api/v1/reference_items"]
+    appends = [c for c in fake.calls if c[1].endswith("/images")]
+    assert len(upserts) == 1
+    assert len(appends) == 2
+
+
+def test_upload_with_sku_unconfigured_reports_skipped(tmp_path, monkeypatch):
+    """A machine without Nines config must not fail submits that carry a sku -
+    the response says delivery was skipped and no HTTP happens."""
+    paths = _shot_set(tmp_path)
+    cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config
+    fake = _FakeNinesAPI()
+    monkeypatch.setattr(cc, "_nines_request", fake)
+
+    out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
+
+    assert "not configured" in out["nines"]["skipped"]
+    assert fake.calls == []
+    assert out["failed"] == []
+
+
+def test_upload_without_sku_never_touches_nines(tmp_path, monkeypatch):
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    out = asyncio.run(cc._upload({"paths": _shot_set(tmp_path)}))
+
+    assert "nines" not in out
+    assert fake.calls == []
+
+
+def test_nines_failure_keeps_delivery_image_for_retry(tmp_path, monkeypatch):
+    """`delete_after_upload` removes the archived set, but a failed Nines
+    delivery keeps the JPEG on disk for retry - and is reported under `nines`,
+    never as a per-file Viam failure."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API append failed with 422: bad image",
+                                   status=422),
+    )
+    cc._delete_after_upload = True
+
+    out = asyncio.run(
+        cc._upload({"paths": paths, "name": "front", "sku": "NWC-1042"})
+    )
+
+    assert "422" in out["nines"]["error"]
+    assert out["failed"] == []
+    jpg = next(p for p in paths if p.endswith(".jpg"))
+    assert os.path.exists(jpg)  # kept for the retry
+    assert jpg not in out["deleted"]
+    for p in paths:
+        if p != jpg:
+            assert not os.path.exists(p)  # the rest archived and cleaned up
+
+
+def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
+    """A cached reference-item id that 404s (product deleted on the Nines
+    side) is dropped, re-upserted, and the append retried once."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(tmp_path, monkeypatch, item_id="ritem_new",
+                                dead_item_ids=("ritem_dead",))
+    # Cache is keyed by (org, SKU); the effective org is the configured slug.
+    cc._nines_item_ids[("viam-org", "NWC-1042")] = "ritem_dead"
+
+    out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
+
+    assert [(m, p) for m, p, _, _ in fake.calls] == [
+        ("POST", "/api/v1/reference_items/ritem_dead/images"),
+        ("POST", "/api/v1/reference_items"),
+        ("POST", "/api/v1/reference_items/ritem_new/images"),
+    ]
+    assert out["nines"]["reference_item_id"] == "ritem_new"
+    assert cc._nines_item_ids[("viam-org", "NWC-1042")] == "ritem_new"
+
+
+def test_nines_upload_command_validates(tmp_path, monkeypatch):
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="sku"):
+        asyncio.run(cc.do_command({"nines_upload": {"paths": ["/a.jpg"]}}))
+    with pytest.raises(ValueError, match="paths"):
+        asyncio.run(cc.do_command({"nines_upload": {"sku": "X"}}))
+    with pytest.raises(ValueError, match="jpeg/png/webp/gif"):
+        asyncio.run(cc.do_command(
+            {"nines_upload": {"sku": "X", "paths": ["/a_16.tif"]}}
+        ))
+    assert fake.calls == []
+
+
+def test_nines_upload_command_requires_config(tmp_path, monkeypatch):
+    cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config
+    with pytest.raises(ValueError, match="not configured"):
+        asyncio.run(cc.do_command(
+            {"nines_upload": {"sku": "X", "paths": ["/a.jpg"]}}
+        ))
+
+
+def test_nines_upload_command_sends_listed_files(tmp_path, monkeypatch):
+    """The manual command sends exactly the files given (no best-of-set
+    picking), with shared tags and the optional product display name."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+    front = tmp_path / "front.jpg"
+    front.write_bytes(b"jjj")
+    back = tmp_path / "back.png"
+    back.write_bytes(b"ppp")
+
+    out = asyncio.run(cc.do_command({"nines_upload": {
+        "sku": "NWC-1042",
+        "paths": [str(front), str(back)],
+        "tags": ["on-model"],
+        "product_name": "Northwood Chore Coat",
+    }}))["nines_upload"]
+
+    _, _, upsert_body, _ = fake.calls[0]
+    assert upsert_body["name"] == "Northwood Chore Coat"
+    _, _, append_body, _ = fake.calls[1]
+    images = append_body["images"]
+    assert [i["filename"] for i in images] == ["front.jpg", "back.png"]
+    assert [i["content_type"] for i in images] == ["image/jpeg", "image/png"]
+    assert all(i["tags"] == ["on-model"] for i in images)
+    assert base64.b64decode(images[0]["data"]) == b"jjj"
+    assert out["added_count"] == 2
+    assert out["external_id"] == "NWC-1042"
+
+
+def test_upload_request_slug_overrides_config_slug(tmp_path, monkeypatch):
+    """A per-request `shots_organization_slug` targets that org instead of the
+    configured one - both the upsert and the append carry the request slug."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+
+    out = asyncio.run(cc._upload({
+        "paths": _shot_set(tmp_path),
+        "sku": "NWC-1042",
+        "shots_organization_slug": "buyer-org",
+    }))
+
+    _, upsert_path, upsert_body, _ = fake.calls[0]
+    assert upsert_path == "/api/v1/reference_items"
+    assert upsert_body["shots_organization_slug"] == "buyer-org"
+    _, _, append_body, _ = fake.calls[1]
+    assert append_body["shots_organization_slug"] == "buyer-org"
+    assert out["nines"]["external_id"] == "NWC-1042"
+
+
+def test_upload_caches_reference_item_per_org(tmp_path, monkeypatch):
+    """The reference-item cache is keyed by (org, SKU): the same SKU delivered
+    to two different orgs upserts once per org, so a cached id from one org can
+    never deliver another org's shot to the wrong product."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0001"),
+                            "sku": "NWC-1042",
+                            "shots_organization_slug": "org-a"}))
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0002"),
+                            "sku": "NWC-1042",
+                            "shots_organization_slug": "org-b"}))
+
+    upserts = [c for c in fake.calls if c[1] == "/api/v1/reference_items"]
+    appends = [c for c in fake.calls if c[1].endswith("/images")]
+    assert len(upserts) == 2  # one per org, not shared across orgs
+    assert len(appends) == 2
+    assert {b["shots_organization_slug"] for _, _, b, _ in upserts} == {"org-a",
+                                                                        "org-b"}
+    assert ("org-a", "NWC-1042") in cc._nines_item_ids
+    assert ("org-b", "NWC-1042") in cc._nines_item_ids
+
+
+def test_upload_with_request_slug_needs_only_api_key(tmp_path, monkeypatch):
+    """The multi-org unlock: a machine configured with only an API key (no
+    `nines_organization_slug`) still delivers when the webapp supplies the slug
+    per request - it must not report `skipped`."""
+    cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config...
+    cc._nines_api_key = "nines_live_test"            # ...except the API key
+    assert cc._nines_org_slug is None
+    fake = _FakeNinesAPI()
+    monkeypatch.setattr(cc, "_nines_request", fake)
+
+    out = asyncio.run(cc._upload({
+        "paths": _shot_set(tmp_path),
+        "sku": "NWC-1042",
+        "shots_organization_slug": "buyer-org",
+    }))
+
+    assert "skipped" not in out["nines"]
+    assert out["nines"]["reference_item_id"] == "ritem_1"
+    _, _, upsert_body, _ = fake.calls[0]
+    assert upsert_body["shots_organization_slug"] == "buyer-org"
+
+
+def test_nines_upload_command_honors_request_slug(tmp_path, monkeypatch):
+    """A manual `nines_upload` retry can name the org so it lands in the same
+    org as the original submit, overriding the configured slug."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+    front = tmp_path / "front.jpg"
+    front.write_bytes(b"jjj")
+
+    asyncio.run(cc.do_command({"nines_upload": {
+        "sku": "NWC-1042",
+        "paths": [str(front)],
+        "shots_organization_slug": "retry-org",
+    }}))
+
+    _, _, upsert_body, _ = fake.calls[0]
+    assert upsert_body["shots_organization_slug"] == "retry-org"
+    _, _, append_body, _ = fake.calls[1]
+    assert append_body["shots_organization_slug"] == "retry-org"

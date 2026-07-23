@@ -935,7 +935,8 @@ def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
     paths = _shot_set(tmp_path)
     cc, fake = _nines_component(tmp_path, monkeypatch, item_id="ritem_new",
                                 dead_item_ids=("ritem_dead",))
-    cc._nines_item_ids["NWC-1042"] = "ritem_dead"
+    # Cache is keyed by (org, SKU); the effective org is the configured slug.
+    cc._nines_item_ids[("viam-org", "NWC-1042")] = "ritem_dead"
 
     out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
 
@@ -945,7 +946,7 @@ def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
         ("POST", "/api/v1/reference_items/ritem_new/images"),
     ]
     assert out["nines"]["reference_item_id"] == "ritem_new"
-    assert cc._nines_item_ids["NWC-1042"] == "ritem_new"
+    assert cc._nines_item_ids[("viam-org", "NWC-1042")] == "ritem_new"
 
 
 def test_nines_upload_command_validates(tmp_path, monkeypatch):
@@ -996,3 +997,86 @@ def test_nines_upload_command_sends_listed_files(tmp_path, monkeypatch):
     assert base64.b64decode(images[0]["data"]) == b"jjj"
     assert out["added_count"] == 2
     assert out["external_id"] == "NWC-1042"
+
+
+def test_upload_request_slug_overrides_config_slug(tmp_path, monkeypatch):
+    """A per-request `shots_organization_slug` targets that org instead of the
+    configured one - both the upsert and the append carry the request slug."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+
+    out = asyncio.run(cc._upload({
+        "paths": _shot_set(tmp_path),
+        "sku": "NWC-1042",
+        "shots_organization_slug": "buyer-org",
+    }))
+
+    _, upsert_path, upsert_body, _ = fake.calls[0]
+    assert upsert_path == "/api/v1/reference_items"
+    assert upsert_body["shots_organization_slug"] == "buyer-org"
+    _, _, append_body, _ = fake.calls[1]
+    assert append_body["shots_organization_slug"] == "buyer-org"
+    assert out["nines"]["external_id"] == "NWC-1042"
+
+
+def test_upload_caches_reference_item_per_org(tmp_path, monkeypatch):
+    """The reference-item cache is keyed by (org, SKU): the same SKU delivered
+    to two different orgs upserts once per org, so a cached id from one org can
+    never deliver another org's shot to the wrong product."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0001"),
+                            "sku": "NWC-1042",
+                            "shots_organization_slug": "org-a"}))
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0002"),
+                            "sku": "NWC-1042",
+                            "shots_organization_slug": "org-b"}))
+
+    upserts = [c for c in fake.calls if c[1] == "/api/v1/reference_items"]
+    appends = [c for c in fake.calls if c[1].endswith("/images")]
+    assert len(upserts) == 2  # one per org, not shared across orgs
+    assert len(appends) == 2
+    assert {b["shots_organization_slug"] for _, _, b, _ in upserts} == {"org-a",
+                                                                        "org-b"}
+    assert ("org-a", "NWC-1042") in cc._nines_item_ids
+    assert ("org-b", "NWC-1042") in cc._nines_item_ids
+
+
+def test_upload_with_request_slug_needs_only_api_key(tmp_path, monkeypatch):
+    """The multi-org unlock: a machine configured with only an API key (no
+    `nines_organization_slug`) still delivers when the webapp supplies the slug
+    per request - it must not report `skipped`."""
+    cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config...
+    cc._nines_api_key = "nines_live_test"            # ...except the API key
+    assert cc._nines_org_slug is None
+    fake = _FakeNinesAPI()
+    monkeypatch.setattr(cc, "_nines_request", fake)
+
+    out = asyncio.run(cc._upload({
+        "paths": _shot_set(tmp_path),
+        "sku": "NWC-1042",
+        "shots_organization_slug": "buyer-org",
+    }))
+
+    assert "skipped" not in out["nines"]
+    assert out["nines"]["reference_item_id"] == "ritem_1"
+    _, _, upsert_body, _ = fake.calls[0]
+    assert upsert_body["shots_organization_slug"] == "buyer-org"
+
+
+def test_nines_upload_command_honors_request_slug(tmp_path, monkeypatch):
+    """A manual `nines_upload` retry can name the org so it lands in the same
+    org as the original submit, overriding the configured slug."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # config slug "viam-org"
+    front = tmp_path / "front.jpg"
+    front.write_bytes(b"jjj")
+
+    asyncio.run(cc.do_command({"nines_upload": {
+        "sku": "NWC-1042",
+        "paths": [str(front)],
+        "shots_organization_slug": "retry-org",
+    }}))
+
+    _, _, upsert_body, _ = fake.calls[0]
+    assert upsert_body["shots_organization_slug"] == "retry-org"
+    _, _, append_body, _ = fake.calls[1]
+    assert append_body["shots_organization_slug"] == "retry-org"

@@ -872,10 +872,14 @@ class ColorCorrection(Camera, EasyResource):
         self._nines_base_url: str = str(
             attrs.get("nines_base_url") or NINES_DEFAULT_BASE_URL
         ).rstrip("/")
-        # Upserted reference-item ids by SKU, so a multi-shot submit upserts
-        # the product once. Reset on reconfigure: the ids are scoped to the
-        # org slug / base URL, which may just have changed.
-        self._nines_item_ids: Dict[str, str] = {}
+        # Upserted reference-item ids keyed by (org slug, SKU), so a multi-shot
+        # submit upserts each product once. The org is part of the key because
+        # one machine can serve multiple orgs (the webapp may pass a per-request
+        # `shots_organization_slug`) and the same external_id/SKU can exist in
+        # more than one org - a SKU-only key would deliver one org's shot to
+        # another org's product. Reset on reconfigure: the ids are also scoped
+        # to the base URL, which may just have changed.
+        self._nines_item_ids: Dict[Tuple[str, str], str] = {}
 
         # The `upload` DoCommand authenticates to the cloud with the API key
         # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
@@ -1720,8 +1724,8 @@ class ColorCorrection(Camera, EasyResource):
                                   ``.cr3``, ``.json``, ...). When absent, the
                                   camera's on-disk basename is used.
           ``sku``                 product code for Nines delivery: when set (and
-                                  ``nines_api_key`` / ``nines_organization_slug``
-                                  are configured), the Nines product with this
+                                  ``nines_api_key`` plus an org slug are
+                                  available), the Nines product with this
                                   ``external_id`` is upserted and the set's
                                   delivery image (the full-res JPEG, by
                                   preference) is appended to it. Reported under
@@ -1729,6 +1733,11 @@ class ColorCorrection(Camera, EasyResource):
                                   never marks the Viam uploads as failed, and
                                   keeps the delivery image on disk for retry
                                   even with ``delete_after_upload``.
+          ``shots_organization_slug``
+                                  deliver to this Nines org instead of the
+                                  configured ``nines_organization_slug`` (so one
+                                  machine can serve multiple orgs); falls back to
+                                  the config slug when absent
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
@@ -1742,6 +1751,7 @@ class ColorCorrection(Camera, EasyResource):
         tags = [str(t) for t in (opts.get("tags") or [])]
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
         sku = str(opts.get("sku") or "").strip() or None
+        org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
 
         name = opts.get("name")
         name = str(name) if name else None      # falsy/empty -> keep current behavior
@@ -1814,7 +1824,7 @@ class ColorCorrection(Camera, EasyResource):
         nines_keep: Optional[str] = None
         if sku:
             nines, nines_keep = await self._nines_deliver_for_upload(
-                sku, paths, name, capture_stem
+                sku, paths, name, capture_stem, org_slug=org_slug
             )
 
         deleted: List[str] = []
@@ -1980,9 +1990,13 @@ class ColorCorrection(Camera, EasyResource):
             return base
         return name + base[len(capture_stem):]
 
-    @property
-    def _nines_configured(self) -> bool:
-        return bool(self._nines_api_key and self._nines_org_slug)
+    def _nines_ready(self, org_slug: Optional[str]) -> bool:
+        """Whether Nines delivery can proceed for the given effective org slug.
+        Needs an API key plus an org slug from *somewhere* - the per-request
+        ``org_slug`` when the webapp supplies one, else the configured slug. A
+        machine configured with only a key can still serve any org the webapp
+        names; that's what lets one machine deliver to multiple orgs."""
+        return bool(self._nines_api_key and (org_slug or self._nines_org_slug))
 
     @staticmethod
     def _nines_pick_image(paths: Sequence[str]) -> Optional[str]:
@@ -2048,19 +2062,23 @@ class ColorCorrection(Camera, EasyResource):
                 f"Nines API {method} {path} unreachable: {exc.reason}"
             ) from exc
 
-    async def _nines_upsert_item(self, sku: str, product_name: Optional[str]) -> str:
+    async def _nines_upsert_item(
+        self, sku: str, product_name: Optional[str], org_slug: Optional[str] = None
+    ) -> str:
         """
-        Upsert the Nines reference item whose ``external_id`` is ``sku`` and
-        cache its id. Deliberately sends no ``images`` field - on an existing
-        product that would *replace* all of its imagery; appending happens
-        through the non-destructive images endpoint only.
+        Upsert the Nines reference item whose ``external_id`` is ``sku`` in the
+        effective org (``org_slug`` when given, else the configured slug) and
+        cache its id under ``(org, sku)``. Deliberately sends no ``images``
+        field - on an existing product that would *replace* all of its imagery;
+        appending happens through the non-destructive images endpoint only.
         """
+        org = org_slug or self._nines_org_slug
         response = await asyncio.to_thread(
             self._nines_request,
             "POST",
             "/api/v1/reference_items",
             {
-                "shots_organization_slug": self._nines_org_slug,
+                "shots_organization_slug": org,
                 "name": product_name or sku,
                 "external_id": sku,
             },
@@ -2069,11 +2087,11 @@ class ColorCorrection(Camera, EasyResource):
         item_id = str(response.get("id") or "")
         if not item_id:
             raise NinesAPIError("Nines upsert returned no reference item id")
-        self._nines_item_ids[sku] = item_id
+        self._nines_item_ids[(org, sku)] = item_id
         self.logger.info(
             f"Nines reference item {item_id} "
             f"({'created' if response.get('created') else 'updated'}) "
-            f"for SKU {sku!r}"
+            f"for SKU {sku!r} in org {org!r}"
         )
         return item_id
 
@@ -2082,18 +2100,21 @@ class ColorCorrection(Camera, EasyResource):
         sku: str,
         images: Sequence[Tuple[str, str, List[str]]],
         product_name: Optional[str] = None,
+        org_slug: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """
-        Deliver on-disk image files to the Nines product identified by ``sku``:
-        upsert the reference item (once per SKU since the last reconfigure),
-        then append every image non-destructively as inline base64. ``images``
-        is ``[(path, upload_filename, tags)]``; every file must carry a
-        jpeg/png/webp/gif extension. Raises on any API failure - callers decide
-        whether that fails their operation.
+        Deliver on-disk image files to the Nines product identified by ``sku``
+        in the effective org (``org_slug`` when given, else the configured
+        slug): upsert the reference item (once per ``(org, SKU)`` since the last
+        reconfigure), then append every image non-destructively as inline
+        base64. ``images`` is ``[(path, upload_filename, tags)]``; every file
+        must carry a jpeg/png/webp/gif extension. Raises on any API failure -
+        callers decide whether that fails their operation.
         """
-        cached = sku in self._nines_item_ids
-        item_id = self._nines_item_ids.get(sku) or await self._nines_upsert_item(
-            sku, product_name
+        org = org_slug or self._nines_org_slug
+        cached = (org, sku) in self._nines_item_ids
+        item_id = self._nines_item_ids.get((org, sku)) or await self._nines_upsert_item(
+            sku, product_name, org_slug=org
         )
 
         payload: List[Dict[str, Any]] = []
@@ -2112,7 +2133,7 @@ class ColorCorrection(Camera, EasyResource):
                 self._nines_request,
                 "POST",
                 f"/api/v1/reference_items/{rid}/images",
-                {"shots_organization_slug": self._nines_org_slug, "images": payload},
+                {"shots_organization_slug": org, "images": payload},
                 self._upload_file_timeout_s,
             )
 
@@ -2125,11 +2146,11 @@ class ColorCorrection(Camera, EasyResource):
             if not (cached and exc.status == 404):
                 raise
             self.logger.warning(
-                f"cached Nines item {item_id} for SKU {sku!r} is gone (404); "
-                "re-upserting and retrying"
+                f"cached Nines item {item_id} for SKU {sku!r} in org {org!r} is "
+                "gone (404); re-upserting and retrying"
             )
-            self._nines_item_ids.pop(sku, None)
-            item_id = await self._nines_upsert_item(sku, product_name)
+            self._nines_item_ids.pop((org, sku), None)
+            item_id = await self._nines_upsert_item(sku, product_name, org_slug=org)
             response = await append(item_id)
 
         return {
@@ -2145,23 +2166,27 @@ class ColorCorrection(Camera, EasyResource):
         paths: Sequence[str],
         name: Optional[str],
         capture_stem: Optional[str],
+        org_slug: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
         """
         The ``upload``-integrated Nines delivery: pick the one delivery image
-        out of the capture set and append it to the SKU's product, tagged with
-        its final filename stem. Returns ``(nines_result, keep_path)`` where
-        ``keep_path`` names a file the delete pass must leave on disk for a
-        retry (the delivery image, when delivery failed). Never raises: a
-        Nines problem is reported in the result, not allowed to fail the Viam
-        half of the submit.
+        out of the capture set and append it to the SKU's product in the
+        effective org (``org_slug`` when the webapp names one, else the
+        configured slug), tagged with its final filename stem. Returns
+        ``(nines_result, keep_path)`` where ``keep_path`` names a file the
+        delete pass must leave on disk for a retry (the delivery image, when
+        delivery failed). Never raises: a Nines problem is reported in the
+        result, not allowed to fail the Viam half of the submit.
         """
-        if not self._nines_configured:
+        org = org_slug or self._nines_org_slug
+        if not self._nines_ready(org):
             self.logger.info(
                 f"`upload` got sku {sku!r} but Nines delivery is not configured"
             )
             return {
                 "skipped": "Nines delivery not configured: set `nines_api_key` "
-                           "and `nines_organization_slug`"
+                           "and an org slug (config `nines_organization_slug` "
+                           "or a per-request `shots_organization_slug`)"
             }, None
 
         delivery = self._nines_pick_image(paths)
@@ -2174,7 +2199,8 @@ class ColorCorrection(Camera, EasyResource):
         filename = self._renamed_basename(delivery, name, capture_stem)
         try:
             result = await self._nines_deliver(
-                sku, [(delivery, filename, [os.path.splitext(filename)[0]])]
+                sku, [(delivery, filename, [os.path.splitext(filename)[0]])],
+                org_slug=org,
             )
         except Exception as exc:  # noqa: BLE001 - reported, never fails the upload
             self.logger.error(f"Nines delivery failed for SKU {sku!r}: {exc}")
@@ -2194,18 +2220,24 @@ class ColorCorrection(Camera, EasyResource):
         local deletion), appended to the SKU's product non-destructively.
 
         ``opts``:
-          ``sku``           product code upserted as the Nines ``external_id``
-                            (required)
-          ``paths``         image files to append; each must be jpeg/png/webp/gif
-                            (required)
-          ``tags``          Nines tags applied to every appended image
-                            (e.g. ["front"])
-          ``product_name``  product display name used if the SKU doesn't exist
-                            on the Nines side yet (default: the sku)
+          ``sku``                       product code upserted as the Nines
+                                        ``external_id`` (required)
+          ``paths``                     image files to append; each must be
+                                        jpeg/png/webp/gif (required)
+          ``shots_organization_slug``   deliver to this org instead of the
+                                        configured one, so a webapp retry lands
+                                        in the same org as the original submit;
+                                        falls back to the config slug
+          ``tags``                      Nines tags applied to every appended
+                                        image (e.g. ["front"])
+          ``product_name``              product display name used if the SKU
+                                        doesn't exist on the Nines side yet
+                                        (default: the sku)
 
-        Requires the ``nines_api_key`` and ``nines_organization_slug`` config
-        attributes. Returns ``{"reference_item_id", "external_id",
-        "added_count", "images_count"}``.
+        Requires ``nines_api_key`` plus an org slug - from config
+        (``nines_organization_slug``) or the per-request
+        ``shots_organization_slug``. Returns ``{"reference_item_id",
+        "external_id", "added_count", "images_count"}``.
         """
         sku = str(opts.get("sku") or "").strip()
         if not sku:
@@ -2213,11 +2245,13 @@ class ColorCorrection(Camera, EasyResource):
         raw_paths = opts.get("paths") or []
         if not raw_paths:
             raise ValueError("`nines_upload` needs a non-empty `paths` list")
-        if not self._nines_configured:
+        org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
+        if not self._nines_ready(org_slug):
             raise ValueError(
-                "Nines delivery is not configured: set the `nines_api_key` and "
-                "`nines_organization_slug` config attributes (the key may also "
-                "come from the NINES_API_KEY env var)"
+                "Nines delivery is not configured: set the `nines_api_key` "
+                "config attribute (the key may also come from the NINES_API_KEY "
+                "env var) and an org slug - `nines_organization_slug` in config "
+                "or a per-request `shots_organization_slug`"
             )
         paths = [str(p) for p in raw_paths]
         ineligible = [
@@ -2235,6 +2269,7 @@ class ColorCorrection(Camera, EasyResource):
             sku,
             [(p, os.path.basename(p), tags) for p in paths],
             product_name=str(product_name) if product_name else None,
+            org_slug=org_slug,
         )
 
     async def get_geometries(

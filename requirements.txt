@@ -4,6 +4,8 @@ numpy
 pillow
 rawpy
 tifffile
-# contrib build needed for the cv2.mcc ColorChecker detector (color_correction)
+# contrib build needed for the cv2.mcc ColorChecker detector (color_correction).
+# detect_colorchecker handles the process() signature change between 4.x and
+# 5.x; verified against 4.8-4.13 and 5.0.
 opencv-contrib-python-headless
 gphoto2; platform_system != "Windows"

@@ -474,7 +474,15 @@ def detect_colorchecker(
 
     bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     detector = cv2.mcc.CCheckerDetector_create()
-    if not detector.process(bgr, cv2.mcc.MCC24):
+    # OpenCV 5 dropped the chartType argument from process(); its second
+    # parameter is now `nc` (max charts to find). Passing 4.x's MCC24 (== 0)
+    # there means "find zero charts", which silently detects nothing - so the
+    # call has to branch on the major version.
+    if int(cv2.__version__.split(".")[0]) >= 5:
+        processed = detector.process(bgr, 1)
+    else:
+        processed = detector.process(bgr, cv2.mcc.MCC24)
+    if not processed:
         return None
     checkers = detector.getListColorChecker()
     if not checkers:

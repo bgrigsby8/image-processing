@@ -163,6 +163,101 @@ def test_capture_generic_error_keeps_autofocus_hint_and_no_retry():
 
 
 # ---------------------------------------------------------------------------
+# capture() card-scan fallback: identifies the NEW file by pre-trigger diff
+# (dual-slot bodies broke newest-by-lexical-sort: every path on the second
+# store sorts after every path on the first)
+# ---------------------------------------------------------------------------
+
+class _FakeCamNoEvent(_FakeCam):
+    """A body that never reports FILE_ADDED (Canon after its first capture)."""
+
+    def wait_for_event(self, _timeout_ms):
+        return gp.GP_EVENT_TIMEOUT, None
+
+
+class _StableInfo:
+    """file_get_info result whose size never changes."""
+
+    def __init__(self, size=100):
+        class _F:
+            pass
+
+        self.file = _F()
+        self.file.size = size
+
+
+def _session_with_listings(listings, sizes=None):
+    """Session on a no-event body whose card contents step through `listings`
+    (the last entry repeats). `sizes` optionally scripts file_get_info sizes."""
+    cam = _FakeCamNoEvent(trigger_errors=[])
+    if sizes is None:
+        cam.file_get_info = lambda folder, name: _StableInfo()
+    else:
+        seq = list(sizes)
+        cam.file_get_info = lambda folder, name: _StableInfo(
+            seq.pop(0) if len(seq) > 1 else seq[0]
+        )
+    session = _session_with_cam(cam)
+    session.refresh = lambda: None  # no cached filesystem on the fake body
+    steps = [list(files) for files in listings]
+    session.list_image_files = lambda: steps.pop(0) if len(steps) > 1 else steps[0]
+    return session
+
+
+def test_capture_fallback_picks_new_file_not_lexical_last():
+    # The stale frame on store 2 sorts after the new frame on store 1; the old
+    # newest-by-sort fallback returned it, the diff must not.
+    old = ["/store_00010001/DCIM/9Q0A0001.CR3", "/store_00020001/DCIM/9Q0A0001.CR3"]
+    new = "/store_00010001/DCIM/9Q0A0002.CR3"
+    session = _session_with_listings([old, old + [new]])
+    assert session.capture(settle=0.05) == new
+
+
+def test_capture_fallback_prefers_raw_on_first_store():
+    # One exposure can land as RAW+JPEG mirrored to both slots; prefer the RAW
+    # on the first (fast) card.
+    new = [
+        "/store_00010001/DCIM/9Q0A0002.JPG",
+        "/store_00010001/DCIM/9Q0A0002.CR3",
+        "/store_00020001/DCIM/9Q0A0002.CR3",
+    ]
+    session = _session_with_listings([[], new])
+    assert session.capture(settle=0.05) == "/store_00010001/DCIM/9Q0A0002.CR3"
+
+
+def test_capture_fallback_no_new_file_raises():
+    files = ["/store_00010001/DCIM/9Q0A0001.CR3"]
+    session = _session_with_listings([files])
+    with pytest.raises(RuntimeError, match="no new image"):
+        session.capture(settle=0.05)
+
+
+def test_wait_size_stable_waits_for_settled_size():
+    session = _session_with_listings([[]], sizes=[10, 50, 90, 90])
+    session._wait_size_stable("/store/DCIM/IMG.CR3", timeout=5.0, interval=0.01)
+    # the scripted sequence was consumed down to its stable tail
+    assert session._cam.file_get_info("x", "y").file.size == 90
+
+
+def test_wait_size_stable_drops_fs_cache_before_every_read():
+    # libgphoto2 caches file info with the directory listing; without a
+    # refresh per read a mid-write file reports the same stale size twice and
+    # passes as "stable" (then downloads truncated - seen on the R5's SD slot).
+    session = _session_with_listings([[]], sizes=[10, 50, 90, 90])
+    refreshes = []
+    session.refresh = lambda: refreshes.append(1)
+    session._wait_size_stable("/store/DCIM/IMG.CR3", timeout=5.0, interval=0.01)
+    assert len(refreshes) == 4  # one cache drop per size read
+
+
+def test_wait_size_stable_skips_when_info_unavailable():
+    session = _session_with_listings([[]])
+    session._cam.file_get_info = None  # not callable -> TypeError inside
+    # must swallow the error and return rather than raise
+    session._wait_size_stable("/store/DCIM/IMG.CR3", timeout=0.2, interval=0.01)
+
+
+# ---------------------------------------------------------------------------
 # `trigger` DoCommand: fires the shutter, returns the on-camera path, and
 # never downloads (the deferred-pipeline handoff)
 # ---------------------------------------------------------------------------

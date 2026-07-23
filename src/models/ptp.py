@@ -28,7 +28,9 @@ Two ways to get images out:
               Many bodies (notably Canon) write the still to the card themselves
               and report the capture as a benign libgphoto2 -1 without handing
               back the path; in that case we wait `capture_settle` seconds for
-              the write to finish and download the newest file on the card.
+              the write to finish, then scan the card for the file this trigger
+              added (diffed against a pre-trigger snapshot) and download it
+              once its size settles.
 
        {"trigger": {}}
            -> trip the shutter but skip the download; returns
@@ -557,8 +559,16 @@ class PTPSession:
         After firing we drain the event queue for up to ``settle`` seconds. That
         gives the body time to finish writing and lets libgphoto2 process events:
         a body that *does* report the new file hands us its path directly (fast
-        path), and one that writes to the card silently falls through to the
-        newest file on the card.
+        path), and one that writes to the card silently falls through to a
+        card scan for the file the trigger produced.
+
+        The scan identifies the new file by diffing against a pre-trigger
+        snapshot of the card - NOT by "lexically newest overall". On dual-slot
+        bodies every path on the second store sorts after every path on the
+        first, so newest-by-sort returned a stale (or still-being-written)
+        file from card 2 whenever both slots held images; Canon bodies stop
+        emitting FILE_ADDED after the first capture of a session, which made
+        every subsequent capture take that broken path until a power cycle.
         """
         def _capture_error(exc: Exception) -> RuntimeError:
             if _device_gone(exc):
@@ -574,6 +584,16 @@ class PTPSession:
                 "card, and that the mode dial allows remote release (use "
                 "P/Av/Tv/M, not movie/bulb)."
             )
+
+        # Snapshot the card before firing so the fallback can pick out the file
+        # this trigger produced. Best-effort: with an empty snapshot the diff
+        # just yields every file, and we pick the lexically newest of them -
+        # the old behavior.
+        try:
+            before = set(self.list_image_files())
+        except Exception as exc:
+            LOGGER.debug(f"pre-capture card snapshot failed ({exc}); proceeding without")
+            before = set()
 
         # Retry only the trigger itself after a reconnect: once the shutter has
         # actually fired, a blind retry would expose a second frame.
@@ -616,22 +636,80 @@ class PTPSession:
                 )
                 return event_data.folder.rstrip("/") + "/" + event_data.name
 
-        # No path reported - the body wrote it to the card itself. Grab the
-        # newest file there (same as `{"download": {"latest": true}}`).
+        # No path reported - the body wrote it to the card itself. Poll for a
+        # file that wasn't in the pre-trigger snapshot.
         LOGGER.debug(
             f"[timing] no file event within the {settle:.1f}s settle window; "
-            "scanning card for the newest file"
+            "scanning card for the new file"
         )
         t_scan = time.perf_counter()
-        path = self.latest_image_file()
-        LOGGER.debug(f"[timing] card scan for newest file: {time.perf_counter() - t_scan:.2f}s")
-        if path is None:
+        scan_deadline = time.monotonic() + max(settle, 5.0)
+        new_files: List[str] = []
+        while True:
+            try:
+                new_files = sorted(set(self.list_image_files()) - before)
+            except Exception as exc:
+                LOGGER.debug(f"card rescan failed ({exc}); retrying")
+            if new_files or time.monotonic() >= scan_deadline:
+                break
+            time.sleep(0.5)
+        LOGGER.debug(
+            f"[timing] card scan for new file: {time.perf_counter() - t_scan:.2f}s "
+            f"(found {len(new_files)})"
+        )
+        if not new_files:
             raise RuntimeError(
-                "capture fired but no image appeared on the card - check "
+                "capture fired but no new image appeared on the card - check "
                 "autofocus (try manual focus or a lit, high-contrast subject), "
                 "the memory card, and that the mode dial allows remote release."
             )
+
+        # Dual-slot mirroring and RAW+JPEG modes produce several new files for
+        # one exposure. Prefer a RAW over a JPEG, and the first store (the
+        # fast card) over the second.
+        path = min(new_files, key=lambda p: (_mime_for(p) == "image/jpeg", p))
+        if len(new_files) > 1:
+            LOGGER.debug(f"multiple new files {new_files}; using {path}")
+        self._wait_size_stable(path)
         return path
+
+    def _wait_size_stable(
+        self, path: str, timeout: float = 20.0, interval: float = 0.7
+    ) -> None:
+        """Wait until the camera reports a settled size for ``path``.
+
+        The card-scan fallback can spot the new file while the body is still
+        flushing it (a slow SD slot takes several seconds for a full RAW);
+        downloading then yields a truncated frame. Poll the reported size until
+        two consecutive reads agree. libgphoto2 caches file info along with
+        the directory listing, so the cache must be dropped (``refresh()``)
+        before every read - without that, both reads return the size cached
+        when the file was first seen, a mid-write file looks "stable", and the
+        following ``file_get`` downloads exactly that stale byte count.
+        Best-effort: bodies that can't report file info skip the check, and a
+        size still changing at ``timeout`` is downloaded anyway.
+        """
+        folder, name = os.path.split(path)
+        last = -1
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.refresh()
+                size = int(self._cam.file_get_info(folder, name).file.size)
+            except Exception as exc:
+                LOGGER.debug(
+                    f"file_get_info failed for {path} ({exc}); skipping "
+                    "size-stability check"
+                )
+                return
+            if size > 0 and size == last:
+                LOGGER.debug(f"size of {path} settled at {size / 1e6:.1f} MB")
+                return
+            last = size
+            time.sleep(interval)
+        LOGGER.debug(
+            f"size of {path} still changing after {timeout:.1f}s; downloading anyway"
+        )
 
     @_retry_once_on_device_gone
     def delete(self, path: str) -> None:

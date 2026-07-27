@@ -1080,3 +1080,249 @@ def test_nines_upload_command_honors_request_slug(tmp_path, monkeypatch):
     assert upsert_body["shots_organization_slug"] == "retry-org"
     _, _, append_body, _ = fake.calls[1]
     assert append_body["shots_organization_slug"] == "retry-org"
+
+
+# ---------------------------------------------------------------------------
+# develop: crop + output_stem
+# ---------------------------------------------------------------------------
+
+def _write_still_sized(tmp_path, w, h, name="IMG_0042.PNG"):
+    p = str(tmp_path / name)
+    Image.fromarray(np.full((h, w, 3), 120, np.uint8)).save(p, format="PNG")
+    return p
+
+
+def test_parse_crop_accepts_mapping_and_sequence():
+    from models.color_correction import ColorCorrection as CC
+
+    assert CC._parse_crop({"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}) == (0.1, 0.2, 0.3, 0.4)
+    assert CC._parse_crop([0.1, 0.2, 0.3, 0.4]) == (0.1, 0.2, 0.3, 0.4)
+
+
+def test_parse_crop_normalizes_no_op_and_none():
+    from models.color_correction import ColorCorrection as CC
+
+    assert CC._parse_crop(None) is None
+    # A full-frame rect is not a crop — skip the crop path entirely.
+    assert CC._parse_crop({"x": 0, "y": 0, "w": 1, "h": 1}) is None
+
+
+def test_parse_crop_rejects_malformed_rects():
+    from models.color_correction import ColorCorrection as CC
+
+    with pytest.raises(ValueError, match="missing"):
+        CC._parse_crop({"x": 0.1, "y": 0.2, "w": 0.3})
+    with pytest.raises(ValueError, match="exactly 4"):
+        CC._parse_crop([0.1, 0.2, 0.3])
+    with pytest.raises(ValueError, match="must be positive"):
+        CC._parse_crop({"x": 0.1, "y": 0.2, "w": 0.0, "h": 0.4})
+    with pytest.raises(ValueError, match="within the frame"):
+        CC._parse_crop({"x": 0.8, "y": 0.0, "w": 0.5, "h": 1.0})
+    with pytest.raises(ValueError, match="x/y/w/h or a 4-element list"):
+        CC._parse_crop("half")
+
+
+def test_develop_crop_shrinks_the_exports(tmp_path):
+    """A crop must change what lands on disk, not just the response — and it must
+    leave the source file untouched."""
+    out_dir = str(tmp_path / "out")
+    cc = _component(_FakeSource(saved_path=None), output_dir=out_dir)
+    cc._output_formats = ["jpeg"]
+    p = _write_still_sized(tmp_path, 200, 100)
+    before = open(p, "rb").read()
+
+    out = asyncio.run(cc.do_command({
+        "develop": {"path": p, "crop": {"x": 0.25, "y": 0.0, "w": 0.5, "h": 0.5}},
+    }))
+    exported = out["develop"]["exports"]["jpeg"]
+    with Image.open(exported) as img:
+        assert img.size == (100, 50)
+    assert out["develop"]["crop"] == [0.25, 0.0, 0.5, 0.5]
+    # Non-destructive: the master is byte-identical.
+    assert open(p, "rb").read() == before
+
+
+def test_develop_without_crop_exports_the_full_frame(tmp_path):
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc._output_formats = ["jpeg"]
+    p = _write_still_sized(tmp_path, 200, 100)
+
+    out = asyncio.run(cc.do_command({"develop": {"path": p}}))
+    with Image.open(out["develop"]["exports"]["jpeg"]) as img:
+        assert img.size == (200, 100)
+    assert "crop" not in out["develop"]
+
+
+def test_develop_output_stem_keeps_a_cropped_variant_off_the_master(tmp_path):
+    """The whole point of `output_stem`: develop one RAW twice (uncropped master
+    + cropped variant) and end up with two distinct sets of files on disk."""
+    out_dir = str(tmp_path / "out")
+    cc = _component(_FakeSource(saved_path=None), output_dir=out_dir)
+    cc._output_formats = ["jpeg"]
+    cc._write_sidecar = True
+    p = _write_still_sized(tmp_path, 200, 100)
+
+    master = asyncio.run(cc.do_command({"develop": {"path": p}}))["develop"]
+    variant = asyncio.run(cc.do_command({
+        "develop": {
+            "path": p,
+            "crop": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0},
+            "output_stem": "IMG_0042_crop-2",
+        },
+    }))["develop"]
+
+    assert master["exports"]["jpeg"] != variant["exports"]["jpeg"]
+    assert master["sidecar"] != variant["sidecar"]
+    assert os.path.basename(variant["exports"]["jpeg"]).startswith("IMG_0042_crop-2")
+    # Both survived — the variant didn't clobber the master.
+    with Image.open(master["exports"]["jpeg"]) as img:
+        assert img.size == (200, 100)
+    with Image.open(variant["exports"]["jpeg"]) as img:
+        assert img.size == (100, 100)
+
+
+def test_develop_sidecar_records_the_crop(tmp_path):
+    import json
+
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc._output_formats = ["jpeg"]
+    cc._write_sidecar = True
+    p = _write_still_sized(tmp_path, 200, 100)
+
+    out = asyncio.run(cc.do_command({
+        "develop": {"path": p, "crop": [0.1, 0.2, 0.3, 0.4], "output_stem": "v2"},
+    }))
+    with open(out["develop"]["sidecar"]) as f:
+        record = json.load(f)
+    assert record["crop"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+
+    # No crop -> recorded as null, so a sidecar always states the region.
+    out2 = asyncio.run(cc.do_command({"develop": {"path": p}}))
+    with open(out2["develop"]["sidecar"]) as f:
+        assert json.load(f)["crop"] is None
+
+
+def test_develop_output_stem_rejected_for_multiple_paths(tmp_path):
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    a = _write_still_sized(tmp_path, 20, 20, "a.PNG")
+    b = _write_still_sized(tmp_path, 20, 20, "b.PNG")
+
+    with pytest.raises(Exception, match="output_stem"):
+        asyncio.run(cc.do_command({
+            "develop": {"paths": [a, b], "output_stem": "shared"},
+        }))
+
+
+from io import BytesIO
+
+# ---------------------------------------------------------------------------
+# preview: cropped previews at full requested resolution
+# ---------------------------------------------------------------------------
+
+def test_preview_crop_fills_max_dim_instead_of_shrinking(tmp_path):
+    """The bug this command exists for: a tight crop must not come back tiny.
+
+    Cropping a 1024px preview to 10% leaves ~102px. Cropping a fresh decode and
+    encoding to max_dim gives the full 1024 back."""
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still_sized(tmp_path, 4000, 4000)
+
+    out = asyncio.run(cc.do_command({
+        "preview": {"path": p, "crop": {"x": 0.45, "y": 0.45, "w": 0.1, "h": 0.1},
+                    "max_dim": 1024},
+    }))["preview"]
+
+    raw = base64.b64decode(out["image_base64"])
+    with Image.open(BytesIO(raw)) as img:
+        # 10% of 4000 = 400px of source, and max_dim only ever downsizes, so we
+        # get the source region at its own size — far more than 1024 * 0.1.
+        assert max(img.size) == 400
+    assert out["crop"] == [0.45, 0.45, 0.1, 0.1]
+
+
+def test_preview_downsizes_a_large_crop_to_max_dim(tmp_path):
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still_sized(tmp_path, 4000, 3000)
+
+    out = asyncio.run(cc.do_command({
+        "preview": {"path": p, "crop": {"x": 0, "y": 0, "w": 1.0, "h": 0.9},
+                    "max_dim": 800},
+    }))["preview"]
+    with Image.open(BytesIO(base64.b64decode(out["image_base64"]))) as img:
+        assert max(img.size) == 800
+
+
+def test_preview_writes_nothing_to_disk(tmp_path):
+    """Safe to call on every crop adjustment: no exports, no sidecar, source intact."""
+    out_dir = tmp_path / "out"
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(out_dir))
+    cc._write_sidecar = True
+    p = _write_still_sized(tmp_path, 400, 300)
+    before = sorted(os.listdir(tmp_path))
+    original = open(p, "rb").read()
+
+    resp = asyncio.run(cc.do_command({"preview": {"path": p}}))["preview"]
+
+    assert "exports" not in resp and "sidecar" not in resp
+    assert sorted(os.listdir(tmp_path)) == before
+    assert not out_dir.exists()
+    assert open(p, "rb").read() == original
+
+
+def test_preview_full_frame_needs_no_crop(tmp_path):
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still_sized(tmp_path, 400, 300)
+    out = asyncio.run(cc.do_command({"preview": {"path": p, "max_dim": 200}}))["preview"]
+    assert "crop" not in out
+    assert out["mime_type"] == "image/jpeg"
+    with Image.open(BytesIO(base64.b64decode(out["image_base64"]))) as img:
+        assert img.size == (200, 150)
+
+
+def test_preview_requires_a_path_and_positive_max_dim(tmp_path):
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still_sized(tmp_path, 100, 100)
+    with pytest.raises(Exception, match="needs a `path`"):
+        asyncio.run(cc.do_command({"preview": {}}))
+    with pytest.raises(Exception, match="positive `max_dim`"):
+        asyncio.run(cc.do_command({"preview": {"path": p, "max_dim": 0}}))
+
+
+def test_half_size_suffices_picks_the_cheaper_decode_only_when_it_can(tmp_path):
+    """Half size is 4x faster, so prefer it — but never at the cost of the
+    resolution the caller asked for."""
+    cc = _component(_FakeSource(saved_path=None))
+    p = _write_still_sized(tmp_path, 8000, 6000)
+
+    # Full frame: nothing to lose, always half.
+    assert cc._half_size_suffices(p, None, 4096) is True
+    # Half of a 50% crop is 2000px — clears a 1024 request.
+    assert cc._half_size_suffices(p, (0.0, 0.0, 0.5, 0.5), 1024) is True
+    # Half of a 10% crop is 400px — does not, so decode full.
+    assert cc._half_size_suffices(p, (0.0, 0.0, 0.1, 0.1), 1024) is False
+    # A missing file can't be probed: prefer quality over speed.
+    assert cc._half_size_suffices(str(tmp_path / "nope.CR3"), (0, 0, 0.5, 0.5), 512) is False
+
+
+def test_preview_honors_the_crop_region(tmp_path):
+    """The returned pixels must be the requested region, not just the right size."""
+    # Left half black, right half white.
+    arr = np.zeros((200, 400, 3), np.uint8)
+    arr[:, 200:] = 255
+    p = str(tmp_path / "halves.PNG")
+    Image.fromarray(arr).save(p, format="PNG")
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+
+    left = asyncio.run(cc.do_command({
+        "preview": {"path": p, "crop": {"x": 0, "y": 0, "w": 0.4, "h": 1.0}, "max_dim": 64},
+    }))["preview"]
+    right = asyncio.run(cc.do_command({
+        "preview": {"path": p, "crop": {"x": 0.6, "y": 0, "w": 0.4, "h": 1.0}, "max_dim": 64},
+    }))["preview"]
+
+    def mean(res):
+        with Image.open(BytesIO(base64.b64decode(res["image_base64"]))) as img:
+            return np.asarray(img.convert("L"), dtype=float).mean()
+
+    assert mean(left) < 40    # dark half
+    assert mean(right) > 215  # light half

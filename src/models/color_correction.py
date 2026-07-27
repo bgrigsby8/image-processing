@@ -70,6 +70,29 @@ Two ways to get corrected images out of this component:
               options as ``capture``. A single ``path`` returns that file's
               result; ``paths`` returns {"developed": [...], "count": N}.
 
+       {"develop": {"path": "/photos/IMG_0042.CR3",
+                    "crop": {"x": 0.1, "y": 0.0, "w": 0.6, "h": 1.0},
+                    "output_stem": "IMG_0042_crop-2"}}
+           -> the cropping path. ``crop`` is normalized to the decoded frame
+              (0-1, top-left origin) so a rect an operator drew on the small
+              preview applies unchanged to the full-res decode; it's applied
+              before the colour math, so it also makes the develop cheaper. The
+              RAW master is never touched. ``output_stem`` renames the exports
+              and sidecar, which is what lets one RAW be developed twice - an
+              uncropped master plus one or more cropped variants - without the
+              second pass overwriting the first's files.
+
+       {"preview": {"path": "/photos/IMG_0042.CR3",
+                    "crop": {"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2},
+                    "max_dim": 1600}}
+           -> a display-only JPEG (base64) of a file on disk, optionally cropped.
+              Writes nothing, so it is safe to call repeatedly while an operator
+              adjusts a crop. Cropping an already-downsized preview in the browser
+              leaves only (preview size x crop fraction) pixels, which looks soft
+              for a tight crop; this crops a *fresh* decode instead, so the result
+              fills ``max_dim`` however small the region is. Decodes at half
+              resolution when that still clears ``max_dim``, full when it doesn't.
+
        {"delete": {"paths": ["/photos/a.CR3", "/photos/a.jpg"]}}
            -> remove files from this machine's disk: skipped captures the
               operator discarded, or sets already safe in the cloud. Guarded -
@@ -149,7 +172,9 @@ from models.image_io import (
     SHARPEN_OPTIONS,
     TONE_OPTIONS,
     compute_raw_wb_multipliers,
+    crop_linear,
     export_renditions,
+    image_dimensions,
     is_raw,
     linear_to_jpeg_base64,
     linear_to_srgb,
@@ -1004,6 +1029,9 @@ class ColorCorrection(Camera, EasyResource):
         if "develop" in command:
             resp["develop"] = await self._develop(command.get("develop") or {})
 
+        if "preview" in command:
+            resp["preview"] = await self._preview(command.get("preview") or {})
+
         if "upload" in command:
             resp["upload"] = await self._upload(command.get("upload") or {})
 
@@ -1018,7 +1046,7 @@ class ColorCorrection(Camera, EasyResource):
         if not resp:
             raise ValueError(
                 "no recognized command; supported: calibrate_color, capture, "
-                "capture_result, develop, upload, nines_upload, delete"
+                "capture_result, develop, preview, upload, nines_upload, delete"
             )
         return resp
 
@@ -1501,6 +1529,16 @@ class ColorCorrection(Camera, EasyResource):
           ``demosaic``       RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
           ``output_formats`` subset of tiff16/tiff8/jpeg/png16/png8
           ``output_dir``     where to write exports (default: next to each file)
+          ``crop``           {"x","y","w","h"} normalized to the decoded frame
+                             (0-1, top-left origin) - exports only this region.
+                             Normalized so a rect drawn on a preview applies
+                             unchanged to the full-res decode. Omit for the full
+                             frame. The source file is never modified.
+          ``output_stem``    override the export/sidecar filename stem (default:
+                             the source file's). Lets the same source be
+                             developed more than once - e.g. an uncropped master
+                             plus a cropped variant - without the second pass
+                             overwriting the first's exports.
         """
         raw_paths = opts.get("paths")
         single = raw_paths is None
@@ -1519,6 +1557,15 @@ class ColorCorrection(Camera, EasyResource):
         out_dir_override = opts.get("output_dir") or self._output_dir
         tone = opts.get("tone", self._tone)
         sharpen = opts.get("sharpen", self._sharpen)
+        crop = self._parse_crop(opts.get("crop"))
+        output_stem = opts.get("output_stem")
+        output_stem = str(output_stem) if output_stem else None
+        if output_stem and len(paths) > 1:
+            raise ValueError(
+                "`output_stem` names a single set of exports, so it can't be "
+                f"used with {len(paths)} `paths` (they would overwrite each "
+                "other); develop one path per command instead"
+            )
 
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
@@ -1540,6 +1587,8 @@ class ColorCorrection(Camera, EasyResource):
                     include_preview=single,
                     tone=tone,
                     sharpen=sharpen,
+                    crop=crop,
+                    output_stem=output_stem,
                 )
             )
             self.logger.debug(
@@ -1550,6 +1599,106 @@ class ColorCorrection(Camera, EasyResource):
         if single:
             return results[0]
         return {"developed": results, "count": len(results)}
+
+    async def _preview(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Render a display-only JPEG of a file on disk, optionally cropped. Writes
+        nothing — no exports, no sidecar — so it's safe to call repeatedly while an
+        operator adjusts a crop.
+
+        The point is resolution: a crop taken from an existing 1024px preview only
+        has 1024 x (crop fraction) pixels left, which looks terrible for a tight
+        crop. Here the crop comes off a fresh decode of the RAW instead, so the
+        returned JPEG fills ``max_dim`` no matter how small the region is.
+
+        ``opts``:
+          ``path``           file to render (required)
+          ``crop``           {"x","y","w","h"} normalized; omit for the full frame
+          ``max_dim``        longest edge of the returned JPEG (default 1024)
+          ``white_balance`` / ``exposure_stops`` / ``tone`` / ``sharpen``
+                             as for ``develop``; default to the configured values
+                             so the preview matches what a develop would produce
+        """
+        path = opts.get("path")
+        if not path:
+            raise ValueError("`preview` needs a `path`")
+        path = str(path)
+
+        crop = self._parse_crop(opts.get("crop"))
+        max_dim = int(opts.get("max_dim", 1024))
+        if max_dim <= 0:
+            raise ValueError(f"`preview` needs a positive `max_dim`, got {max_dim}")
+        white_balance = opts.get("white_balance", self._white_balance)
+        exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        tone = opts.get("tone", self._tone)
+        sharpen = opts.get("sharpen", self._sharpen)
+
+        start = time.perf_counter()
+        half_size = await asyncio.to_thread(self._half_size_suffices, path, crop, max_dim)
+        linear = await asyncio.to_thread(
+            load_linear_rgb,
+            path, white_balance=white_balance, exposure_stops=exposure_stops,
+            half_size=half_size, demosaic=self._demosaic,
+        )
+        if crop is not None:
+            linear = crop_linear(linear, *crop)
+        corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
+        image_base64 = await asyncio.to_thread(
+            linear_to_jpeg_base64, corrected, max_dim, self._jpeg_quality,
+            tone, sharpen,
+        )
+        self.logger.debug(
+            f"[timing] preview {os.path.basename(path)} "
+            f"({'half' if half_size else 'full'} decode, "
+            f"{corrected.shape[1]}x{corrected.shape[0]} before encode): "
+            f"{time.perf_counter() - start:.2f}s"
+        )
+
+        result: Dict[str, ValueTypes] = {
+            "source_path": path,
+            "image_base64": image_base64,
+            "mime_type": CameraMimeType.JPEG.value,
+            "half_size": half_size,
+            "ccm_applied": not self.corrector.is_identity,
+            "color_space": "sRGB",
+        }
+        if crop is not None:
+            result["crop"] = list(crop)
+        return result
+
+    def _half_size_suffices(
+        self,
+        path: str,
+        crop: Optional[Tuple[float, float, float, float]],
+        max_dim: int,
+    ) -> bool:
+        """
+        Whether a half-resolution demosaic still leaves ``max_dim`` pixels on the
+        cropped region's long edge. Half size is ~4x faster, so it's the default —
+        but a tight crop needs the full decode or the preview is soft, which is the
+        whole problem this path exists to avoid.
+
+        Errs toward the full decode: an unreadable header, or a RAW whose reported
+        orientation is ambiguous, costs time rather than quality.
+        """
+        if crop is None:
+            return True
+        try:
+            width, height = image_dimensions(path)
+        except Exception as exc:  # noqa: BLE001 - a probe failure must not fail the preview
+            self.logger.debug(f"could not probe {path} for preview sizing: {exc}")
+            return False
+        if not width or not height:
+            return False
+        cw, ch = crop[2], crop[3]
+        # A 90-degree EXIF rotation would pair the crop fractions with the other
+        # axis; take the smaller of the two readings so an ambiguous orientation
+        # picks the higher-quality decode.
+        long_edge = min(
+            max(cw * width, ch * height),
+            max(cw * height, ch * width),
+        )
+        return long_edge / 2 >= max_dim
 
     def _develop_one(
         self,
@@ -1562,13 +1711,22 @@ class ColorCorrection(Camera, EasyResource):
         include_preview: bool = True,
         tone: Optional[str] = None,
         sharpen: Optional[str] = None,
+        crop: Optional[Tuple[float, float, float, float]] = None,
+        output_stem: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """
         Shared core for ``capture`` and ``develop``: apply the CCM in linear
         light, write the rendered exports (non-destructively) and a sidecar, and
         return the result. ``linear`` is linear-light float RGB; ``source_path``
         is the originating file (or None for an inline base64 capture).
+
+        ``crop`` is a normalized (x, y, w, h) rect applied before the color math;
+        ``output_stem`` overrides the export/sidecar filename stem so a cropped
+        variant can sit next to the uncropped master without clobbering it.
         """
+        if crop is not None:
+            linear = crop_linear(linear, *crop)
+
         t_ccm = time.perf_counter()
         corrected = self.corrector.apply_to_linear(linear)
         self.logger.debug(
@@ -1579,15 +1737,17 @@ class ColorCorrection(Camera, EasyResource):
         out_dir = out_dir_override or (
             os.path.dirname(source_path) if source_path else None
         )
-        stem = (
+        stem = output_stem or (
             os.path.splitext(os.path.basename(source_path))[0]
             if source_path else "capture"
         )
         # A RAW source (.cr3/.nef/...) never collides with our .tif/.jpg/.png
         # exports, so its name is preserved. But if the source is itself a
         # JPEG/PNG/TIFF, a same-name export would overwrite the original - so
-        # suffix the exports to keep the pipeline non-destructive.
-        if source_path and not is_raw(source_path):
+        # suffix the exports to keep the pipeline non-destructive. An explicit
+        # `output_stem` is the caller's business: they already chose a distinct
+        # name, so don't second-guess it.
+        if source_path and not output_stem and not is_raw(source_path):
             stem = stem + "_corrected"
         exports: Dict[str, str] = {}
         if out_dir:
@@ -1611,7 +1771,13 @@ class ColorCorrection(Camera, EasyResource):
         if self._write_sidecar and source_path:
             sidecar = self._write_sidecar_file(
                 source_path, white_balance, exposure_stops, formats, exports,
-                tone, sharpen,
+                tone, sharpen, crop,
+                # With a stem override the sidecar has to follow the exports, or
+                # a cropped variant would overwrite the master's record.
+                dest=(
+                    os.path.join(out_dir, stem + ".json")
+                    if output_stem and out_dir else None
+                ),
             )
 
         result: Dict[str, ValueTypes] = {
@@ -1621,6 +1787,13 @@ class ColorCorrection(Camera, EasyResource):
             "ccm_applied": not self.corrector.is_identity,
             "color_space": "sRGB",
         }
+        if crop is not None:
+            result["crop"] = list(crop)
+        if include_preview:
+            # Report what the exports actually cover, so a caller that cropped
+            # can confirm the rect landed where it drew it.
+            result["width"] = int(corrected.shape[1])
+            result["height"] = int(corrected.shape[0])
         if include_preview:
             result["image_base64"] = linear_to_jpeg_base64(
                 corrected, tone=tone, sharpen=sharpen
@@ -1637,18 +1810,24 @@ class ColorCorrection(Camera, EasyResource):
         exports: Mapping[str, str],
         tone: Optional[str] = None,
         sharpen: Optional[str] = None,
+        crop: Optional[Tuple[float, float, float, float]] = None,
+        dest: Optional[str] = None,
     ) -> str:
         """
         Write a ``<stem>.json`` sidecar next to the (untouched) source file
         recording exactly how it was developed - the non-destructive record that
-        lets a capture be reproduced or re-exported later.
+        lets a capture be reproduced or re-exported later. ``dest`` overrides
+        where it lands, for variants that don't share the source's stem.
         """
-        sidecar_path = os.path.splitext(source_path)[0] + ".json"
+        sidecar_path = dest or (os.path.splitext(source_path)[0] + ".json")
         record = {
             "source": os.path.basename(source_path),
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "white_balance": white_balance,
             "exposure_stops": exposure_stops,
+            "crop": (
+                dict(zip(("x", "y", "w", "h"), crop)) if crop is not None else None
+            ),
             "tone": tone or "none",
             "sharpen": sharpen or "none",
             "demosaic": self._demosaic,
@@ -1661,6 +1840,65 @@ class ColorCorrection(Camera, EasyResource):
         with open(sidecar_path, "w") as f:
             json.dump(record, f, indent=2)
         return sidecar_path
+
+    @staticmethod
+    def _parse_crop(
+        raw: Any,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Validate a ``crop`` option into a normalized (x, y, w, h) tuple, or
+        ``None`` for "no crop". Accepts the {"x","y","w","h"} mapping the webapp
+        sends or a 4-element sequence.
+
+        A crop that covers the whole frame is normalized away to ``None`` so the
+        no-op case skips the crop path entirely. Anything malformed raises rather
+        than silently developing an unexpected region - a wrong crop is invisible
+        in the response but wrong on disk.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, Mapping):
+            missing = [k for k in ("x", "y", "w", "h") if k not in raw]
+            if missing:
+                raise ValueError(
+                    f"`crop` is missing {missing}; it needs all of x, y, w, h "
+                    "as fractions of the frame (0-1, top-left origin)"
+                )
+            values = [raw["x"], raw["y"], raw["w"], raw["h"]]
+        elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            if len(raw) != 4:
+                raise ValueError(
+                    f"`crop` as a list needs exactly 4 values [x, y, w, h], got {len(raw)}"
+                )
+            values = list(raw)
+        else:
+            raise ValueError(
+                f"`crop` must be an object with x/y/w/h or a 4-element list, "
+                f"got {type(raw).__name__}"
+            )
+
+        try:
+            x, y, w, h = (float(v) for v in values)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"`crop` values must be numbers: {exc}") from exc
+
+        if w <= 0 or h <= 0:
+            raise ValueError(
+                f"`crop` width and height must be positive, got w={w}, h={h}"
+            )
+        # Tolerate float dust from the browser's normalized rect, but reject a
+        # rect that genuinely runs off the frame.
+        eps = 1e-6
+        if x < -eps or y < -eps or x + w > 1 + eps or y + h > 1 + eps:
+            raise ValueError(
+                f"`crop` must lie within the frame as fractions of 0-1, got "
+                f"x={x}, y={y}, w={w}, h={h}"
+            )
+        x, y = max(0.0, x), max(0.0, y)
+        w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+        if (x, y, w, h) == (0.0, 0.0, 1.0, 1.0):
+            return None
+        return (x, y, w, h)
 
     async def _get_data_client(self) -> DataClient:
         """

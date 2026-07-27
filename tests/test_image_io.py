@@ -9,6 +9,8 @@ from PIL import Image
 
 from models.image_io import (
     EXPORT_FORMATS,
+    crop_linear,
+    image_dimensions,
     TONE_OPTIONS,
     _TONE_CURVES,
     _encode_srgb,
@@ -380,3 +382,60 @@ def test_demosaic_algorithm_resolves_and_validates():
     with pytest.raises(ValueError, match="unknown demosaic"):
         _demosaic_algorithm("nope")
     assert "none" in SHARPEN_OPTIONS and "DHT" in DEMOSAIC_ALGORITHMS
+
+
+# ---------------------------------------------------------------------------
+# Cropping
+# ---------------------------------------------------------------------------
+
+def test_crop_linear_takes_the_normalized_region():
+    # Distinct value per pixel so the crop's origin is unambiguous.
+    img = np.arange(100 * 200 * 3, dtype=np.float32).reshape(100, 200, 3)
+    out = crop_linear(img, 0.25, 0.5, 0.5, 0.25)
+    # x: 0.25..0.75 of 200 = 50..150; y: 0.5..0.75 of 100 = 50..75
+    assert out.shape == (25, 100, 3)
+    assert np.array_equal(out, img[50:75, 50:150])
+
+
+def test_crop_linear_full_frame_returns_input_untouched():
+    img = np.zeros((10, 10, 3), np.float32)
+    assert crop_linear(img, 0.0, 0.0, 1.0, 1.0) is img
+
+
+def test_crop_linear_is_resolution_independent():
+    """The same normalized rect must select the same region of a preview-sized
+    and a full-sized decode - that's what lets the operator crop on the preview."""
+    small = np.zeros((50, 100, 3), np.float32)
+    large = np.zeros((500, 1000, 3), np.float32)
+    rect = (0.1, 0.2, 0.4, 0.5)
+    s, l = crop_linear(small, *rect), crop_linear(large, *rect)
+    assert s.shape[0] / small.shape[0] == pytest.approx(l.shape[0] / large.shape[0])
+    assert s.shape[1] / small.shape[1] == pytest.approx(l.shape[1] / large.shape[1])
+
+
+def test_crop_linear_clamps_degenerate_rect_to_one_pixel():
+    img = np.zeros((10, 10, 3), np.float32)
+    out = crop_linear(img, 0.999, 0.999, 0.0005, 0.0005)
+    assert out.shape[0] >= 1 and out.shape[1] >= 1
+
+
+def test_crop_linear_preserves_channels_and_dtype():
+    img = np.random.rand(20, 30, 3).astype(np.float32)
+    out = crop_linear(img, 0.0, 0.0, 0.5, 0.5)
+    assert out.shape == (10, 15, 3) and out.dtype == np.float32
+
+
+def test_image_dimensions_reads_a_header_without_decoding(tmp_path):
+    p = str(tmp_path / "wide.png")
+    Image.fromarray(np.zeros((300, 700, 3), np.uint8)).save(p)
+    assert image_dimensions(p) == (700, 300)
+
+
+def test_image_dimensions_matches_what_load_linear_rgb_returns(tmp_path):
+    """The sizing decision in `preview` only holds if the probe agrees with the
+    decode about which axis is which."""
+    p = str(tmp_path / "tall.png")
+    Image.fromarray(np.zeros((400, 150, 3), np.uint8)).save(p)
+    w, h = image_dimensions(p)
+    decoded = load_linear_rgb(p)
+    assert (w, h) == (decoded.shape[1], decoded.shape[0])

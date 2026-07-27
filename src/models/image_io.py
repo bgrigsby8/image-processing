@@ -246,6 +246,75 @@ def load_linear_rgb(
         return srgb_to_linear(arr).astype(np.float32)
 
 
+def image_dimensions(path: str) -> Tuple[int, int]:
+    """
+    Read an image's output dimensions from its header, without decoding it. Cheap
+    enough to call before deciding *how* to decode — e.g. picking half- vs
+    full-resolution demosaic so a cropped preview lands at a useful size.
+
+    Returns (width, height) as the decoded image will be oriented. RAW files
+    report libraw's post-rotation output size; a RAW whose EXIF flip swaps the
+    axes is reported swapped, matching what ``load_linear_rgb`` returns.
+    """
+    if is_raw(path):
+        if rawpy is None:
+            raise RuntimeError(
+                f"cannot read dimensions of RAW file {os.path.basename(path)!r}: "
+                f"rawpy is not available ({_RAWPY_IMPORT_ERROR})"
+            )
+        with rawpy.imread(path) as raw:
+            s = raw.sizes
+            # flip 5/6 are the 90-degree rotations; libraw's iwidth/iheight
+            # already account for them, but fall back to width/height when a
+            # build doesn't populate them.
+            w = int(getattr(s, "iwidth", 0) or s.width)
+            h = int(getattr(s, "iheight", 0) or s.height)
+            return (w, h)
+    with Image.open(path) as img:
+        return (int(img.width), int(img.height))
+
+
+def crop_linear(
+    img: np.ndarray,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+) -> np.ndarray:
+    """
+    Crop an ``(H, W, 3)`` image array to a **normalized** rect, where ``x``/``y``
+    are the top-left corner and ``w``/``h`` the size, each as a fraction of the
+    array's own width/height. Normalized rather than pixel coordinates so a crop
+    an operator drew on a downsized preview applies unchanged to the full-res
+    decode of the same frame.
+
+    Cropping happens before any color math, so it costs nothing and shrinks every
+    downstream step. The result is a *view* into ``img`` (no copy); the writers
+    and the CCM both handle non-contiguous input fine.
+
+    The rect is clamped to the array bounds and to at least one pixel per axis,
+    so a degenerate or slightly out-of-range rect degrades to a valid crop rather
+    than raising or producing an empty array.
+    """
+    height, width = img.shape[:2]
+    x0 = int(round(x * width))
+    y0 = int(round(y * height))
+    x1 = int(round((x + w) * width))
+    y1 = int(round((y + h) * height))
+
+    x0 = max(0, min(x0, width - 1))
+    y0 = max(0, min(y0, height - 1))
+    x1 = max(x0 + 1, min(x1, width))
+    y1 = max(y0 + 1, min(y1, height))
+
+    if (x0, y0, x1, y1) == (0, 0, width, height):
+        return img
+    LOGGER.info(
+        f"cropping {width}x{height} to {x1 - x0}x{y1 - y0} at ({x0}, {y0})"
+    )
+    return img[y0:y1, x0:x1]
+
+
 # ---------------------------------------------------------------------------
 # RAW colour-calibration helpers (ColorChecker white balance + detection)
 # ---------------------------------------------------------------------------

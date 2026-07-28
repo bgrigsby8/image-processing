@@ -8,7 +8,7 @@ camera hardware.
 import numpy as np
 import pytest
 
-from models.color_correction import (
+from models.calibration import (
     _oriented_chart_grid,
     REFERENCE_SRGB,
     ColorCorrector,
@@ -279,6 +279,7 @@ import asyncio
 from PIL import Image
 
 from models.color_correction import ColorCorrection
+from models.nines import NinesClient
 
 
 class _FakeSource:
@@ -327,10 +328,14 @@ def _component(source, output_dir=None):
     cc._delete_after_upload = False
     cc._upload_dial_timeout_s = 30.0
     cc._upload_file_timeout_s = 180.0
-    cc._nines_api_key = None
-    cc._nines_org_slug = None
-    cc._nines_base_url = "https://nines.test"
-    cc._nines_item_ids = {}
+    cc._nines = NinesClient(
+        api_key=None,
+        org_slug=None,
+        base_url="https://nines.test",
+        logger=cc.logger,
+        request_timeout_s=cc._upload_dial_timeout_s,
+        upload_timeout_s=cc._upload_file_timeout_s,
+    )
     cc._pending_captures = {}
     cc._capture_seq = 0
     return cc
@@ -744,17 +749,17 @@ def test_delete_requires_paths(tmp_path):
 # Nines partner-API delivery: `upload` with a `sku` upserts the Nines product
 # (external_id = SKU) and appends the set's delivery image; `nines_upload`
 # sends exactly the listed files. Exercised against a recording fake of
-# `_nines_request` - no HTTP.
+# `NinesClient.request` - no HTTP.
 # ---------------------------------------------------------------------------
 
 import base64
 import os
 
-from models.color_correction import NinesAPIError
+from models.nines import NinesAPIError
 
 
 class _FakeNinesAPI:
-    """Records every `_nines_request` call; scripted upsert/append responses.
+    """Records every `NinesClient.request` call; scripted upsert/append responses.
 
     ``dead_item_ids`` 404 their appends (a product deleted server-side);
     ``append_error`` fails every append.
@@ -786,12 +791,12 @@ class _FakeNinesAPI:
 
 
 def _nines_component(tmp_path, monkeypatch, **fake_kwargs):
-    """Uploader component with Nines configured and `_nines_request` faked."""
+    """Uploader component with Nines configured and `NinesClient.request` faked."""
     cc = _uploader_component(tmp_path, monkeypatch)
-    cc._nines_api_key = "nines_live_test"
-    cc._nines_org_slug = "viam-org"
+    cc._nines.api_key = "nines_live_test"
+    cc._nines.org_slug = "viam-org"
     fake = _FakeNinesAPI(**fake_kwargs)
-    monkeypatch.setattr(cc, "_nines_request", fake)
+    monkeypatch.setattr(cc._nines, "request", fake)
     return cc, fake
 
 
@@ -806,7 +811,7 @@ def _shot_set(tmp_path, stem="IMG_0042"):
 
 
 def test_nines_pick_image_prefers_full_res_jpeg():
-    pick = ColorCorrection._nines_pick_image
+    pick = NinesClient.pick_image
     files = ["/d/a.cr3", "/d/a_16.tif", "/d/a_16.png", "/d/a.png", "/d/a.jpg",
              "/d/a.json"]
     assert pick(files) == "/d/a.jpg"
@@ -885,7 +890,7 @@ def test_upload_with_sku_unconfigured_reports_skipped(tmp_path, monkeypatch):
     paths = _shot_set(tmp_path)
     cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config
     fake = _FakeNinesAPI()
-    monkeypatch.setattr(cc, "_nines_request", fake)
+    monkeypatch.setattr(cc._nines, "request", fake)
 
     out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
 
@@ -936,7 +941,7 @@ def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
     cc, fake = _nines_component(tmp_path, monkeypatch, item_id="ritem_new",
                                 dead_item_ids=("ritem_dead",))
     # Cache is keyed by (org, SKU); the effective org is the configured slug.
-    cc._nines_item_ids[("viam-org", "NWC-1042")] = "ritem_dead"
+    cc._nines.item_ids[("viam-org", "NWC-1042")] = "ritem_dead"
 
     out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
 
@@ -946,7 +951,7 @@ def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
         ("POST", "/api/v1/reference_items/ritem_new/images"),
     ]
     assert out["nines"]["reference_item_id"] == "ritem_new"
-    assert cc._nines_item_ids[("viam-org", "NWC-1042")] == "ritem_new"
+    assert cc._nines.item_ids[("viam-org", "NWC-1042")] == "ritem_new"
 
 
 def test_nines_upload_command_validates(tmp_path, monkeypatch):
@@ -1037,8 +1042,8 @@ def test_upload_caches_reference_item_per_org(tmp_path, monkeypatch):
     assert len(appends) == 2
     assert {b["shots_organization_slug"] for _, _, b, _ in upserts} == {"org-a",
                                                                         "org-b"}
-    assert ("org-a", "NWC-1042") in cc._nines_item_ids
-    assert ("org-b", "NWC-1042") in cc._nines_item_ids
+    assert ("org-a", "NWC-1042") in cc._nines.item_ids
+    assert ("org-b", "NWC-1042") in cc._nines.item_ids
 
 
 def test_upload_with_request_slug_needs_only_api_key(tmp_path, monkeypatch):
@@ -1046,10 +1051,10 @@ def test_upload_with_request_slug_needs_only_api_key(tmp_path, monkeypatch):
     `nines_organization_slug`) still delivers when the webapp supplies the slug
     per request - it must not report `skipped`."""
     cc = _uploader_component(tmp_path, monkeypatch)  # no Nines config...
-    cc._nines_api_key = "nines_live_test"            # ...except the API key
-    assert cc._nines_org_slug is None
+    cc._nines.api_key = "nines_live_test"            # ...except the API key
+    assert cc._nines.org_slug is None
     fake = _FakeNinesAPI()
-    monkeypatch.setattr(cc, "_nines_request", fake)
+    monkeypatch.setattr(cc._nines, "request", fake)
 
     out = asyncio.run(cc._upload({
         "paths": _shot_set(tmp_path),

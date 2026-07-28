@@ -45,7 +45,9 @@ Two ways to get corrected images out of this component:
 
    This is a non-destructive, Capture One-style pipeline: 16-bit linear math,
    no auto-brightness, the original RAW preserved, adjustments recorded in a
-   sidecar. See image_io.py for the decode/export details and color-space notes.
+   sidecar. See image_io.py for the decode/export details and color-space
+   notes, calibration.py for the ColorChecker detection / CCM math, and
+   nines.py for the Nines partner-API client.
 
    Relevant config attributes: ``output_dir`` (default: next to the source),
    ``output_formats`` (default ["tiff16", "jpeg", "png16", "png8"]),
@@ -127,8 +129,6 @@ import base64
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
@@ -165,6 +165,14 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
+from models.calibration import (
+    REFERENCE_SRGB,
+    ColorCorrector,
+    PatchSampler,
+    _fit_ccm,
+    _neutral_brightness_report,
+    detect_colorchecker,
+)
 from models.image_io import (
     DEFAULT_DEMOSAIC,
     DEMOSAIC_ALGORITHMS,
@@ -182,17 +190,11 @@ from models.image_io import (
     render_raw_for_detection,
     srgb_to_linear,
 )
-
-# OpenCV's ColorChecker detector (cv2.mcc) lives in opencv-contrib; import lazily
-# so the module still loads (and the streaming/develop paths work) on a host
-# without it - calibration raises a clean, actionable error at point of use.
-try:
-    import cv2  # type: ignore
-
-    _CV2_IMPORT_ERROR: Optional[Exception] = None
-except Exception as exc:  # pragma: no cover - depends on the host
-    cv2 = None  # type: ignore
-    _CV2_IMPORT_ERROR = exc
+from models.nines import (
+    NINES_CONTENT_TYPES,
+    NINES_DEFAULT_BASE_URL,
+    NinesClient,
+)
 
 # Default delivery set when `output_formats` isn't configured. Override in
 # config to trim it (e.g. just ["tiff16", "jpeg"] for a master + proof).
@@ -203,550 +205,6 @@ DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
 # 16-bit TIFF (~250 MB). The FileUpload RPC is client-streaming, so we send
 # the file ourselves in chunks safely under that cap.
 UPLOAD_CHUNK_BYTES = 1024 * 1024
-
-# Nines partner-API delivery (the REST API documented in the nines-webapp
-# repo's partner-api-guide.md): products ("reference items") are upserted by
-# `external_id` - our SKU - and imagery is appended to them.
-NINES_DEFAULT_BASE_URL = "https://review-app.ninesstyle.com"
-
-# Content types the Nines image-append endpoint accepts, by file extension.
-# The RAW master, TIFFs, and JSON sidecar of a capture set are Viam-archival
-# only - Nines rejects them.
-NINES_CONTENT_TYPES = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
-
-
-class NinesAPIError(RuntimeError):
-    """A failed Nines partner-API call; ``status`` is the HTTP status code, or
-    ``None`` when the API was unreachable."""
-
-    def __init__(self, message: str, status: Optional[int] = None):
-        super().__init__(message)
-        self.status = status
-
-
-def _read_base64(path: str) -> str:
-    """Whole-file base64 for the Nines inline image form (run in a thread)."""
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
-
-# ---------------------------------------------------------------------------
-# ColorChecker Classic reference values (24 patches)
-# ---------------------------------------------------------------------------
-# Rather than hard-code an sRGB table (the previous one matched the pre-2014
-# colorants and was off by up to ~18/255 on the saturated patches - worst on
-# blue), we keep the *authoritative* CIE xyY data and derive sRGB from it, so
-# the reference is traceable to source and unambiguous.
-#
-# These are the X-Rite published values for the "After November 2014"
-# formulation - the colorants in every ColorChecker Classic made since, so the
-# right ones for a current chart. Values via the colour-science dataset
-# (ColorChecker24 - After November 2014), CIE 1931 2-degree observer, ICC D50.
-# Order: dark skin -> black, matching the patch layout (text at top).
-_COLORCHECKER_XYY_D50 = np.array([
-    [0.4325, 0.3788, 0.1034],  # 1  Dark Skin
-    [0.4191, 0.3748, 0.3525],  # 2  Light Skin
-    [0.2761, 0.3004, 0.1847],  # 3  Blue Sky
-    [0.3700, 0.4501, 0.1335],  # 4  Foliage
-    [0.3020, 0.2877, 0.2324],  # 5  Blue Flower
-    [0.2856, 0.3910, 0.4174],  # 6  Bluish Green
-    [0.5291, 0.4075, 0.3117],  # 7  Orange
-    [0.2339, 0.2155, 0.1140],  # 8  Purplish Blue
-    [0.5008, 0.3293, 0.1979],  # 9  Moderate Red
-    [0.3326, 0.2556, 0.0644],  # 10 Purple
-    [0.3989, 0.4998, 0.4435],  # 11 Yellow Green
-    [0.4962, 0.4428, 0.4358],  # 12 Orange Yellow
-    [0.2040, 0.1696, 0.0579],  # 13 Blue
-    [0.3270, 0.5033, 0.2307],  # 14 Green
-    [0.5709, 0.3298, 0.1268],  # 15 Red
-    [0.4694, 0.4732, 0.6081],  # 16 Yellow
-    [0.4177, 0.2704, 0.2007],  # 17 Magenta
-    [0.2151, 0.3037, 0.1903],  # 18 Cyan
-    [0.3488, 0.3628, 0.9129],  # 19 White 9.5
-    [0.3451, 0.3596, 0.5885],  # 20 Neutral 8
-    [0.3446, 0.3590, 0.3595],  # 21 Neutral 6.5
-    [0.3438, 0.3589, 0.1912],  # 22 Neutral 5
-    [0.3423, 0.3576, 0.0893],  # 23 Neutral 3.5
-    [0.3439, 0.3565, 0.0320],  # 24 Black 2
-], dtype=np.float64)
-
-# Bradford chromatic adaptation D50 -> D65, and CIE XYZ (D65) -> linear sRGB
-# (Lindbloom / sRGB spec). The chart data is D50; sRGB is a D65 space.
-_BRADFORD_D50_TO_D65 = np.array([
-    [0.9555766, -0.0230393, 0.0631636],
-    [-0.0282895, 1.0099416, 0.0210077],
-    [0.0122982, -0.0204830, 1.3299098],
-])
-_XYZ_D65_TO_LINEAR_SRGB = np.array([
-    [3.2404542, -1.5371385, -0.4985314],
-    [-0.9692660, 1.8760108, 0.0415560],
-    [0.0556434, -0.2040259, 1.0572252],
-])
-
-
-def _xyy_d50_to_srgb(xyY: np.ndarray) -> np.ndarray:
-    """CIE xyY (D50) -> gamma-encoded sRGB in [0, 1]. Out-of-gamut patches (the
-    chart's blue/cyan fall outside sRGB) are clipped after the linear transform,
-    as any sRGB rendering of the chart must."""
-    x, y, big_y = xyY[:, 0], xyY[:, 1], xyY[:, 2]
-    xyz = np.stack([big_y * x / y, big_y, big_y * (1.0 - x - y) / y], axis=1)
-    xyz_d65 = xyz @ _BRADFORD_D50_TO_D65.T
-    linear = np.clip(xyz_d65 @ _XYZ_D65_TO_LINEAR_SRGB.T, 0.0, 1.0)
-    return linear_to_srgb(linear).astype(np.float32)
-
-
-# Gamma-encoded sRGB [0, 1], dark skin -> black; the CCM fit and the
-# neutral-brightness readout both reference this.
-REFERENCE_SRGB = _xyy_d50_to_srgb(_COLORCHECKER_XYY_D50)
-
-
-# Canonical sRGB transfer functions live in image_io so the decode/export path
-# and the color math agree exactly; aliased here to keep call sites readable.
-_srgb_to_linear = srgb_to_linear
-_linear_to_srgb = linear_to_srgb
-
-
-# Row-4 neutral ramp: name -> index into REFERENCE_SRGB / the 24 sampled patches.
-_NEUTRAL_PATCHES = {
-    "white_9_5": 18,
-    "neutral_8": 19,
-    "neutral_6_5": 20,
-    "neutral_5": 21,
-    "neutral_3_5": 22,
-    "black_2": 23,
-}
-
-
-def _neutral_brightness_report(measured_linear: np.ndarray) -> Dict[str, Dict[str, float]]:
-    """
-    As-shot brightness of each neutral patch as an sRGB-encoded 0-255 value -
-    the same readout a grey-card picker (e.g. Capture One's) shows. ``measured``
-    is the white-balanced value straight off the sensor with no exposure
-    compensation, so it responds directly to light power: adjust the flash
-    until ``measured`` matches ``reference`` (at which point ``exposure_stops``
-    lands near 0) instead of changing camera exposure or digital gain.
-    """
-    report: Dict[str, Dict[str, float]] = {}
-    for name, idx in _NEUTRAL_PATCHES.items():
-        measured = _linear_to_srgb(np.clip(measured_linear[idx], 0.0, 1.0))
-        report[name] = {
-            "measured": round(float(np.mean(measured)) * 255.0, 1),
-            "reference": round(float(np.mean(REFERENCE_SRGB[idx])) * 255.0, 1),
-        }
-    return report
-
-
-def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
-    """
-    Least-squares fit of a 3x3 Color Correction Matrix.
-
-    Solves ``reference ~= measured @ CCM.T`` (each reference row = CCM @ measured_row).
-
-    Parameters
-    ----------
-    measured  : (N, 3) float32, linear-light measured RGB, normalised [0, 1]
-    reference : (N, 3) float32, linear-light reference RGB, normalised [0, 1]
-
-    Returns
-    -------
-    ccm : (3, 3) float32
-    """
-    solution, _, _, _ = np.linalg.lstsq(measured, reference, rcond=None)
-    return solution.T  # shape (3, 3)
-
-
-# ---------------------------------------------------------------------------
-# Automatic ColorChecker detection (cv2.mcc)
-# ---------------------------------------------------------------------------
-
-def _order_corners(pts: np.ndarray) -> np.ndarray:
-    """
-    Order 4 chart corners as [top-left, top-right, bottom-right, bottom-left]
-    *of the image frame* (x+y / x-y heuristic).
-
-    This fixes the winding only - it says nothing about which corner sits next
-    to the dark-skin patch. The calibration render is deliberately unrotated
-    (``user_flip=0``), so a portrait shot puts the chart on its side;
-    ``_oriented_chart_grid`` below tries all four 90-degree assignments and
-    keeps the one whose colors match the reference layout.
-    """
-    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
-    s = pts.sum(axis=1)
-    d = pts[:, 0] - pts[:, 1]
-    return np.array([
-        pts[np.argmin(s)],  # top-left      (smallest x+y)
-        pts[np.argmax(d)],  # top-right     (largest  x-y)
-        pts[np.argmax(s)],  # bottom-right  (largest  x+y)
-        pts[np.argmin(d)],  # bottom-left   (smallest x-y)
-    ], dtype=np.float32)
-
-
-def _orientation_score(measured_srgb: np.ndarray) -> float:
-    """
-    How well 24 sampled patch colors match REFERENCE_SRGB's layout: per-channel
-    Pearson correlation, summed over R/G/B (max 3.0). Standardizing each channel
-    makes the score invariant to exposure and to per-channel gain - so an
-    uncorrected white-balance cast can't disguise the right orientation.
-    Wrong rotations land near 0.
-    """
-    score = 0.0
-    for c in range(3):
-        m, r = measured_srgb[:, c], REFERENCE_SRGB[:, c]
-        ms, rs = float(m.std()), float(r.std())
-        if ms < 1e-6 or rs < 1e-6:
-            continue
-        score += float((((m - m.mean()) / ms) * ((r - r.mean()) / rs)).mean())
-    return score
-
-
-# Below this, no candidate rotation matched the reference layout - the detector
-# most likely latched onto something that isn't a ColorChecker Classic.
-_MIN_ORIENTATION_SCORE = 0.75
-
-
-def _oriented_chart_grid(
-    img_rgb: np.ndarray, box: np.ndarray, *, rows: int = 4, cols: int = 6
-) -> Optional[Dict[str, Any]]:
-    """
-    Map a detected chart quad to the 24 patch centres in REFERENCE_SRGB order,
-    robust to the chart sitting at any 90-degree rotation in the frame.
-
-    Tries the four cyclic corner assignments, samples the patch colors each
-    would imply, and keeps the orientation that correlates with the reference
-    layout. Returns ``None`` if none does (false-positive detection).
-
-    Returns a dict with ``centers`` (24, 2), ``neutral_boxes_norm`` (axis-
-    aligned inner boxes over Neutral 8 / 6.5 for raw WB sampling),
-    ``suggested_radius`` (patch-size-relative sampling half-width), and
-    ``orientation_score``.
-    """
-    corners = _order_corners(box)
-    h, w = img_rgb.shape[:2]
-    img_f = img_rgb.astype(np.float32) / 255.0
-
-    def make_grid(c0, c1, c2, c3):
-        # c0->c1 spans the `cols` axis, c0->c3 the `rows` axis.
-        def grid_point(u: float, v: float) -> np.ndarray:
-            top = c0 + (c1 - c0) * u
-            bot = c3 + (c2 - c3) * u
-            return top + (bot - top) * v
-        centers = np.zeros((rows * cols, 2), dtype=np.float32)
-        for r in range(rows):
-            for c in range(cols):
-                centers[r * cols + c] = grid_point((c + 0.5) / cols, (r + 0.5) / rows)
-        return centers, grid_point
-
-    def sample(centers: np.ndarray, radius: int) -> np.ndarray:
-        out = np.zeros((len(centers), 3), dtype=np.float32)
-        for i, (x, y) in enumerate(centers):
-            xi, yi = int(round(float(x))), int(round(float(y)))
-            x0, y0 = max(0, xi - radius), max(0, yi - radius)
-            patch = img_f[y0:yi + radius, x0:xi + radius].reshape(-1, 3)
-            if patch.size:
-                out[i] = np.median(patch, axis=0)
-        return out
-
-    best_score, best = -np.inf, None
-    cycle = list(corners)
-    for _ in range(4):
-        c0, c1, c2, c3 = cycle
-        centers, grid_point = make_grid(c0, c1, c2, c3)
-        patch_px = min(
-            float(np.linalg.norm(c1 - c0)) / cols,
-            float(np.linalg.norm(c3 - c0)) / rows,
-        )
-        radius = max(2, int(0.15 * patch_px))
-        score = _orientation_score(sample(centers, radius))
-        if score > best_score:
-            best_score, best = score, (centers, grid_point, radius)
-        cycle = cycle[1:] + cycle[:1]
-
-    if best is None or best_score < _MIN_ORIENTATION_SCORE:
-        return None
-    centers, grid_point, radius = best
-
-    # Neutral 8 (#19) and Neutral 6.5 (#20): mid-grey patches for raw white
-    # balance - not the white patch (clips) or black (noisy). Inner ~40% of
-    # each, as an axis-aligned box built from the patch's own step vectors so
-    # any chart rotation works.
-    neutral_boxes_norm: List[Tuple[float, float, float, float]] = []
-    for idx in ((rows - 1) * cols + 1, (rows - 1) * cols + 2):
-        r, c = divmod(idx, cols)
-        u, v = (c + 0.5) / cols, (r + 0.5) / rows
-        center = grid_point(u, v)
-        half_u = (grid_point(u + 0.5 / cols, v) - grid_point(u - 0.5 / cols, v)) * 0.2
-        half_v = (grid_point(u, v + 0.5 / rows) - grid_point(u, v - 0.5 / rows)) * 0.2
-        pts = np.array([
-            center + half_u + half_v, center + half_u - half_v,
-            center - half_u + half_v, center - half_u - half_v,
-        ])
-        neutral_boxes_norm.append((
-            float(pts[:, 0].min()) / w, float(pts[:, 1].min()) / h,
-            float(pts[:, 0].max()) / w, float(pts[:, 1].max()) / h,
-        ))
-
-    return {
-        "centers": centers,
-        "neutral_boxes_norm": neutral_boxes_norm,
-        "suggested_radius": radius,
-        "orientation_score": best_score,
-    }
-
-
-def detect_colorchecker(
-    img_rgb: np.ndarray, *, rows: int = 4, cols: int = 6
-) -> Optional[Dict[str, Any]]:
-    """
-    Auto-detect a ColorChecker Classic anywhere in ``img_rgb`` (uint8 RGB).
-
-    Returns ``None`` if no chart is found, else a dict with:
-      ``centers``            (24, 2) float patch centres in pixel coords, in
-                             REFERENCE_SRGB order (dark skin -> black).
-      ``neutral_boxes_norm`` (x0, y0, x1, y1) boxes (fractions of W/H) over the
-                             Neutral 8 and Neutral 6.5 patches, for raw white
-                             balance sampling.
-      ``suggested_radius``   patch-size-relative sampling half-width (px).
-      ``orientation_score``  reference-layout correlation of the chosen
-                             rotation (max 3.0).
-
-    Patch centres come from bilinearly interpolating the detected chart box
-    over a rows x cols grid, after resolving which of the four 90-degree
-    rotations the chart sits at (see ``_oriented_chart_grid``) - so a portrait
-    shot, whose calibration render is deliberately unrotated, still maps
-    correctly. The centres are geometry, valid on any co-registered render
-    (the linear CCM render, the raw CFA).
-    """
-    if cv2 is None:
-        raise RuntimeError(
-            f"ColorChecker auto-detection needs OpenCV, which isn't available "
-            f"({_CV2_IMPORT_ERROR}); install `opencv-contrib-python-headless`"
-        )
-    if not hasattr(cv2, "mcc"):
-        raise RuntimeError(
-            "this OpenCV build has no `mcc` module; the ColorChecker detector "
-            "ships in opencv-contrib - install `opencv-contrib-python-headless` "
-            "(replacing `opencv-python-headless`), or pass explicit `patch_centers`"
-        )
-
-    bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    detector = cv2.mcc.CCheckerDetector_create()
-    # OpenCV 5 dropped the chartType argument from process(); its second
-    # parameter is now `nc` (max charts to find). Passing 4.x's MCC24 (== 0)
-    # there means "find zero charts", which silently detects nothing - so the
-    # call has to branch on the major version.
-    if int(cv2.__version__.split(".")[0]) >= 5:
-        processed = detector.process(bgr, 1)
-    else:
-        processed = detector.process(bgr, cv2.mcc.MCC24)
-    if not processed:
-        return None
-    checkers = detector.getListColorChecker()
-    if not checkers:
-        return None
-
-    box = np.asarray(checkers[0].getBox(), dtype=np.float32).reshape(-1, 2)
-    if box.shape[0] != 4:
-        return None
-    return _oriented_chart_grid(img_rgb, box, rows=rows, cols=cols)
-
-
-class PatchSampler:
-    """Locate and sample the 24 ColorChecker patches from an RGB image."""
-
-    @staticmethod
-    def auto_sample(img_rgb: np.ndarray, grid: Tuple[int, int] = (4, 6)) -> np.ndarray:
-        """
-        Divide the image into a (rows x cols) grid and sample the centre of each
-        cell. Works well only when the ColorChecker fills the frame and is
-        reasonably upright; for anything else pass explicit ``patch_centers``.
-
-        Returns (N, 3) float32 linear-light RGB.
-        """
-        rows, cols = grid
-        h, w = img_rgb.shape[:2]
-        # Shrink sampling box slightly to avoid dark borders
-        margin_y = int(h * 0.05)
-        margin_x = int(w * 0.05)
-        cell_h = (h - 2 * margin_y) // rows
-        cell_w = (w - 2 * margin_x) // cols
-
-        samples = []
-        for r in range(rows):
-            for c in range(cols):
-                cy = margin_y + r * cell_h + cell_h // 2
-                cx = margin_x + c * cell_w + cell_w // 2
-                # Sample a small region and median to reduce noise
-                patch = img_rgb[cy - 10:cy + 10, cx - 10:cx + 10].reshape(-1, 3)
-                samples.append(np.median(patch, axis=0))
-
-        measured_srgb = np.array(samples, dtype=np.float32) / 255.0
-        return _srgb_to_linear(measured_srgb)
-
-    @staticmethod
-    def sample_at_centers(
-        img_rgb: np.ndarray,
-        centers: Sequence[Tuple[int, int]],
-        radius: int = 10,
-    ) -> np.ndarray:
-        """
-        Sample patches at explicit pixel (x, y) centres - the reliable path when
-        the chart does not fill the frame.
-
-        Parameters
-        ----------
-        img_rgb : (H, W, 3) uint8
-        centers : 24 (x, y) pixel coords, in the same order as REFERENCE_SRGB
-        radius  : half-side of the square sampling region
-
-        Returns (24, 3) float32 linear-light RGB.
-        """
-        samples = []
-        for x, y in centers:
-            x, y = int(x), int(y)
-            patch = img_rgb[y - radius:y + radius, x - radius:x + radius].reshape(-1, 3)
-            samples.append(np.median(patch, axis=0))
-        measured_srgb = np.array(samples, dtype=np.float32) / 255.0
-        return _srgb_to_linear(measured_srgb)
-
-    @staticmethod
-    def sample_linear_at_centers(
-        img_linear: np.ndarray,
-        centers: Sequence[Tuple[float, float]],
-        radius: int = 10,
-    ) -> np.ndarray:
-        """
-        Sample patches from an already-**linear-light** float RGB image at the
-        given (x, y) centres - the precise path when calibrating from a 16-bit
-        linear RAW render (no sRGB round-trip). Returns (N, 3) float32 linear RGB.
-        """
-        h, w = img_linear.shape[:2]
-        samples = []
-        for x, y in centers:
-            x, y = int(round(float(x))), int(round(float(y)))
-            x0, y0 = max(0, x - radius), max(0, y - radius)
-            patch = img_linear[y0:y + radius, x0:x + radius].reshape(-1, 3)
-            samples.append(np.median(patch, axis=0))
-        return np.asarray(samples, dtype=np.float32)
-
-
-class ColorCorrector:
-    """
-    Holds a fitted 3x3 Color Correction Matrix and applies it to RGB images.
-
-    All image math lives here, decoupled from Viam, so the same logic can be
-    unit-tested or driven from a script. Operates on numpy uint8 RGB arrays;
-    callers convert to/from PIL or base64 at the edges.
-    """
-
-    def __init__(self, ccm: np.ndarray):
-        ccm = np.asarray(ccm, dtype=np.float32)
-        if ccm.shape != (3, 3):
-            raise ValueError(f"CCM must be a 3x3 matrix, got shape {ccm.shape}")
-        self.ccm = ccm
-
-    @classmethod
-    def identity(cls) -> "ColorCorrector":
-        """A no-op corrector (passes colors through unchanged)."""
-        return cls(np.eye(3, dtype=np.float32))
-
-    # ------------------------------------------------------------------
-    # Calibration
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def calibrate_from_rgb(
-        cls,
-        img_rgb: np.ndarray,
-        patch_centers: Optional[Sequence[Tuple[int, int]]] = None,
-        radius: int = 10,
-    ) -> "ColorCorrector":
-        """
-        Fit a CCM from an RGB image of the ColorChecker Classic.
-
-        If ``patch_centers`` is given (24 (x, y) coords in REFERENCE_SRGB order)
-        the patches are sampled there; otherwise auto-sampling assumes the chart
-        fills the frame.
-        """
-        if patch_centers is not None:
-            measured_linear = PatchSampler.sample_at_centers(img_rgb, patch_centers, radius)
-        else:
-            measured_linear = PatchSampler.auto_sample(img_rgb)
-
-        reference_linear = _srgb_to_linear(REFERENCE_SRGB)
-        ccm = _fit_ccm(measured_linear, reference_linear)
-        return cls(ccm)
-
-    # ------------------------------------------------------------------
-    # Application
-    # ------------------------------------------------------------------
-
-    @property
-    def is_identity(self) -> bool:
-        return bool(np.allclose(self.ccm, np.eye(3, dtype=np.float32)))
-
-    def apply_to_linear(self, img_linear: np.ndarray) -> np.ndarray:
-        """
-        Apply the CCM to an (H, W, 3) **linear-light** float RGB array, returning
-        a linear float array. This is the high-precision path: callers working
-        from 16-bit RAW stay in linear float end to end and only encode the
-        output transfer curve at export. Identity is a no-op passthrough.
-        """
-        if self.is_identity:
-            return img_linear
-        h, w = img_linear.shape[:2]
-        corrected = (img_linear.reshape(-1, 3) @ self.ccm.T).reshape(h, w, 3)
-        return corrected.astype(np.float32)
-
-    def apply_to_rgb(self, img_rgb: np.ndarray) -> np.ndarray:
-        """
-        Apply the CCM to an (H, W, 3) uint8 sRGB array, returning uint8 sRGB.
-
-        Convenience wrapper for the 8-bit streaming path (proxied JPEG/PNG
-        frames): sRGB -> linear -> CCM -> sRGB. A no-op (identity) matrix returns
-        the input untouched, avoiding gamma round-trip rounding.
-        """
-        if self.is_identity:
-            return img_rgb
-        img_linear = _srgb_to_linear(img_rgb.astype(np.float32) / 255.0)
-        corrected_srgb = _linear_to_srgb(self.apply_to_linear(img_linear))
-        return np.rint(corrected_srgb * 255.0).clip(0, 255).astype(np.uint8)
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def delta_e_report(
-        self,
-        img_rgb: np.ndarray,
-        patch_centers: Optional[Sequence[Tuple[int, int]]] = None,
-    ) -> dict:
-        """
-        Per-patch color error before vs. after correction, as a quick measure of
-        calibration quality. Distances are Euclidean in linear RGB (a rough ΔE
-        proxy, not CIE ΔE), scaled by 100.
-        """
-        if patch_centers is not None:
-            measured = PatchSampler.sample_at_centers(img_rgb, patch_centers)
-        else:
-            measured = PatchSampler.auto_sample(img_rgb)
-        ref_linear = _srgb_to_linear(REFERENCE_SRGB)
-        corrected_linear = (measured @ self.ccm.T).clip(0, 1)
-
-        def dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.sqrt(np.sum((a - b) ** 2, axis=1)) * 100
-
-        before = dist(measured, ref_linear)
-        after = dist(corrected_linear, ref_linear)
-        return {
-            "before": {"mean": float(before.mean()), "max": float(before.max())},
-            "after": {"mean": float(after.mean()), "max": float(after.max())},
-        }
-
 
 # ---------------------------------------------------------------------------
 # Image <-> base64 / PIL helpers (used on the DoCommand boundary)
@@ -890,30 +348,6 @@ class ColorCorrection(Camera, EasyResource):
         # that fail to upload are kept for retry.
         self._delete_after_upload: bool = bool(attrs.get("delete_after_upload", False))
 
-        # Optional Nines partner-API delivery (the REST API in the nines-webapp
-        # repo's partner-api-guide.md). With an API key and organization slug
-        # configured, `upload` calls that carry a `sku` also upsert the Nines
-        # product for that SKU and append the shot's delivery image to it, and
-        # the `nines_upload` command sends arbitrary on-disk images. Left
-        # unconfigured, `upload` behaves exactly as before.
-        self._nines_api_key: Optional[str] = (
-            attrs.get("nines_api_key") or os.environ.get("NINES_API_KEY") or None
-        )
-        self._nines_org_slug: Optional[str] = (
-            attrs.get("nines_organization_slug") or None
-        )
-        self._nines_base_url: str = str(
-            attrs.get("nines_base_url") or NINES_DEFAULT_BASE_URL
-        ).rstrip("/")
-        # Upserted reference-item ids keyed by (org slug, SKU), so a multi-shot
-        # submit upserts each product once. The org is part of the key because
-        # one machine can serve multiple orgs (the webapp may pass a per-request
-        # `shots_organization_slug`) and the same external_id/SKU can exist in
-        # more than one org - a SKU-only key would deliver one org's shot to
-        # another org's product. Reset on reconfigure: the ids are also scoped
-        # to the base URL, which may just have changed.
-        self._nines_item_ids: Dict[Tuple[str, str], str] = {}
-
         # The `upload` DoCommand authenticates to the cloud with the API key
         # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
         # so no credentials are configured here. part_id falls back to the
@@ -935,6 +369,23 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._upload_file_timeout_s: float = float(
             attrs.get("upload_file_timeout_s", 180.0)
+        )
+
+        # Optional Nines partner-API delivery (see models/nines.py). With an
+        # API key and organization slug configured, `upload` calls that carry a
+        # `sku` also upsert the Nines product for that SKU and append the
+        # shot's delivery image to it, and the `nines_upload` command sends
+        # arbitrary on-disk images. Left unconfigured, `upload` behaves exactly
+        # as before. Rebuilt on every reconfigure, which also resets the
+        # client's reference-item cache (its ids are scoped to the base URL,
+        # which may just have changed).
+        self._nines = NinesClient(
+            api_key=attrs.get("nines_api_key") or os.environ.get("NINES_API_KEY") or None,
+            org_slug=attrs.get("nines_organization_slug") or None,
+            base_url=str(attrs.get("nines_base_url") or NINES_DEFAULT_BASE_URL),
+            logger=self.logger,
+            request_timeout_s=self._upload_dial_timeout_s,
+            upload_timeout_s=self._upload_file_timeout_s,
         )
 
         # In-flight deferred captures (`capture` with `defer: true`), keyed by
@@ -1227,7 +678,7 @@ class ColorCorrection(Camera, EasyResource):
 
         # Fit the CCM on patches developed with the SAME white balance the
         # captures will use, so the matrix and the WB stay consistent.
-        reference_linear = _srgb_to_linear(REFERENCE_SRGB)
+        reference_linear = srgb_to_linear(REFERENCE_SRGB)
         if raw_path:
             linear = load_linear_rgb(
                 raw_path,
@@ -2236,176 +1687,6 @@ class ColorCorrection(Camera, EasyResource):
             return base
         return name + base[len(capture_stem):]
 
-    def _nines_ready(self, org_slug: Optional[str]) -> bool:
-        """Whether Nines delivery can proceed for the given effective org slug.
-        Needs an API key plus an org slug from *somewhere* - the per-request
-        ``org_slug`` when the webapp supplies one, else the configured slug. A
-        machine configured with only a key can still serve any org the webapp
-        names; that's what lets one machine deliver to multiple orgs."""
-        return bool(self._nines_api_key and (org_slug or self._nines_org_slug))
-
-    @staticmethod
-    def _nines_pick_image(paths: Sequence[str]) -> Optional[str]:
-        """
-        Choose the one file of a capture set to deliver to Nines. The partner
-        API wants exactly one full-resolution original per view and accepts
-        only jpeg/png/webp/gif - so out of a set that also carries the RAW
-        master, TIFFs, and the sidecar, prefer the full-res JPEG, then the
-        8-bit PNG, then the 16-bit PNG, then webp/gif. Returns ``None`` when
-        nothing in the set is eligible.
-        """
-        def rank(path: str) -> Optional[Tuple[int, str]]:
-            ext = os.path.splitext(path)[1].lower()
-            if ext not in NINES_CONTENT_TYPES:
-                return None
-            if ext in (".jpg", ".jpeg"):
-                order = 0
-            elif ext == ".png":
-                order = 2 if path.lower().endswith("_16.png") else 1
-            elif ext == ".webp":
-                order = 3
-            else:  # .gif
-                order = 4
-            return order, path
-
-        ranked = sorted(r for r in map(rank, paths) if r is not None)
-        return ranked[0][1] if ranked else None
-
-    def _nines_request(
-        self, method: str, path: str, body: Mapping[str, Any], timeout_s: float
-    ) -> Dict[str, Any]:
-        """
-        One JSON request to the Nines partner API. Synchronous (urllib) - call
-        it via ``asyncio.to_thread``. Raises :class:`NinesAPIError` carrying
-        the HTTP status and the API's ``error`` description on a non-2xx
-        response, or without a status when the API was unreachable.
-        """
-        request = urllib.request.Request(
-            f"{self._nines_base_url}{path}",
-            data=json.dumps(body).encode(),
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self._nines_api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout_s) as resp:
-                return json.loads(resp.read().decode() or "{}")
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = json.loads(exc.read().decode()).get("error", "")
-            except Exception:  # noqa: BLE001 - error bodies aren't guaranteed JSON
-                pass
-            raise NinesAPIError(
-                f"Nines API {method} {path} failed with {exc.code}"
-                + (f": {detail}" if detail else ""),
-                status=exc.code,
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise NinesAPIError(
-                f"Nines API {method} {path} unreachable: {exc.reason}"
-            ) from exc
-
-    async def _nines_upsert_item(
-        self, sku: str, product_name: Optional[str], org_slug: Optional[str] = None
-    ) -> str:
-        """
-        Upsert the Nines reference item whose ``external_id`` is ``sku`` in the
-        effective org (``org_slug`` when given, else the configured slug) and
-        cache its id under ``(org, sku)``. Deliberately sends no ``images``
-        field - on an existing product that would *replace* all of its imagery;
-        appending happens through the non-destructive images endpoint only.
-        """
-        org = org_slug or self._nines_org_slug
-        response = await asyncio.to_thread(
-            self._nines_request,
-            "POST",
-            "/api/v1/reference_items",
-            {
-                "shots_organization_slug": org,
-                "name": product_name or sku,
-                "external_id": sku,
-            },
-            self._upload_dial_timeout_s,
-        )
-        item_id = str(response.get("id") or "")
-        if not item_id:
-            raise NinesAPIError("Nines upsert returned no reference item id")
-        self._nines_item_ids[(org, sku)] = item_id
-        self.logger.info(
-            f"Nines reference item {item_id} "
-            f"({'created' if response.get('created') else 'updated'}) "
-            f"for SKU {sku!r} in org {org!r}"
-        )
-        return item_id
-
-    async def _nines_deliver(
-        self,
-        sku: str,
-        images: Sequence[Tuple[str, str, List[str]]],
-        product_name: Optional[str] = None,
-        org_slug: Optional[str] = None,
-    ) -> Dict[str, ValueTypes]:
-        """
-        Deliver on-disk image files to the Nines product identified by ``sku``
-        in the effective org (``org_slug`` when given, else the configured
-        slug): upsert the reference item (once per ``(org, SKU)`` since the last
-        reconfigure), then append every image non-destructively as inline
-        base64. ``images`` is ``[(path, upload_filename, tags)]``; every file
-        must carry a jpeg/png/webp/gif extension. Raises on any API failure -
-        callers decide whether that fails their operation.
-        """
-        org = org_slug or self._nines_org_slug
-        cached = (org, sku) in self._nines_item_ids
-        item_id = self._nines_item_ids.get((org, sku)) or await self._nines_upsert_item(
-            sku, product_name, org_slug=org
-        )
-
-        payload: List[Dict[str, Any]] = []
-        for path, filename, tags in images:
-            image: Dict[str, Any] = {
-                "data": await asyncio.to_thread(_read_base64, path),
-                "filename": filename,
-                "content_type": NINES_CONTENT_TYPES[os.path.splitext(path)[1].lower()],
-            }
-            if tags:
-                image["tags"] = tags
-            payload.append(image)
-
-        async def append(rid: str) -> Dict[str, Any]:
-            return await asyncio.to_thread(
-                self._nines_request,
-                "POST",
-                f"/api/v1/reference_items/{rid}/images",
-                {"shots_organization_slug": org, "images": payload},
-                self._upload_file_timeout_s,
-            )
-
-        try:
-            response = await append(item_id)
-        except NinesAPIError as exc:
-            # A cached id can go stale (product deleted on the Nines side);
-            # re-upsert once and retry rather than wedging every later shot of
-            # the session on the dead id.
-            if not (cached and exc.status == 404):
-                raise
-            self.logger.warning(
-                f"cached Nines item {item_id} for SKU {sku!r} in org {org!r} is "
-                "gone (404); re-upserting and retrying"
-            )
-            self._nines_item_ids.pop((org, sku), None)
-            item_id = await self._nines_upsert_item(sku, product_name, org_slug=org)
-            response = await append(item_id)
-
-        return {
-            "reference_item_id": item_id,
-            "external_id": sku,
-            "added_count": response.get("added_count"),
-            "images_count": response.get("images_count"),
-        }
-
     async def _nines_deliver_for_upload(
         self,
         sku: str,
@@ -2424,8 +1705,8 @@ class ColorCorrection(Camera, EasyResource):
         delivery failed). Never raises: a Nines problem is reported in the
         result, not allowed to fail the Viam half of the submit.
         """
-        org = org_slug or self._nines_org_slug
-        if not self._nines_ready(org):
+        org = org_slug or self._nines.org_slug
+        if not self._nines.ready(org):
             self.logger.info(
                 f"`upload` got sku {sku!r} but Nines delivery is not configured"
             )
@@ -2435,7 +1716,7 @@ class ColorCorrection(Camera, EasyResource):
                            "or a per-request `shots_organization_slug`)"
             }, None
 
-        delivery = self._nines_pick_image(paths)
+        delivery = self._nines.pick_image(paths)
         if delivery is None:
             return {
                 "error": "no Nines-compatible image (jpeg/png/webp/gif) in "
@@ -2444,7 +1725,7 @@ class ColorCorrection(Camera, EasyResource):
 
         filename = self._renamed_basename(delivery, name, capture_stem)
         try:
-            result = await self._nines_deliver(
+            result = await self._nines.deliver(
                 sku, [(delivery, filename, [os.path.splitext(filename)[0]])],
                 org_slug=org,
             )
@@ -2492,7 +1773,7 @@ class ColorCorrection(Camera, EasyResource):
         if not raw_paths:
             raise ValueError("`nines_upload` needs a non-empty `paths` list")
         org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
-        if not self._nines_ready(org_slug):
+        if not self._nines.ready(org_slug):
             raise ValueError(
                 "Nines delivery is not configured: set the `nines_api_key` "
                 "config attribute (the key may also come from the NINES_API_KEY "
@@ -2511,7 +1792,7 @@ class ColorCorrection(Camera, EasyResource):
             )
         tags = [str(t) for t in (opts.get("tags") or [])]
         product_name = opts.get("product_name")
-        return await self._nines_deliver(
+        return await self._nines.deliver(
             sku,
             [(p, os.path.basename(p), tags) for p in paths],
             product_name=str(product_name) if product_name else None,

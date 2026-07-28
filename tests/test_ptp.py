@@ -2,9 +2,11 @@
 (no camera hardware needed)."""
 
 import asyncio
+import time
 
 import pytest
 
+from models import ptp as ptp_module
 from models.ptp import (
     PTP,
     PTPSession,
@@ -186,10 +188,17 @@ class _StableInfo:
         self.file.size = size
 
 
-def _session_with_listings(listings, sizes=None):
+class _FakeCamCaptureComplete(_FakeCam):
+    """A body that reports CAPTURE_COMPLETE but never FILE_ADDED."""
+
+    def wait_for_event(self, _timeout_ms):
+        return gp.GP_EVENT_CAPTURE_COMPLETE, None
+
+
+def _session_with_listings(listings, sizes=None, cam_cls=_FakeCamNoEvent):
     """Session on a no-event body whose card contents step through `listings`
     (the last entry repeats). `sizes` optionally scripts file_get_info sizes."""
-    cam = _FakeCamNoEvent(trigger_errors=[])
+    cam = cam_cls(trigger_errors=[])
     if sizes is None:
         cam.file_get_info = lambda folder, name: _StableInfo()
     else:
@@ -225,11 +234,141 @@ def test_capture_fallback_prefers_raw_on_first_store():
     assert session.capture(settle=0.05) == "/store_00010001/DCIM/9Q0A0002.CR3"
 
 
+def test_capture_scans_during_the_settle_window_instead_of_waiting_it_out():
+    # Canon bodies stop emitting FILE_ADDED after the first capture of a
+    # session, so on a no-event body the card scan has to *race* the event
+    # wait. When the scan ran only after the event wait expired, every frame
+    # after the first paid the whole settle window before looking at the card.
+    old = ["/store_00010001/DCIM/9Q0A0001.CR3"]
+    new = "/store_00010001/DCIM/9Q0A0002.CR3"
+    session = _session_with_listings([old, old + [new]])
+    start = time.monotonic()
+    assert session.capture(settle=30.0) == new
+    assert time.monotonic() - start < 5.0  # not the 30s ceiling
+
+
+def test_capture_scans_as_soon_as_the_body_reports_capture_complete():
+    # CAPTURE_COMPLETE means the write is done: it's both the earliest a scan
+    # can succeed (an earlier one gets -110 busy) and the earliest it can find
+    # anything, so it must pre-empt the head-start timer.
+    old = ["/store_00010001/DCIM/9Q0A0001.CR3"]
+    new = "/store_00010001/DCIM/9Q0A0002.CR3"
+    session = _session_with_listings(
+        [old, old + [new]], cam_cls=_FakeCamCaptureComplete
+    )
+    start = time.monotonic()
+    assert session.capture(settle=30.0) == new
+    assert time.monotonic() - start < ptp_module._SCAN_HEAD_START_SEC
+
+
+def test_capture_stops_scanning_speculatively_once_the_body_reports_the_event():
+    # A scan before CAPTURE_COMPLETE never finds anything on such a body (the
+    # file isn't visible until the write lands) and costs real USB bus time
+    # contending with that write - measured at 0.29-0.95s per scan on an R5.
+    # So after the first capture teaches us the body reports it, later captures
+    # must wait for the event rather than poll the card.
+    first = ["/store_00010001/DCIM/9Q0A0001.CR3"]
+    second = first + ["/store_00010001/DCIM/9Q0A0002.CR3"]
+    third = second + ["/store_00010001/DCIM/9Q0A0003.CR3"]
+    # snapshot, scan (capture 1), then snapshot, scan (capture 2)
+    session = _session_with_listings(
+        [first, second, second, third], cam_cls=_FakeCamCaptureComplete
+    )
+    scans = []
+    listing = session.list_image_files
+    session.list_image_files = lambda: (scans.append(1), listing())[1]
+
+    assert session.capture(settle=30.0) == second[-1]
+    assert session._reports_capture_complete
+    before = len(scans)
+
+    # Second capture: the event still drives it, and no timer scan precedes it.
+    assert session.capture(settle=30.0) == third[-1]
+    assert len(scans) - before == 2  # the pre-trigger snapshot and one real scan
+
+
+def test_capture_survives_a_busy_rescan_instead_of_propagating_it():
+    # A scan that lands while the body is still flushing raises -110; that's
+    # "not ready", not a failed capture.
+    old = ["/store_00010001/DCIM/9Q0A0001.CR3"]
+    new = "/store_00010001/DCIM/9Q0A0002.CR3"
+    session = _session_with_listings([old])
+    calls = []
+
+    def listing():
+        calls.append(1)
+        if len(calls) == 1:
+            return old  # the pre-trigger snapshot
+        if len(calls) == 2:
+            raise gp.GPhoto2Error(gp.GP_ERROR_CAMERA_BUSY)
+        return old + [new]
+
+    session.list_image_files = listing
+    assert session.capture(settle=30.0) == new
+
+
 def test_capture_fallback_no_new_file_raises():
     files = ["/store_00010001/DCIM/9Q0A0001.CR3"]
     session = _session_with_listings([files])
     with pytest.raises(RuntimeError, match="no new image"):
         session.capture(settle=0.05)
+
+
+# ---------------------------------------------------------------------------
+# refresh(): a busy body is not a broken connection
+# ---------------------------------------------------------------------------
+
+class _BusyCam:
+    """A camera whose first `busy_inits` re-inits report -110 (still writing)."""
+
+    def __init__(self, busy_inits):
+        self.busy_inits = busy_inits
+        self.inits = 0
+
+    def exit(self):
+        pass
+
+    def init(self):
+        self.inits += 1
+        if self.inits <= self.busy_inits:
+            raise gp.GPhoto2Error(gp.GP_ERROR_CAMERA_BUSY)
+
+
+def _session_tracking_reopen(cam, monkeypatch):
+    monkeypatch.setattr(ptp_module, "_BUSY_RETRY_DELAY_SEC", 0.0)
+    session = _session_with_cam(cam)
+    reopened = []
+    session.close = lambda: reopened.append("close")
+    session.open = lambda: reopened.append("open")
+    return session, reopened
+
+
+def test_refresh_waits_out_a_busy_camera(monkeypatch):
+    cam = _BusyCam(busy_inits=2)
+    session, reopened = _session_tracking_reopen(cam, monkeypatch)
+    session.refresh()
+    assert cam.inits == 3  # two busy, then through
+    assert not reopened
+
+
+def test_refresh_raises_when_busy_rather_than_killing_the_session(monkeypatch):
+    # -110 while the body flushes a frame is transient. The old code reopened
+    # on any error, and reopening mid-write can't claim the interface (-53) -
+    # which killed a live session and made every later call fail.
+    cam = _BusyCam(busy_inits=99)
+    session, reopened = _session_tracking_reopen(cam, monkeypatch)
+    with pytest.raises(gp.GPhoto2Error):
+        session.refresh()
+    assert cam.inits == ptp_module._BUSY_RETRIES
+    assert not reopened
+
+
+def test_refresh_still_reopens_on_a_real_handshake_failure(monkeypatch):
+    cam = _BusyCam(busy_inits=0)
+    cam.init = lambda: (_ for _ in ()).throw(gp.GPhoto2Error(gp.GP_ERROR_IO_USB_FIND))
+    session, reopened = _session_tracking_reopen(cam, monkeypatch)
+    session.refresh()
+    assert reopened == ["close", "open"]
 
 
 def test_wait_size_stable_waits_for_settled_size():

@@ -27,10 +27,10 @@ Two ways to get images out:
               are too large for gRPC, so they move by file path (`saved_to`).
               Many bodies (notably Canon) write the still to the card themselves
               and report the capture as a benign libgphoto2 -1 without handing
-              back the path; in that case we wait `capture_settle` seconds for
-              the write to finish, then scan the card for the file this trigger
-              added (diffed against a pre-trigger snapshot) and download it
-              once its size settles.
+              back the path; in that case we poll the card for the file this
+              trigger added (diffed against a pre-trigger snapshot) and download
+              it once its size settles. `capture_settle` is the *cap* on that
+              wait, not a fixed delay - we return as soon as the frame lands.
 
        {"trigger": {}}
            -> trip the shutter but skip the download; returns
@@ -166,6 +166,31 @@ _FOCUS_RELEVANT_WIDGETS = (
 # timing we can't verify without the body.
 _LIVE_VIEW_SETTLE_SEC = 0.75
 
+# capture() waits for the new frame rather than sleeping a fixed delay, so
+# these bound the *polling*, not the expected latency.
+#   floor      - `capture_settle` is a ceiling on how long we'll wait for the
+#                frame; never give up sooner than this even if it's set lower.
+#   head start - how long we hold off the first card scan when the body has
+#                reported nothing at all. A scan re-handshakes USB, which a
+#                body mid-write refuses (-110), so scanning early is worse than
+#                useless; a body that reports CAPTURE_COMPLETE skips this wait.
+#   interval   - gap between card scans; a scan is itself expensive
+#                (re-handshake plus a recursive folder walk).
+#   backoff    - a *failed* scan means "busy", so those back off to this cap
+#                instead of retrying at `interval`.
+_CAPTURE_TIMEOUT_FLOOR_SEC = 5.0
+_SCAN_HEAD_START_SEC = 1.0
+_SCAN_INTERVAL_SEC = 0.25
+_SCAN_BACKOFF_MAX_SEC = 1.0
+# How long before the deadline the safety-net scan runs on a body we've already
+# seen report CAPTURE_COMPLETE. Enough for one scan plus the size check.
+_LATE_SCAN_MARGIN_SEC = 1.5
+
+# Retries for a camera that answers -110 (busy) because it's still flushing a
+# frame to the card. Doubling from 0.25s, five attempts covers ~4s of writing.
+_BUSY_RETRIES = 5
+_BUSY_RETRY_DELAY_SEC = 0.25
+
 # Built lazily because `gp` is None when the gphoto2 wheel is missing (see the
 # import guard above), so we can't reference gp.GP_WIDGET_* at module load.
 _WIDGET_TYPE_NAMES: Optional[Dict[int, str]] = None
@@ -252,6 +277,10 @@ class PTPSession:
     thread executor under a lock. Not thread-safe on its own - one caller at a
     time.
     """
+
+    # Set the first time a capture on this body reports GP_EVENT_CAPTURE_COMPLETE.
+    # A class-level default so sessions built without __init__ (tests) have it.
+    _reports_capture_complete = False
 
     def __init__(self, port: Optional[str] = None, model_match: Optional[str] = None):
         if gp is None:
@@ -488,17 +517,40 @@ class PTPSession:
         re-reads it. We reuse the same ``Camera`` object and its port binding,
         so this is a USB re-handshake, not a full re-autodetect. If the
         re-handshake fails we fall back to a clean reopen.
+
+        Except when the body is merely *busy*: a camera still flushing a frame
+        to the card answers the re-init with -110 (GP_ERROR_CAMERA_BUSY). That
+        is not a broken connection, and reopening then can't claim the
+        interface (-53) - it takes down a session that was perfectly fine, and
+        every later call on the dead handle fails. So busy is retried with
+        backoff and then *raised*; callers that can wait (the capture scan,
+        the size-stability poll) retry, and we never tear down a live
+        connection over a transient. Note libgphoto2 re-inits the camera on
+        demand, so raising mid-``exit()`` leaves it usable.
         """
         cam = self._camera
         if cam is None:
             return
-        try:
-            cam.exit()
-            cam.init()
-        except gp.GPhoto2Error as exc:
-            LOGGER.debug(f"refresh re-handshake failed ({exc}); reopening")
-            self.close()
-            self.open()
+        delay = _BUSY_RETRY_DELAY_SEC
+        for attempt in range(_BUSY_RETRIES):
+            try:
+                cam.exit()
+                cam.init()
+                return
+            except gp.GPhoto2Error as exc:
+                if getattr(exc, "code", None) != gp.GP_ERROR_CAMERA_BUSY:
+                    LOGGER.debug(f"refresh re-handshake failed ({exc}); reopening")
+                    self.close()
+                    self.open()
+                    return
+                if attempt == _BUSY_RETRIES - 1:
+                    LOGGER.debug(
+                        f"camera still busy after {_BUSY_RETRIES} refresh "
+                        "attempts; leaving the connection alone"
+                    )
+                    raise
+                time.sleep(delay)
+                delay *= 2
 
     @_retry_once_on_device_gone
     def list_image_files(self, folder: str = "/") -> List[str]:
@@ -556,11 +608,17 @@ class PTPSession:
         bodies (notably Canon writing to the card) never send, then raises a
         generic -1. ``trigger_capture()`` trips the shutter and returns at once.
 
-        After firing we drain the event queue for up to ``settle`` seconds. That
-        gives the body time to finish writing and lets libgphoto2 process events:
-        a body that *does* report the new file hands us its path directly (fast
-        path), and one that writes to the card silently falls through to a
-        card scan for the file the trigger produced.
+        After firing we race two signals against each other, and return the
+        instant either one produces a path: libgphoto2's event queue (a body
+        that *does* report the new file hands us its path directly) and a scan
+        of the card (for one that writes silently). ``settle`` is the ceiling
+        on that race, not a fixed delay - with a fast card a capture usually
+        resolves in a few hundred milliseconds.
+
+        Racing matters because Canon bodies stop emitting FILE_ADDED after the
+        first capture of a session: draining events for the *whole* settle
+        window before even looking at the card meant every frame after the
+        first paid the full window before starting to scan.
 
         The scan identifies the new file by diffing against a pre-trigger
         snapshot of the card - NOT by "lexically newest overall". On dual-slot
@@ -619,47 +677,94 @@ class PTPSession:
         # wait_for_event returns *early* on each event, and bodies emit a burst
         # of non-file events (capture-complete, unknown) right after the shutter
         # trips. Crediting each of those the full step would blow the whole
-        # settle budget in milliseconds and we'd give up before the card write
+        # budget in milliseconds and we'd give up before the card write
         # finishes. We cap each wait at the time remaining so we never overshoot.
         LOGGER.debug(f"[timing] shutter trigger: {time.perf_counter() - t_trigger:.2f}s")
         t_settle = time.perf_counter()
-        deadline = time.monotonic() + settle
+        deadline = time.monotonic() + max(settle, _CAPTURE_TIMEOUT_FLOOR_SEC)
+        # CAPTURE_COMPLETE means the write is done: both the earliest a scan
+        # can succeed and the earliest it can find anything. Timer scans are
+        # only for bodies that report neither that nor FILE_ADDED, so once a
+        # body has shown it reports the event we stop scanning speculatively
+        # and just listen. Measured on an R5 writing a 54.5 MB CR3 to SD: three
+        # scans before the event each found nothing and cost 0.29s, 0.41s and
+        # 0.95s of USB bus time - they were competing with the write they were
+        # waiting on. One late scan stays as a safety net in case the event
+        # doesn't arrive this time.
+        head_start = _SCAN_HEAD_START_SEC
+        if self._reports_capture_complete:
+            head_start = max(
+                _SCAN_HEAD_START_SEC,
+                max(settle, _CAPTURE_TIMEOUT_FLOOR_SEC) - _LATE_SCAN_MARGIN_SEC,
+            )
+        next_scan = time.monotonic() + min(settle, head_start)
+        scan_backoff = _SCAN_INTERVAL_SEC
+        capture_complete = False
+        new_files: List[str] = []
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if now >= deadline:
                 break
-            event_type, event_data = cam.wait_for_event(min(500, int(remaining * 1000) + 1))
+            # Sleep in the event queue until the next scan is due, in slices
+            # short enough that an event burst can't starve the scan. Re-read
+            # self._cam every pass: a rescan below can reconnect underneath us,
+            # and the old handle would then fail with "could not claim".
+            wait_s = min(0.25, deadline - now, max(next_scan - now, 0.0))
+            try:
+                event_type, event_data = self._cam.wait_for_event(int(wait_s * 1000) + 1)
+            except gp.GPhoto2Error as exc:
+                # Busy (still writing) is expected here; anything else is a
+                # real failure and the caller's device-gone path should see it.
+                if getattr(exc, "code", None) != gp.GP_ERROR_CAMERA_BUSY:
+                    raise
+                LOGGER.debug(f"camera busy while waiting for the frame ({exc})")
+                time.sleep(_BUSY_RETRY_DELAY_SEC)
+                continue
             if event_type == gp.GP_EVENT_FILE_ADDED:
                 LOGGER.debug(
                     f"[timing] camera reported new file after "
-                    f"{time.perf_counter() - t_settle:.2f}s of settle wait"
+                    f"{time.perf_counter() - t_settle:.2f}s"
                 )
                 return event_data.folder.rstrip("/") + "/" + event_data.name
-
-        # No path reported - the body wrote it to the card itself. Poll for a
-        # file that wasn't in the pre-trigger snapshot.
-        LOGGER.debug(
-            f"[timing] no file event within the {settle:.1f}s settle window; "
-            "scanning card for the new file"
-        )
-        t_scan = time.perf_counter()
-        scan_deadline = time.monotonic() + max(settle, 5.0)
-        new_files: List[str] = []
-        while True:
+            if event_type == gp.GP_EVENT_CAPTURE_COMPLETE and not capture_complete:
+                # Only the *first* one pre-empts the timer; a body that repeats
+                # the event must not get a scan per event.
+                capture_complete = True
+                self._reports_capture_complete = True
+                LOGGER.debug(
+                    f"[timing] capture complete after "
+                    f"{time.perf_counter() - t_settle:.2f}s; scanning the card"
+                )
+                next_scan = now  # the body is done writing - scan now
+            elif time.monotonic() < next_scan:
+                continue
+            # No path reported - look for a file that wasn't on the card before
+            # the trigger.
+            t_scan = time.perf_counter()
             try:
                 new_files = sorted(set(self.list_image_files()) - before)
             except Exception as exc:
-                LOGGER.debug(f"card rescan failed ({exc}); retrying")
-            if new_files or time.monotonic() >= scan_deadline:
-                break
-            time.sleep(0.5)
-        LOGGER.debug(
-            f"[timing] card scan for new file: {time.perf_counter() - t_scan:.2f}s "
-            f"(found {len(new_files)})"
-        )
+                LOGGER.debug(
+                    f"[timing] card scan at {t_scan - t_settle:.2f}s failed after "
+                    f"{time.perf_counter() - t_scan:.2f}s ({exc})"
+                )
+            else:
+                if new_files:
+                    break
+                LOGGER.debug(
+                    f"[timing] card scan at {t_scan - t_settle:.2f}s found nothing "
+                    f"(took {time.perf_counter() - t_scan:.2f}s)"
+                )
+            # Empty or failed, the story is the same: the body hasn't finished
+            # writing. Back off either way - a scan is a USB re-handshake, and
+            # hammering one at a body mid-write risks slowing the write itself.
+            next_scan = time.monotonic() + scan_backoff
+            scan_backoff = min(scan_backoff * 2, _SCAN_BACKOFF_MAX_SEC)
+
         if not new_files:
             raise RuntimeError(
-                "capture fired but no new image appeared on the card - check "
+                f"capture fired but no new image appeared on the card within "
+                f"{max(settle, _CAPTURE_TIMEOUT_FLOOR_SEC):.1f}s - check "
                 "autofocus (try manual focus or a lit, high-contrast subject), "
                 "the memory card, and that the mode dial allows remote release."
             )
@@ -674,29 +779,48 @@ class PTPSession:
         return path
 
     def _wait_size_stable(
-        self, path: str, timeout: float = 20.0, interval: float = 0.7
+        self,
+        path: str,
+        timeout: float = 20.0,
+        interval: float = 0.2,
+        max_interval: float = 0.7,
     ) -> None:
         """Wait until the camera reports a settled size for ``path``.
 
-        The card-scan fallback can spot the new file while the body is still
-        flushing it (a slow SD slot takes several seconds for a full RAW);
-        downloading then yields a truncated frame. Poll the reported size until
-        two consecutive reads agree. libgphoto2 caches file info along with
-        the directory listing, so the cache must be dropped (``refresh()``)
-        before every read - without that, both reads return the size cached
-        when the file was first seen, a mid-write file looks "stable", and the
-        following ``file_get`` downloads exactly that stale byte count.
+        The card scan can spot the new file while the body is still flushing it
+        (a slow SD slot takes several seconds for a full RAW); downloading then
+        yields a truncated frame. Poll the reported size until two consecutive
+        reads agree. libgphoto2 caches file info along with the directory
+        listing, so the cache must be dropped (``refresh()``) before every read
+        - without that, both reads return the size cached when the file was
+        first seen, a mid-write file looks "stable", and the following
+        ``file_get`` downloads exactly that stale byte count.
+
+        The gap between reads starts at ``interval`` and backs off to
+        ``max_interval``. Two reads are always needed, so that first gap is
+        pure latency on every capture - a fast card is done writing long before
+        we look, and keeping the gap short there costs us nothing; a slot slow
+        enough to still be flushing gets the longer gaps as the backoff grows.
+
         Best-effort: bodies that can't report file info skip the check, and a
         size still changing at ``timeout`` is downloaded anyway.
         """
         folder, name = os.path.split(path)
         last = -1
+        wait = interval
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 self.refresh()
                 size = int(self._cam.file_get_info(folder, name).file.size)
             except Exception as exc:
+                if getattr(exc, "code", None) == gp.GP_ERROR_CAMERA_BUSY:
+                    # Busy *is* the answer we're waiting on - the body is still
+                    # writing. Keep polling instead of declaring it settled.
+                    LOGGER.debug(f"camera busy reading size of {path}; still writing")
+                    time.sleep(wait)
+                    wait = min(wait * 2, max_interval)
+                    continue
                 LOGGER.debug(
                     f"file_get_info failed for {path} ({exc}); skipping "
                     "size-stability check"
@@ -706,7 +830,8 @@ class PTPSession:
                 LOGGER.debug(f"size of {path} settled at {size / 1e6:.1f} MB")
                 return
             last = size
-            time.sleep(interval)
+            time.sleep(wait)
+            wait = min(wait * 2, max_interval)
         LOGGER.debug(
             f"size of {path} still changing after {timeout:.1f}s; downloading anyway"
         )
@@ -769,10 +894,11 @@ class PTP(Camera, EasyResource):
         self._model_match: Optional[str] = attrs.get("camera_model") or None
         self._download_dir: Optional[str] = attrs.get("download_dir") or None
         self._delete_after_download: bool = bool(attrs.get("delete_after_download", False))
-        # Seconds to wait after firing for the body to finish writing to the
-        # card before we grab the "latest" file (bodies that don't report the
-        # captured path - e.g. Canon writing to card). Bump it for slow cards
-        # or flash recycle time.
+        # How long capture() is willing to wait for the new frame to show up
+        # (bodies that don't report the captured path - e.g. Canon writing to
+        # card). A ceiling, not a delay: we poll and return as soon as the file
+        # lands, so raising it for slow cards or flash recycle time costs
+        # nothing on a fast card. Floored at _CAPTURE_TIMEOUT_FLOOR_SEC.
         self._capture_settle: float = float(attrs.get("capture_settle", 2.0))
 
         if self._download_dir:

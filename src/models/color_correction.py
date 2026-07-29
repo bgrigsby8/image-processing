@@ -1435,6 +1435,12 @@ class ColorCorrection(Camera, EasyResource):
                                   configured ``nines_organization_slug`` (so one
                                   machine can serve multiple orgs); falls back to
                                   the config slug when absent
+          ``product_name``        product display name used when this ``sku``
+                                  doesn't exist in Nines yet, so a newly created
+                                  product reads as the product rather than the
+                                  bare code (default: the sku). Ignored for a
+                                  product that already exists - the upsert never
+                                  renames one.
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
@@ -1449,6 +1455,7 @@ class ColorCorrection(Camera, EasyResource):
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
         sku = str(opts.get("sku") or "").strip() or None
         org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
+        product_name = str(opts.get("product_name") or "").strip() or None
 
         name = opts.get("name")
         name = str(name) if name else None      # falsy/empty -> keep current behavior
@@ -1521,7 +1528,8 @@ class ColorCorrection(Camera, EasyResource):
         nines_keep: Optional[str] = None
         if sku:
             nines, nines_keep = await self._nines_deliver_for_upload(
-                sku, paths, name, capture_stem, org_slug=org_slug
+                sku, paths, name, capture_stem, org_slug=org_slug,
+                product_name=product_name,
             )
 
         deleted: List[str] = []
@@ -1694,12 +1702,15 @@ class ColorCorrection(Camera, EasyResource):
         name: Optional[str],
         capture_stem: Optional[str],
         org_slug: Optional[str] = None,
+        product_name: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
         """
         The ``upload``-integrated Nines delivery: pick the one delivery image
         out of the capture set and append it to the SKU's product in the
         effective org (``org_slug`` when the webapp names one, else the
-        configured slug), tagged with its final filename stem. Returns
+        configured slug), tagged with its final filename stem. ``product_name``
+        names the product if the upsert has to create it - without it a new
+        product is titled with the raw SKU. Returns
         ``(nines_result, keep_path)`` where ``keep_path`` names a file the
         delete pass must leave on disk for a retry (the delivery image, when
         delivery failed). Never raises: a Nines problem is reported in the
@@ -1727,6 +1738,7 @@ class ColorCorrection(Camera, EasyResource):
         try:
             result = await self._nines.deliver(
                 sku, [(delivery, filename, [os.path.splitext(filename)[0]])],
+                product_name=product_name,
                 org_slug=org,
             )
         except Exception as exc:  # noqa: BLE001 - reported, never fails the upload

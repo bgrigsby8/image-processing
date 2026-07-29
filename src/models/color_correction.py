@@ -166,11 +166,13 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
 from models.calibration import (
+    CCM_FIT_WEIGHTS,
     REFERENCE_SRGB,
     ColorCorrector,
     PatchSampler,
     _fit_ccm,
     _neutral_brightness_report,
+    delta_e76,
     detect_colorchecker,
 )
 from models.image_io import (
@@ -400,7 +402,14 @@ class ColorCorrection(Camera, EasyResource):
             os.makedirs(self._output_dir, exist_ok=True)
 
     def _correct_viam_image(self, image: ViamImage) -> ViamImage:
-        """Apply the CCM to a single ViamImage, preserving its mime type."""
+        """Apply the CCM to a single ViamImage, preserving its mime type.
+
+        Approximation, by design: a CCM calibrated from RAW is strictly valid
+        on linear sensor data, but these streamed frames are camera JPEGs that
+        already carry in-camera WB and a picture-style tone curve which
+        ``srgb_to_linear`` doesn't undo. Good enough for monitoring; the
+        colour-accurate path is the RAW capture/develop pipeline.
+        """
         pil_image = viam_to_pil_image(image).convert("RGB")
         corrected = self.corrector.apply_to_rgb(np.array(pil_image))
         mime = image.mime_type if image.mime_type == CameraMimeType.PNG else CameraMimeType.JPEG
@@ -628,8 +637,9 @@ class ColorCorrection(Camera, EasyResource):
         ``neutral_brightness`` (as-shot 0-255 sRGB picker readout per neutral
         patch with its reference target - adjust the light power until measured
         matches reference to hit nominal brightness without touching camera
-        exposure), and a ``delta_e`` report whose ``after`` figure is
-        exposure-normalised colour accuracy.
+        exposure), and a ``delta_e`` report in CIE delta-E*ab 1976 (mean below
+        ~3 is a solid calibration; ``after`` is exposure-normalised, so it
+        reflects pure colour accuracy).
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
@@ -708,11 +718,15 @@ class ColorCorrection(Camera, EasyResource):
         exposure_scale = float(np.dot(meas_neutral, ref_neutral) / energy) if energy > 0 else 1.0
         measured_fit = measured_linear * exposure_scale
 
-        ccm = _fit_ccm(measured_fit, reference_linear)
+        # Weighted fit: ~1/Y per-patch weights so shadow accuracy isn't
+        # sacrificed to numerically-large highlight errors, with the
+        # out-of-gamut patches (whose targets are clipped approximations)
+        # down-weighted. See CCM_FIT_WEIGHTS in calibration.py.
+        ccm = _fit_ccm(measured_fit, reference_linear, weights=CCM_FIT_WEIGHTS)
         corrector = ColorCorrector(ccm)
 
         def _delta_e_stats(values: np.ndarray) -> Dict[str, float]:
-            d = np.sqrt(np.sum((np.clip(values, 0, 1) - reference_linear) ** 2, axis=1)) * 100
+            d = delta_e76(np.clip(values, 0, 1), reference_linear)
             return {"mean": float(d.mean()), "max": float(d.max())}
 
         # "after" is exposure-normalised, so it reflects pure colour accuracy
@@ -1125,15 +1139,14 @@ class ColorCorrection(Camera, EasyResource):
     ) -> bool:
         """
         Whether a half-resolution demosaic still leaves ``max_dim`` pixels on the
-        cropped region's long edge. Half size is ~4x faster, so it's the default —
-        but a tight crop needs the full decode or the preview is soft, which is the
-        whole problem this path exists to avoid.
+        (cropped or full) frame's long edge. Half size is ~4x faster, so it's the
+        default — but a tight crop, or a large ``max_dim`` against a full frame,
+        needs the full decode or the preview is soft, which is the whole problem
+        this path exists to avoid.
 
         Errs toward the full decode: an unreadable header, or a RAW whose reported
         orientation is ambiguous, costs time rather than quality.
         """
-        if crop is None:
-            return True
         try:
             width, height = image_dimensions(path)
         except Exception as exc:  # noqa: BLE001 - a probe failure must not fail the preview
@@ -1141,7 +1154,7 @@ class ColorCorrection(Camera, EasyResource):
             return False
         if not width or not height:
             return False
-        cw, ch = crop[2], crop[3]
+        cw, ch = (crop[2], crop[3]) if crop is not None else (1.0, 1.0)
         # A 90-degree EXIF rotation would pair the crop fractions with the other
         # axis; take the smaller of the two readings so an ambiguous orientation
         # picks the higher-quality decode.

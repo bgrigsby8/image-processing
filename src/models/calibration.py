@@ -91,26 +91,94 @@ _XYZ_D65_TO_LINEAR_SRGB = np.array([
 ])
 
 
-def _xyy_d50_to_srgb(xyY: np.ndarray) -> np.ndarray:
-    """CIE xyY (D50) -> gamma-encoded sRGB in [0, 1]. Out-of-gamut patches (the
-    chart's blue/cyan fall outside sRGB) are clipped after the linear transform,
-    as any sRGB rendering of the chart must."""
+def _xyy_d50_to_linear_srgb(xyY: np.ndarray) -> np.ndarray:
+    """CIE xyY (D50) -> *linear* sRGB, unclipped. Out-of-gamut patches keep
+    their negative/over-range components here so gamut membership stays
+    measurable; clipping happens where an sRGB rendering is actually needed."""
     x, y, big_y = xyY[:, 0], xyY[:, 1], xyY[:, 2]
     xyz = np.stack([big_y * x / y, big_y, big_y * (1.0 - x - y) / y], axis=1)
     xyz_d65 = xyz @ _BRADFORD_D50_TO_D65.T
-    linear = np.clip(xyz_d65 @ _XYZ_D65_TO_LINEAR_SRGB.T, 0.0, 1.0)
-    return linear_to_srgb(linear).astype(np.float32)
+    return xyz_d65 @ _XYZ_D65_TO_LINEAR_SRGB.T
 
+
+_REFERENCE_LINEAR_UNCLIPPED = _xyy_d50_to_linear_srgb(_COLORCHECKER_XYY_D50)
+
+# Patches whose true color lies outside sRGB (cyan, on the post-2014 chart).
+# Their clipped sRGB targets are fabrications - the nearest representable
+# color, not the patch's real color - so the CCM fit down-weights them rather
+# than letting an impossible target pull the matrix (see CCM_FIT_WEIGHTS).
+_OUT_OF_GAMUT = np.any(
+    (_REFERENCE_LINEAR_UNCLIPPED < -1e-4)
+    | (_REFERENCE_LINEAR_UNCLIPPED > 1.0 + 1e-4),
+    axis=1,
+)
 
 # Gamma-encoded sRGB [0, 1], dark skin -> black; the CCM fit and the
-# neutral-brightness readout both reference this.
-REFERENCE_SRGB = _xyy_d50_to_srgb(_COLORCHECKER_XYY_D50)
+# neutral-brightness readout both reference this. Out-of-gamut patches are
+# clipped after the linear transform, as any sRGB rendering of the chart must.
+REFERENCE_SRGB = linear_to_srgb(
+    np.clip(_REFERENCE_LINEAR_UNCLIPPED, 0.0, 1.0)
+).astype(np.float32)
+
+# Per-patch weights for the CCM fit. Unweighted least squares in linear light
+# over-weights bright patches: a fixed linear-RGB error on White 9.5 (Y~0.91)
+# is numerically ~10x one on Black 2 (Y~0.03) yet perceptually far *smaller*,
+# so an unweighted solver polishes highlights at the expense of shadows and
+# dark saturated colors - where portrait/product work actually lives.
+# Weighting each patch ~1/Y roughly equalises *relative* linear error across
+# the tonal range (a first-order stand-in for minimising delta-E; the epsilon
+# keeps the darkest patches from dominating outright). Out-of-gamut patches
+# are further down-weighted because their targets are clipped approximations.
+# Normalised to mean 1 so the weights read as relative emphasis.
+CCM_FIT_WEIGHTS = 1.0 / (_COLORCHECKER_XYY_D50[:, 2] + 0.05)
+CCM_FIT_WEIGHTS[_OUT_OF_GAMUT] *= 0.25
+CCM_FIT_WEIGHTS = (CCM_FIT_WEIGHTS / CCM_FIT_WEIGHTS.mean()).astype(np.float32)
 
 
 # Canonical sRGB transfer functions live in image_io so the decode/export path
 # and the color math agree exactly; aliased here to keep call sites readable.
 _srgb_to_linear = srgb_to_linear
 _linear_to_srgb = linear_to_srgb
+
+
+# ---------------------------------------------------------------------------
+# CIE Lab / delta-E (the perceptual error metric for calibration reports)
+# ---------------------------------------------------------------------------
+
+# Linear sRGB -> CIE XYZ (D65), the inverse of _XYZ_D65_TO_LINEAR_SRGB
+# (Lindbloom / sRGB spec).
+_LINEAR_SRGB_TO_XYZ_D65 = np.array([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+])
+# White point taken as this matrix's own image of RGB (1,1,1), so pure white
+# lands on exactly L*=100, a*=b*=0 regardless of rounding in the matrix.
+_XYZ_D65_WHITE = _LINEAR_SRGB_TO_XYZ_D65.sum(axis=1)
+
+
+def _linear_srgb_to_lab(rgb_linear: np.ndarray) -> np.ndarray:
+    """(N, 3) linear sRGB in [0, 1] -> (N, 3) CIE L*a*b* (D65 white)."""
+    xyz = np.asarray(rgb_linear, dtype=np.float64) @ _LINEAR_SRGB_TO_XYZ_D65.T
+    t = np.maximum(xyz / _XYZ_D65_WHITE, 0.0)
+    delta = 6.0 / 29.0
+    f = np.where(t > delta ** 3, np.cbrt(t), t / (3.0 * delta ** 2) + 4.0 / 29.0)
+    lab = np.empty_like(f)
+    lab[:, 0] = 116.0 * f[:, 1] - 16.0
+    lab[:, 1] = 500.0 * (f[:, 0] - f[:, 1])
+    lab[:, 2] = 200.0 * (f[:, 1] - f[:, 2])
+    return lab
+
+
+def delta_e76(a_linear: np.ndarray, b_linear: np.ndarray) -> np.ndarray:
+    """Per-row CIE delta-E*ab (1976) between two (N, 3) **linear** sRGB arrays -
+    Euclidean distance in Lab, the standard perceptual yardstick (rules of
+    thumb: <1 imperceptible, ~2 barely visible side by side, >5 obvious).
+    Unlike a linear-RGB distance it doesn't over-weight bright patches, and the
+    numbers are comparable to other tools' calibration reports."""
+    return np.linalg.norm(
+        _linear_srgb_to_lab(a_linear) - _linear_srgb_to_lab(b_linear), axis=1
+    )
 
 
 # Row-4 neutral ramp: name -> index into REFERENCE_SRGB / the 24 sampled patches.
@@ -143,7 +211,11 @@ def _neutral_brightness_report(measured_linear: np.ndarray) -> Dict[str, Dict[st
     return report
 
 
-def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
+def _fit_ccm(
+    measured: np.ndarray,
+    reference: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     Least-squares fit of a 3x3 Color Correction Matrix.
 
@@ -153,11 +225,18 @@ def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
     ----------
     measured  : (N, 3) float32, linear-light measured RGB, normalised [0, 1]
     reference : (N, 3) float32, linear-light reference RGB, normalised [0, 1]
+    weights   : optional (N,) per-patch weights (e.g. ``CCM_FIT_WEIGHTS``):
+                patch i's squared error counts ``weights[i]`` times in the
+                loss. ``None`` fits unweighted.
 
     Returns
     -------
     ccm : (3, 3) float32
     """
+    if weights is not None:
+        w = np.sqrt(np.asarray(weights, dtype=np.float64)).reshape(-1, 1)
+        measured = measured * w
+        reference = reference * w
     solution, _, _, _ = np.linalg.lstsq(measured, reference, rcond=None)
     return solution.T  # shape (3, 3)
 
@@ -407,10 +486,20 @@ class PatchSampler:
 
         Returns (24, 3) float32 linear-light RGB.
         """
+        h, w = img_rgb.shape[:2]
         samples = []
         for x, y in centers:
             x, y = int(x), int(y)
-            patch = img_rgb[y - radius:y + radius, x - radius:x + radius].reshape(-1, 3)
+            # Clamp the region to the frame: a centre closer to the edge than
+            # `radius` would otherwise produce negative slice indices, which
+            # numpy wraps around to the far side of the image.
+            x0, y0 = max(0, x - radius), max(0, y - radius)
+            x1, y1 = min(w, x + radius), min(h, y + radius)
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError(
+                    f"patch centre ({x}, {y}) lies outside the {w}x{h} image"
+                )
+            patch = img_rgb[y0:y1, x0:x1].reshape(-1, 3)
             samples.append(np.median(patch, axis=0))
         measured_srgb = np.array(samples, dtype=np.float32) / 255.0
         return _srgb_to_linear(measured_srgb)
@@ -431,7 +520,12 @@ class PatchSampler:
         for x, y in centers:
             x, y = int(round(float(x))), int(round(float(y)))
             x0, y0 = max(0, x - radius), max(0, y - radius)
-            patch = img_linear[y0:y + radius, x0:x + radius].reshape(-1, 3)
+            x1, y1 = min(w, x + radius), min(h, y + radius)
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError(
+                    f"patch centre ({x}, {y}) lies outside the {w}x{h} image"
+                )
+            patch = img_linear[y0:y1, x0:x1].reshape(-1, 3)
             samples.append(np.median(patch, axis=0))
         return np.asarray(samples, dtype=np.float32)
 
@@ -480,7 +574,7 @@ class ColorCorrector:
             measured_linear = PatchSampler.auto_sample(img_rgb)
 
         reference_linear = _srgb_to_linear(REFERENCE_SRGB)
-        ccm = _fit_ccm(measured_linear, reference_linear)
+        ccm = _fit_ccm(measured_linear, reference_linear, weights=CCM_FIT_WEIGHTS)
         return cls(ccm)
 
     # ------------------------------------------------------------------
@@ -529,8 +623,9 @@ class ColorCorrector:
     ) -> dict:
         """
         Per-patch color error before vs. after correction, as a quick measure of
-        calibration quality. Distances are Euclidean in linear RGB (a rough ΔE
-        proxy, not CIE ΔE), scaled by 100.
+        calibration quality. Reported as CIE delta-E*ab 1976 (see ``delta_e76``);
+        mean below ~3 is a solid calibration, individual patches above ~5 are
+        visibly off.
         """
         if patch_centers is not None:
             measured = PatchSampler.sample_at_centers(img_rgb, patch_centers)
@@ -539,11 +634,8 @@ class ColorCorrector:
         ref_linear = _srgb_to_linear(REFERENCE_SRGB)
         corrected_linear = (measured @ self.ccm.T).clip(0, 1)
 
-        def dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.sqrt(np.sum((a - b) ** 2, axis=1)) * 100
-
-        before = dist(measured, ref_linear)
-        after = dist(corrected_linear, ref_linear)
+        before = delta_e76(measured.clip(0, 1), ref_linear)
+        after = delta_e76(corrected_linear, ref_linear)
         return {
             "before": {"mean": float(before.mean()), "max": float(before.max())},
             "after": {"mean": float(after.mean()), "max": float(after.max())},

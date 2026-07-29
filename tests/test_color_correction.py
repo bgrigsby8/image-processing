@@ -934,6 +934,41 @@ def test_upload_with_sku_upserts_and_appends_jpeg(tmp_path, monkeypatch):
     assert out["failed"] == []
 
 
+def test_upload_product_name_titles_a_created_product(tmp_path, monkeypatch):
+    """The display name the operator picked in the webapp reaches the upsert,
+    so a SKU that doesn't exist in Nines yet is created as the product rather
+    than as the bare code."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    asyncio.run(cc._upload({
+        "paths": paths,
+        "name": "front",
+        "sku": "NWC-1042",
+        "product_name": "Northwood Chore Coat - Duck Brown",
+    }))
+
+    _, upsert_path, body, _ = fake.calls[0]
+    assert upsert_path == "/api/v1/reference_items"
+    assert body["external_id"] == "NWC-1042"
+    assert body["name"] == "Northwood Chore Coat - Duck Brown"
+
+
+def test_upload_blank_product_name_falls_back_to_sku(tmp_path, monkeypatch):
+    """A manually typed SKU has no product behind it, so the webapp sends an
+    empty `product_name`. That must fall back to the SKU, never title the new
+    product with an empty string."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    asyncio.run(cc._upload({
+        "paths": paths, "name": "front", "sku": "NWC-1042", "product_name": "   ",
+    }))
+
+    _, _, body, _ = fake.calls[0]
+    assert body["name"] == "NWC-1042"
+
+
 def test_upload_same_sku_upserts_once(tmp_path, monkeypatch):
     """The reference-item id is cached per SKU, so a multi-shot submit hits
     the upsert endpoint once and the append endpoint per shot."""

@@ -10,12 +10,15 @@ import pytest
 
 from models.calibration import (
     _oriented_chart_grid,
+    _OUT_OF_GAMUT,
+    CCM_FIT_WEIGHTS,
     REFERENCE_SRGB,
     ColorCorrector,
     PatchSampler,
     _fit_ccm,
     _neutral_brightness_report,
     _order_corners,
+    delta_e76,
 )
 from models.image_io import linear_to_srgb, srgb_to_linear
 
@@ -43,6 +46,57 @@ def test_fit_ccm_identity_when_measured_equals_reference():
     reference = srgb_to_linear(REFERENCE_SRGB)
     ccm = _fit_ccm(reference, reference)
     assert np.allclose(ccm, np.eye(3), atol=1e-4)
+    # An exactly-consistent system is exactly solvable under any weighting.
+    ccm_w = _fit_ccm(reference, reference, weights=CCM_FIT_WEIGHTS)
+    assert np.allclose(ccm_w, np.eye(3), atol=1e-4)
+
+
+def test_fit_ccm_honors_weights():
+    """Rows with (near-)zero weight must not influence the fit: give half the
+    patches targets from matrix A and half from matrix B, weight A's half
+    heavily, and the fit must land on A."""
+    rng = np.random.default_rng(7)
+    measured = rng.uniform(0.05, 0.9, size=(24, 3)).astype(np.float32)
+    a = np.diag([1.2, 1.0, 0.8]).astype(np.float32)
+    b = np.diag([0.7, 1.0, 1.4]).astype(np.float32)
+    reference = np.vstack([measured[:12] @ a.T, measured[12:] @ b.T])
+    weights = np.array([1000.0] * 12 + [1e-6] * 12)
+    ccm = _fit_ccm(measured, reference, weights=weights)
+    assert np.allclose(ccm, a, atol=1e-2)
+
+
+def test_ccm_fit_weights_emphasize_shadows_and_downweight_out_of_gamut():
+    assert CCM_FIT_WEIGHTS.shape == (24,)
+    assert np.all(CCM_FIT_WEIGHTS > 0)
+    # Dark patches carry more weight than bright ones (~1/Y): Black 2 (23)
+    # over White 9.5 (18), Dark Skin (0) over Light Skin (1).
+    assert CCM_FIT_WEIGHTS[23] > CCM_FIT_WEIGHTS[18]
+    assert CCM_FIT_WEIGHTS[0] > CCM_FIT_WEIGHTS[1]
+    # Cyan (17) falls outside sRGB on the post-2014 chart (the only patch that
+    # does), so its clipped reference target is an approximation and must be
+    # down-weighted vs. its Y alone.
+    assert _OUT_OF_GAMUT[17]
+    assert _OUT_OF_GAMUT.sum() == 1
+    assert CCM_FIT_WEIGHTS[17] < CCM_FIT_WEIGHTS[13]  # cyan << similar-Y green
+
+
+# ---------------------------------------------------------------------------
+# delta_e76
+# ---------------------------------------------------------------------------
+
+def test_delta_e76_is_zero_for_identical_colors():
+    ref = srgb_to_linear(REFERENCE_SRGB)
+    assert np.allclose(delta_e76(ref, ref), 0.0, atol=1e-9)
+
+
+def test_delta_e76_matches_known_lab_values():
+    """White (L*=100) vs 18% gray (L*~49.5): a pure-lightness pair with a
+    textbook delta-E, exercising the Lab conversion end to end."""
+    white = np.array([[1.0, 1.0, 1.0]])
+    gray18 = np.array([[0.18, 0.18, 0.18]])
+    assert delta_e76(white, gray18)[0] == pytest.approx(50.5, abs=0.2)
+    # Symmetric, and neutral pairs have no a*/b* component to inflate it.
+    assert delta_e76(gray18, white)[0] == pytest.approx(50.5, abs=0.2)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +186,18 @@ def test_sample_at_centers_reads_exact_patches():
     measured = PatchSampler.sample_at_centers(img, centers)
     assert measured.shape == (24, 3)
     assert np.allclose(measured, srgb_to_linear(REFERENCE_SRGB), atol=0.005)
+
+
+def test_sample_at_centers_clamps_at_edges_and_rejects_outside():
+    img = _synthetic_chart()
+    # A centre closer to the edge than `radius` clamps to the frame instead of
+    # wrapping the slice to the far side of the image (patch 0 = Dark Skin).
+    measured = PatchSampler.sample_at_centers(img, [(3, 3)], radius=10)
+    assert np.allclose(
+        measured[0], srgb_to_linear(REFERENCE_SRGB[0]), atol=0.01
+    )
+    with pytest.raises(ValueError, match="outside"):
+        PatchSampler.sample_at_centers(img, [(-50, -50)], radius=10)
 
 
 def test_sample_linear_at_centers_clamps_at_edges():
@@ -1299,8 +1365,10 @@ def test_half_size_suffices_picks_the_cheaper_decode_only_when_it_can(tmp_path):
     cc = _component(_FakeSource(saved_path=None))
     p = _write_still_sized(tmp_path, 8000, 6000)
 
-    # Full frame: nothing to lose, always half.
-    assert cc._half_size_suffices(p, None, 4096) is True
+    # Full frame: half of 8000 is 4000 — plenty for a 1024 request...
+    assert cc._half_size_suffices(p, None, 1024) is True
+    # ...but short of a 4096 one, which needs the full decode.
+    assert cc._half_size_suffices(p, None, 4096) is False
     # Half of a 50% crop is 2000px — clears a 1024 request.
     assert cc._half_size_suffices(p, (0.0, 0.0, 0.5, 0.5), 1024) is True
     # Half of a 10% crop is 400px — does not, so decode full.

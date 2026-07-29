@@ -30,6 +30,7 @@ Writer split, because no single library does it all cleanly:
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -227,7 +228,15 @@ def load_linear_rgb(
         if exposure_stops:
             # exp_shift is a linear multiplier (rawpy enables the exposure
             # correction automatically when it's set); libraw clamps it to [0.25, 8].
-            kwargs["exp_shift"] = float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
+            shift = float(2.0 ** exposure_stops)
+            clamped = float(np.clip(shift, 0.25, 8.0))
+            if clamped != shift:
+                LOGGER.warning(
+                    f"exposure_stops {exposure_stops:+.2f} exceeds libraw's "
+                    f"exp_shift range (-2 to +3 stops); rendering at "
+                    f"{np.log2(clamped):+.2f} stops instead"
+                )
+            kwargs["exp_shift"] = clamped
         if user_flip is not None:
             kwargs["user_flip"] = int(user_flip)
         if half_size:
@@ -578,6 +587,24 @@ def apply_sharpen(srgb01: np.ndarray, sharpen: Optional[str]) -> np.ndarray:
     return np.clip(srgb01 + amount * detail, 0.0, 1.0).astype(np.float32)
 
 
+def _render_srgb(
+    linear_rgb: np.ndarray,
+    tone: Optional[str] = None, sharpen: Optional[str] = None,
+) -> np.ndarray:
+    """Linear float RGB -> gamma-encoded sRGB float [0,1], optionally through a
+    delivery ``tone`` curve and a capture ``sharpen`` pass. This is the
+    per-pixel float math shared by every export bit depth - compute it once and
+    quantize per depth (see ``export_renditions``)."""
+    return apply_sharpen(apply_tone_curve(linear_to_srgb(linear_rgb), tone), sharpen)
+
+
+def _quantize_srgb(srgb: np.ndarray, bits: int) -> np.ndarray:
+    """Gamma-encoded sRGB float [0,1] -> integer array at the given bit depth."""
+    if bits == 16:
+        return np.rint(srgb * 65535.0).clip(0, 65535).astype(np.uint16)
+    return np.rint(srgb * 255.0).clip(0, 255).astype(np.uint8)
+
+
 def _encode_srgb(
     linear_rgb: np.ndarray, bits: int,
     tone: Optional[str] = None, sharpen: Optional[str] = None,
@@ -585,19 +612,13 @@ def _encode_srgb(
     """Linear float RGB -> sRGB-gamma integer array at the given bit depth,
     optionally through a delivery ``tone`` curve and a capture ``sharpen`` pass
     (both applied in sRGB space)."""
-    srgb = apply_sharpen(apply_tone_curve(linear_to_srgb(linear_rgb), tone), sharpen)
-    if bits == 16:
-        return np.rint(srgb * 65535.0).clip(0, 65535).astype(np.uint16)
-    return np.rint(srgb * 255.0).clip(0, 255).astype(np.uint8)
+    return _quantize_srgb(_render_srgb(linear_rgb, tone, sharpen), bits)
 
 
-def _write_one(
-    linear_rgb: np.ndarray, dest: str, fmt: str, quality: int,
-    tone: Optional[str] = None, sharpen: Optional[str] = None,
-) -> str:
-    spec = EXPORT_FORMATS[fmt]
-    bits = int(spec["bits"])
-    data = _encode_srgb(linear_rgb, bits, tone, sharpen)
+def _write_one(data: np.ndarray, dest: str, fmt: str, quality: int) -> str:
+    """Write an already-quantized sRGB integer array (at the format's bit
+    depth) to ``dest``. The per-pixel colour math happens upstream so several
+    formats can share one render."""
     icc = _srgb_icc_bytes()
 
     if fmt == "tiff16":
@@ -649,19 +670,41 @@ def export_renditions(
     each requested format. Returns {format_key: written_path}. ``tone`` applies
     an optional delivery tone curve (see ``apply_tone_curve``) and ``sharpen`` a
     capture unsharp mask (see ``apply_sharpen``) to every export.
+
+    The expensive parts are shared and overlapped: the per-pixel float math
+    (gamma + tone + sharpen) runs once for all formats, quantization runs once
+    per bit depth, and the encoders - which release the GIL in PIL / tifffile /
+    OpenCV - run concurrently, so wall time is roughly the slowest format
+    rather than the sum.
     """
     unknown = [f for f in formats if f not in EXPORT_FORMATS]
     if unknown:
         raise ValueError(
             f"unknown export format(s) {unknown}; valid: {sorted(EXPORT_FORMATS)}"
         )
+    if not formats:
+        return {}
     os.makedirs(out_dir, exist_ok=True)
-    written: Dict[str, str] = {}
-    for fmt in formats:
+
+    with log_duration(LOGGER, f"render sRGB for {len(formats)} export(s)"):
+        srgb = _render_srgb(linear_rgb, tone, sharpen)
+        quantized = {
+            bits: _quantize_srgb(srgb, bits)
+            for bits in {int(EXPORT_FORMATS[f]["bits"]) for f in formats}
+        }
+
+    def _export(fmt: str) -> str:
         dest = os.path.join(out_dir, stem + str(EXPORT_FORMATS[fmt]["suffix"]))
         with log_duration(LOGGER, f"export {fmt} -> {os.path.basename(dest)}"):
-            written[fmt] = _write_one(linear_rgb, dest, fmt, quality, tone, sharpen)
-    return written
+            return _write_one(
+                quantized[int(EXPORT_FORMATS[fmt]["bits"])], dest, fmt, quality
+            )
+
+    if len(formats) == 1:
+        return {formats[0]: _export(formats[0])}
+    with ThreadPoolExecutor(max_workers=len(formats)) as pool:
+        results = list(pool.map(_export, formats))
+    return dict(zip(formats, results))
 
 
 def linear_to_jpeg_base64(

@@ -143,17 +143,25 @@ class NinesClient:
             detail = ""
             try:
                 detail = json.loads(exc.read().decode()).get("error", "")
-            except Exception:  # noqa: BLE001 - error bodies aren't guaranteed JSON
-                pass
-            raise NinesAPIError(
+            except Exception as parse_exc:  # noqa: BLE001 - error bodies aren't guaranteed JSON
+                self.logger.debug(
+                    f"Nines API {method} {path}: error body ({exc.code}) was not "
+                    f"parseable JSON ({parse_exc})"
+                )
+            message = (
                 f"Nines API {method} {path} failed with {exc.code}"
-                + (f": {detail}" if detail else ""),
-                status=exc.code,
-            ) from exc
+                + (f": {detail}" if detail else "")
+            )
+            self.logger.error(message)
+            raise NinesAPIError(message, status=exc.code) from exc
         except urllib.error.URLError as exc:
-            raise NinesAPIError(
-                f"Nines API {method} {path} unreachable: {exc.reason}"
-            ) from exc
+            message = f"Nines API {method} {path} unreachable: {exc.reason}"
+            self.logger.error(message)
+            raise NinesAPIError(message) from exc
+        except Exception:
+            # Anything else (e.g. a malformed 2xx body) - never silently lost.
+            self.logger.exception(f"Nines API {method} {path} raised unexpectedly")
+            raise
 
     async def upsert_item(
         self, sku: str, product_name: Optional[str], org_slug: Optional[str] = None
@@ -179,6 +187,10 @@ class NinesClient:
         )
         item_id = str(response.get("id") or "")
         if not item_id:
+            self.logger.error(
+                f"Nines upsert for SKU {sku!r} in org {org!r} returned no "
+                f"reference item id (response: {response!r})"
+            )
             raise NinesAPIError("Nines upsert returned no reference item id")
         self.item_ids[(org, sku)] = item_id
         self.logger.info(
@@ -212,8 +224,18 @@ class NinesClient:
 
         payload: List[Dict[str, Any]] = []
         for path, filename, tags in images:
+            try:
+                data = await asyncio.to_thread(_read_base64, path)
+            except OSError as exc:
+                self.logger.error(
+                    f"Nines delivery for SKU {sku!r} in org {org!r}: could not "
+                    f"read {path!r}: {exc}"
+                )
+                raise NinesAPIError(
+                    f"could not read {path!r} for Nines delivery: {exc}"
+                ) from exc
             image: Dict[str, Any] = {
-                "data": await asyncio.to_thread(_read_base64, path),
+                "data": data,
                 "filename": filename,
                 "content_type": NINES_CONTENT_TYPES[os.path.splitext(path)[1].lower()],
             }

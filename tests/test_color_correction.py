@@ -373,6 +373,8 @@ class _FakeSource:
             }}
         if "capture" in command:
             return {"capture": {"saved_to": self.saved_path}}
+        if "home_focus" in command:
+            return {"home_focus": {"emulated": True, "position": 0}}
         raise ValueError("no recognized command")
 
 
@@ -458,6 +460,25 @@ def test_deferred_capture_surfaces_background_failure(tmp_path):
             )
 
     asyncio.run(run())
+
+
+def test_do_command_passthrough_forwards_to_source():
+    """Commands this wrapper doesn't own (focus, status, ...) are forwarded
+    verbatim to the source camera and its response returned as-is."""
+    source = _FakeSource(saved_path=None)
+    cc = _component(source)
+    resp = asyncio.run(cc.do_command({"home_focus": {}}))
+    assert resp == {"home_focus": {"emulated": True, "position": 0}}
+    assert source.commands == [{"home_focus": {}}]
+
+
+def test_do_command_passthrough_surfaces_source_rejection():
+    """A command unknown to both layers fails with the source's error."""
+    source = _FakeSource(saved_path=None)
+    cc = _component(source)
+    with pytest.raises(ValueError, match="no recognized command"):
+        asyncio.run(cc.do_command({"definitely_not_a_command": {}}))
+    assert source.commands == [{"definitely_not_a_command": {}}]
 
 
 def test_preview_only_capture_skips_exports(tmp_path):

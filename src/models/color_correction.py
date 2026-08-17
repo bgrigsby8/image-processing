@@ -504,10 +504,12 @@ class ColorCorrection(Camera, EasyResource):
             resp["delete"] = self._delete_local(command.get("delete") or {})
 
         if not resp:
-            raise ValueError(
-                "no recognized command; supported: calibrate_color, capture, "
-                "capture_result, develop, preview, upload, nines_upload, delete"
-            )
+            # Not one of ours: forward verbatim to the source camera so
+            # clients can reach its commands (focus, status, settings)
+            # through this wrapper. The source rejects unknown commands
+            # itself. Commands both models define (capture, delete) never
+            # get here - the branches above claim them first.
+            return await self.camera.do_command(command, timeout=timeout, **kwargs)
         return resp
 
     # ------------------------------------------------------------------

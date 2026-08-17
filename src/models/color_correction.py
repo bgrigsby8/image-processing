@@ -1490,14 +1490,19 @@ class ColorCorrection(Camera, EasyResource):
                                   camera's on-disk basename is used.
           ``sku``                 product code for Nines delivery: when set (and
                                   ``nines_api_key`` plus an org slug are
-                                  available), the Nines product with this
-                                  ``external_id`` is upserted and the set's
-                                  delivery image (the full-res JPEG, by
-                                  preference) is appended to it. Reported under
-                                  ``nines`` in the response. A Nines failure
-                                  never marks the Viam uploads as failed, and
-                                  keeps the delivery image on disk for retry
-                                  even with ``delete_after_upload``.
+                                  available), the pre-loaded Nines product with
+                                  this ``external_id`` is looked up (created only
+                                  if absent) and the set's delivery image (the
+                                  full-res JPEG, by preference) is appended to
+                                  it. Reported under ``nines`` in the response.
+                                  A Nines failure never marks the Viam uploads
+                                  as failed, and keeps the delivery image on
+                                  disk for retry even with
+                                  ``delete_after_upload``.
+          ``upc``                 product UPC, when known: used to look the
+                                  pre-loaded Nines product up first (before the
+                                  SKU), and carried in ``product_details`` if a
+                                  product has to be created. Optional.
           ``shots_organization_slug``
                                   deliver to this Nines org instead of the
                                   configured ``nines_organization_slug`` (so one
@@ -1507,8 +1512,8 @@ class ColorCorrection(Camera, EasyResource):
                                   doesn't exist in Nines yet, so a newly created
                                   product reads as the product rather than the
                                   bare code (default: the sku). Ignored for a
-                                  product that already exists - the upsert never
-                                  renames one.
+                                  product that already exists - a found product
+                                  is never renamed.
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
@@ -1522,6 +1527,7 @@ class ColorCorrection(Camera, EasyResource):
         tags = [str(t) for t in (opts.get("tags") or [])]
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
         sku = str(opts.get("sku") or "").strip() or None
+        upc = str(opts.get("upc") or "").strip() or None
         org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
         product_name = str(opts.get("product_name") or "").strip() or None
 
@@ -1597,7 +1603,7 @@ class ColorCorrection(Camera, EasyResource):
         if sku:
             nines, nines_keep = await self._nines_deliver_for_upload(
                 sku, paths, name, capture_stem, org_slug=org_slug,
-                product_name=product_name,
+                product_name=product_name, upc=upc,
             )
 
         deleted: List[str] = []
@@ -1771,14 +1777,16 @@ class ColorCorrection(Camera, EasyResource):
         capture_stem: Optional[str],
         org_slug: Optional[str] = None,
         product_name: Optional[str] = None,
+        upc: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
         """
         The ``upload``-integrated Nines delivery: pick the one delivery image
-        out of the capture set and append it to the SKU's product in the
-        effective org (``org_slug`` when the webapp names one, else the
-        configured slug), tagged with its final filename stem. ``product_name``
-        names the product if the upsert has to create it - without it a new
-        product is titled with the raw SKU. Returns
+        out of the capture set and append it to the product in the effective
+        org (``org_slug`` when the webapp names one, else the configured slug),
+        tagged with its final filename stem. The product is looked up by ``upc``
+        (when known) then SKU; ``product_name`` names it if delivery has to
+        create it - without it a new product is titled with the raw SKU.
+        Returns
         ``(nines_result, keep_path)`` where ``keep_path`` names a file the
         delete pass must leave on disk for a retry (the delivery image, when
         delivery failed). Never raises: a Nines problem is reported in the
@@ -1808,6 +1816,7 @@ class ColorCorrection(Camera, EasyResource):
                 sku, [(delivery, filename, [os.path.splitext(filename)[0]])],
                 product_name=product_name,
                 org_slug=org,
+                upc=upc,
             )
         except Exception as exc:  # noqa: BLE001 - reported, never fails the upload
             self.logger.error(f"Nines delivery failed for SKU {sku!r}: {exc}")
@@ -1827,10 +1836,14 @@ class ColorCorrection(Camera, EasyResource):
         local deletion), appended to the SKU's product non-destructively.
 
         ``opts``:
-          ``sku``                       product code upserted as the Nines
+          ``sku``                       product code matched as the Nines
                                         ``external_id`` (required)
           ``paths``                     image files to append; each must be
                                         jpeg/png/webp/gif (required)
+          ``upc``                       product UPC, when known: looks the
+                                        pre-loaded product up first (before the
+                                        SKU), and carried in ``product_details``
+                                        if the product has to be created
           ``shots_organization_slug``   deliver to this org instead of the
                                         configured one, so a webapp retry lands
                                         in the same org as the original submit;
@@ -1872,11 +1885,13 @@ class ColorCorrection(Camera, EasyResource):
             )
         tags = [str(t) for t in (opts.get("tags") or [])]
         product_name = opts.get("product_name")
+        upc = str(opts.get("upc") or "").strip() or None
         return await self._nines.deliver(
             sku,
             [(p, os.path.basename(p), tags) for p in paths],
             product_name=str(product_name) if product_name else None,
             org_slug=org_slug,
+            upc=upc,
         )
 
     async def get_geometries(

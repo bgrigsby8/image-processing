@@ -64,6 +64,11 @@ Two ways to get corrected images out of this component:
    delivery: enables the ``sku`` option on ``upload`` and the ``nines_upload``
    command below).
 
+   ``capture``, ``develop``, and ``preview`` also take a per-call ``ccm``
+   option — a 3x3 nested list applied instead of the configured matrix for
+   this call only. The config ``ccm`` stays the default when the option is
+   absent.
+
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
            -> develop existing RAW/image file(s) already on disk through the
@@ -563,6 +568,22 @@ class ColorCorrection(Camera, EasyResource):
             "its `download_dir` so captures are written to disk"
         )
 
+    def _corrector_for(self, raw_ccm: Any) -> ColorCorrector:
+        """
+        Resolve a per-call ``ccm`` option into the corrector to apply: the
+        configured ``self.corrector`` when the option is absent, or a one-off
+        ``ColorCorrector`` built from the given 3x3 matrix that replaces the
+        configured matrix for this call only (the config ``ccm`` is untouched).
+        """
+        if raw_ccm is None:
+            return self.corrector
+        try:
+            return ColorCorrector(np.array(raw_ccm, dtype=np.float32))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"`ccm` must be a 3x3 nested list of numbers: {exc}"
+            ) from exc
+
     async def _acquire_calibration_source(
         self, opts: Mapping[str, Any], timeout: Optional[float]
     ) -> Tuple[Optional[str], Optional[np.ndarray]]:
@@ -780,6 +801,8 @@ class ColorCorrection(Camera, EasyResource):
           ``capture_options``  forwarded to the source's ``capture`` (e.g. {"af": true})
           ``white_balance``    "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops``   exposure compensation applied at the raw stage
+          ``ccm``              3x3 nested list applied instead of the configured
+                               matrix for this call only
           ``tone``             delivery look: "none" (colour-accurate) | "c1"
                                (matches Capture One) | "medium" | "bright"
                                (lighter lifts); luminance-only, hue preserved
@@ -809,6 +832,7 @@ class ColorCorrection(Camera, EasyResource):
         capture_opts = opts.get("capture_options", {"af": True})
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        corrector = self._corrector_for(opts.get("ccm"))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
         tone = opts.get("tone", self._tone)
@@ -840,6 +864,7 @@ class ColorCorrection(Camera, EasyResource):
             self._develop_one,
             linear, source_path, white_balance, exposure_stops, formats,
             out_dir_override, True, tone, sharpen,
+            corrector=corrector,
         )
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
@@ -858,6 +883,9 @@ class ColorCorrection(Camera, EasyResource):
         """
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        # Resolve (and validate) the per-call `ccm` override before firing the
+        # shutter, so a malformed matrix never wastes an exposure.
+        corrector = self._corrector_for(opts.get("ccm"))
         tone = opts.get("tone", self._tone)
         sharpen = opts.get("sharpen", self._sharpen)
 
@@ -886,7 +914,7 @@ class ColorCorrection(Camera, EasyResource):
         self._pending_captures[capture_id] = asyncio.create_task(
             self._finish_deferred_capture(
                 capture_id, str(camera_path), white_balance, exposure_stops,
-                tone, sharpen,
+                tone, sharpen, corrector,
             )
         )
         # Drop completed-and-collected stragglers if a caller never fetched
@@ -911,10 +939,15 @@ class ColorCorrection(Camera, EasyResource):
         exposure_stops: float,
         tone: Optional[str] = None,
         sharpen: Optional[str] = None,
+        corrector: Optional[ColorCorrector] = None,
     ) -> Dict[str, ValueTypes]:
         """Background half of a deferred capture: download the still from the
         camera, decode at half size, apply the CCM, and build the preview. No
-        exports or sidecar - the RAW on disk is the handoff to ``develop``."""
+        exports or sidecar - the RAW on disk is the handoff to ``develop``.
+        ``corrector`` is the per-call CCM override the caller resolved before
+        the shutter fired; None means the configured matrix."""
+        if corrector is None:
+            corrector = self.corrector
         start = time.perf_counter()
         resp = await self.camera.do_command({"download": {"path": camera_path}})
         meta = resp.get("download") or {}
@@ -929,7 +962,7 @@ class ColorCorrection(Camera, EasyResource):
             white_balance=white_balance, exposure_stops=exposure_stops,
             half_size=True, demosaic=self._demosaic,
         )
-        corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
+        corrected = await asyncio.to_thread(corrector.apply_to_linear, linear)
         preview = await asyncio.to_thread(
             linear_to_jpeg_base64, corrected, tone=tone, sharpen=sharpen
         )
@@ -943,7 +976,7 @@ class ColorCorrection(Camera, EasyResource):
             "source_path": str(saved),
             "image_base64": preview,
             "mime_type": CameraMimeType.JPEG.value,
-            "ccm_applied": not self.corrector.is_identity,
+            "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
         }
 
@@ -993,6 +1026,8 @@ class ColorCorrection(Camera, EasyResource):
           ``paths``          a list of file paths (returns {"developed": [...]})
           ``white_balance``  "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops`` exposure compensation applied at the raw stage
+          ``ccm``            3x3 nested list applied instead of the configured
+                             matrix for this call only
           ``tone``           delivery look: "none" | "c1" | "medium" | "bright"
           ``sharpen``        capture sharpening: "none"|"light"|"medium"|"strong"
           ``demosaic``       RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
@@ -1022,6 +1057,7 @@ class ColorCorrection(Camera, EasyResource):
 
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        corrector = self._corrector_for(opts.get("ccm"))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
         tone = opts.get("tone", self._tone)
@@ -1058,6 +1094,7 @@ class ColorCorrection(Camera, EasyResource):
                     sharpen=sharpen,
                     crop=crop,
                     output_stem=output_stem,
+                    corrector=corrector,
                 )
             )
             self.logger.debug(
@@ -1084,6 +1121,8 @@ class ColorCorrection(Camera, EasyResource):
           ``path``           file to render (required)
           ``crop``           {"x","y","w","h"} normalized; omit for the full frame
           ``max_dim``        longest edge of the returned JPEG (default 1024)
+          ``ccm``            3x3 nested list applied instead of the configured
+                             matrix for this call only
           ``white_balance`` / ``exposure_stops`` / ``tone`` / ``sharpen``
                              as for ``develop``; default to the configured values
                              so the preview matches what a develop would produce
@@ -1099,6 +1138,7 @@ class ColorCorrection(Camera, EasyResource):
             raise ValueError(f"`preview` needs a positive `max_dim`, got {max_dim}")
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        corrector = self._corrector_for(opts.get("ccm"))
         tone = opts.get("tone", self._tone)
         sharpen = opts.get("sharpen", self._sharpen)
 
@@ -1111,7 +1151,7 @@ class ColorCorrection(Camera, EasyResource):
         )
         if crop is not None:
             linear = crop_linear(linear, *crop)
-        corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
+        corrected = await asyncio.to_thread(corrector.apply_to_linear, linear)
         image_base64 = await asyncio.to_thread(
             linear_to_jpeg_base64, corrected, max_dim, self._jpeg_quality,
             tone, sharpen,
@@ -1128,7 +1168,7 @@ class ColorCorrection(Camera, EasyResource):
             "image_base64": image_base64,
             "mime_type": CameraMimeType.JPEG.value,
             "half_size": half_size,
-            "ccm_applied": not self.corrector.is_identity,
+            "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
         }
         if crop is not None:
@@ -1181,6 +1221,7 @@ class ColorCorrection(Camera, EasyResource):
         sharpen: Optional[str] = None,
         crop: Optional[Tuple[float, float, float, float]] = None,
         output_stem: Optional[str] = None,
+        corrector: Optional[ColorCorrector] = None,
     ) -> Dict[str, ValueTypes]:
         """
         Shared core for ``capture`` and ``develop``: apply the CCM in linear
@@ -1190,13 +1231,17 @@ class ColorCorrection(Camera, EasyResource):
 
         ``crop`` is a normalized (x, y, w, h) rect applied before the color math;
         ``output_stem`` overrides the export/sidecar filename stem so a cropped
-        variant can sit next to the uncropped master without clobbering it.
+        variant can sit next to the uncropped master without clobbering it;
+        ``corrector`` is the per-call CCM override (None means the configured
+        matrix).
         """
+        if corrector is None:
+            corrector = self.corrector
         if crop is not None:
             linear = crop_linear(linear, *crop)
 
         t_ccm = time.perf_counter()
-        corrected = self.corrector.apply_to_linear(linear)
+        corrected = corrector.apply_to_linear(linear)
         self.logger.debug(
             f"[timing] apply color correction (CCM): {time.perf_counter() - t_ccm:.2f}s"
         )
@@ -1239,7 +1284,7 @@ class ColorCorrection(Camera, EasyResource):
         if self._write_sidecar and source_path:
             sidecar = self._write_sidecar_file(
                 source_path, white_balance, exposure_stops, formats, exports,
-                tone, sharpen, crop,
+                tone, sharpen, crop, corrector=corrector,
                 # With a stem override the sidecar has to follow the exports, or
                 # a cropped variant would overwrite the master's record.
                 dest=(
@@ -1252,7 +1297,7 @@ class ColorCorrection(Camera, EasyResource):
             "source_path": source_path,
             "exports": exports,
             "sidecar": sidecar,
-            "ccm_applied": not self.corrector.is_identity,
+            "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
         }
         if crop is not None:
@@ -1280,13 +1325,18 @@ class ColorCorrection(Camera, EasyResource):
         sharpen: Optional[str] = None,
         crop: Optional[Tuple[float, float, float, float]] = None,
         dest: Optional[str] = None,
+        corrector: Optional[ColorCorrector] = None,
     ) -> str:
         """
         Write a ``<stem>.json`` sidecar next to the (untouched) source file
         recording exactly how it was developed - the non-destructive record that
         lets a capture be reproduced or re-exported later. ``dest`` overrides
-        where it lands, for variants that don't share the source's stem.
+        where it lands, for variants that don't share the source's stem;
+        ``corrector`` is the per-call CCM override actually applied (None means
+        the configured matrix), so the record always names the matrix used.
         """
+        if corrector is None:
+            corrector = self.corrector
         sidecar_path = dest or (os.path.splitext(source_path)[0] + ".json")
         record = {
             "source": os.path.basename(source_path),
@@ -1299,8 +1349,9 @@ class ColorCorrection(Camera, EasyResource):
             "tone": tone or "none",
             "sharpen": sharpen or "none",
             "demosaic": self._demosaic,
-            "ccm": self.corrector.ccm.tolist(),
-            "ccm_applied": not self.corrector.is_identity,
+            "ccm": corrector.ccm.tolist(),
+            "ccm_source": "config" if corrector is self.corrector else "override",
+            "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
             "output_formats": list(formats),
             "exports": {k: os.path.basename(v) for k, v in exports.items()},

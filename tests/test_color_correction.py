@@ -838,41 +838,62 @@ def test_delete_requires_paths(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Nines partner-API delivery: `upload` with a `sku` upserts the Nines product
-# (external_id = SKU) and appends the set's delivery image; `nines_upload`
-# sends exactly the listed files. Exercised against a recording fake of
-# `NinesClient.request` - no HTTP.
+# Nines partner-API delivery: `upload` with a `sku` looks the pre-loaded Nines
+# product up (by UPC then external_id = SKU), creates it only if absent, and
+# appends the set's delivery image; `nines_upload` sends exactly the listed
+# files. Exercised against a recording fake of `NinesClient.request` - no HTTP.
 # ---------------------------------------------------------------------------
 
 import base64
 import os
+import urllib.parse
 
 from models.nines import NinesAPIError
 
 
 class _FakeNinesAPI:
-    """Records every `NinesClient.request` call; scripted upsert/append responses.
+    """Records every `NinesClient.request` call; scripted lookup/create/append.
 
-    ``dead_item_ids`` 404 their appends (a product deleted server-side);
+    ``existing`` pre-loads reference items (dicts with ``id`` / ``external_id``
+    and optional ``product_details``) that a GET lookup can resolve; by default
+    nothing is loaded, so a lookup misses and delivery falls to the create
+    path. ``dead_item_ids`` 404 their appends (a product deleted server-side);
     ``append_error`` fails every append.
     """
 
-    def __init__(self, item_id="ritem_1", append_error=None, dead_item_ids=()):
+    def __init__(self, item_id="ritem_1", append_error=None, dead_item_ids=(),
+                 existing=()):
         self.item_id = item_id
         self.append_error = append_error
         self.dead_item_ids = dead_item_ids
+        self.existing = list(existing)
         self.calls = []
 
     def __call__(self, method, path, body, timeout_s):
         self.calls.append((method, path, body, timeout_s))
-        if path == "/api/v1/reference_items":
+        base = path.split("?", 1)[0]
+        if method == "GET" and base == "/api/v1/reference_items":
+            params = urllib.parse.parse_qs(path.split("?", 1)[1])
+            matches = []
+            for item in self.existing:
+                if "upc" in params:
+                    if str((item.get("product_details") or {}).get("upc", "")) \
+                            == params["upc"][0]:
+                        matches.append(item)
+                elif "external_id" in params:
+                    if str(item.get("external_id", "")).lower() \
+                            == params["external_id"][0].lower():
+                        matches.append(item)
+            return {"reference_items": matches, "total": len(matches),
+                    "offset": 0, "limit": 200}
+        if base == "/api/v1/reference_items":  # POST upsert / create
             return {"id": self.item_id, "external_id": body["external_id"],
                     "created": True, "updated": False, "images_count": 0}
-        if path.endswith("/images"):
-            rid = path.split("/")[-2]
+        if base.endswith("/images"):
+            rid = base.split("/")[-2]
             if rid in self.dead_item_ids:
                 raise NinesAPIError(
-                    f"Nines API POST {path} failed with 404: not found",
+                    f"Nines API POST {base} failed with 404: not found",
                     status=404,
                 )
             if self.append_error is not None:
@@ -924,27 +945,36 @@ def test_renamed_basename_swaps_stem_and_keeps_suffix():
     assert rename("/d/IMG_0042.jpg", "", None) == "IMG_0042.jpg"
 
 
-def test_upload_with_sku_upserts_and_appends_jpeg(tmp_path, monkeypatch):
+def test_upload_with_sku_creates_when_absent_and_appends_jpeg(tmp_path, monkeypatch):
     paths = _shot_set(tmp_path)
-    cc, fake = _nines_component(tmp_path, monkeypatch)
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # no pre-loaded products
 
     out = asyncio.run(
         cc._upload({"paths": paths, "name": "front", "sku": "NWC-1042"})
     )
 
-    # Upsert first: keyed by the SKU, small-call timeout, and never an
-    # `images` field (that would replace an existing product's imagery).
-    method, upsert_path, body, timeout = fake.calls[0]
-    assert (method, upsert_path) == ("POST", "/api/v1/reference_items")
+    # Look the product up first, by exact external_id / SKU.
+    method, lookup_path, body, timeout = fake.calls[0]
+    assert method == "GET"
+    assert lookup_path.startswith("/api/v1/reference_items?")
+    params = urllib.parse.parse_qs(lookup_path.split("?", 1)[1])
+    assert params["external_id"] == ["NWC-1042"]
+    assert params["shots_organization_slug"] == ["viam-org"]
+    assert body is None  # a GET carries no request body
+    assert timeout == cc._upload_dial_timeout_s
+
+    # The lookup missed, so create it: keyed by the SKU and never an `images`
+    # field (that would replace an existing product's imagery).
+    method, create_path, body, timeout = fake.calls[1]
+    assert (method, create_path) == ("POST", "/api/v1/reference_items")
     assert body["external_id"] == "NWC-1042"
     assert body["name"] == "NWC-1042"
     assert body["shots_organization_slug"] == "viam-org"
     assert "images" not in body
-    assert timeout == cc._upload_dial_timeout_s
 
     # Then one non-destructive append of just the delivery JPEG, renamed to
     # the operator's stem and tagged with it.
-    method, append_path, body, timeout = fake.calls[1]
+    method, append_path, body, timeout = fake.calls[2]
     assert append_path == "/api/v1/reference_items/ritem_1/images"
     assert body["shots_organization_slug"] == "viam-org"
     assert timeout == cc._upload_file_timeout_s
@@ -958,6 +988,47 @@ def test_upload_with_sku_upserts_and_appends_jpeg(tmp_path, monkeypatch):
     assert out["nines"]["external_id"] == "NWC-1042"
     assert out["nines"]["added_count"] == 1
     assert out["failed"] == []
+
+
+def test_upload_appends_to_preloaded_product_without_creating(tmp_path, monkeypatch):
+    """The production flow: the product was pre-loaded on the Nines platform, so
+    delivery looks it up and appends - it never POSTs `/reference_items`, which
+    would clobber the pre-loaded `product_details`."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        existing=[{"id": "ritem_preloaded", "external_id": "NWC-1042",
+                   "product_details": {"upc": "012345678905"}}],
+    )
+
+    out = asyncio.run(cc._upload({"paths": paths, "name": "front",
+                                  "sku": "NWC-1042"}))
+
+    methods = [m for m, _, _, _ in fake.calls]
+    assert methods == ["GET", "POST"]  # lookup, then append - no create
+    _, append_path, _, _ = fake.calls[1]
+    assert append_path == "/api/v1/reference_items/ritem_preloaded/images"
+    assert out["nines"]["reference_item_id"] == "ritem_preloaded"
+
+
+def test_upload_upc_looks_up_first_and_lands_in_product_details(tmp_path, monkeypatch):
+    """A UPC drives the lookup ahead of the SKU and, when the product has to be
+    created, rides in flat `product_details` - never in the name."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(tmp_path, monkeypatch)  # no pre-loaded products
+
+    asyncio.run(cc._upload({"paths": paths, "name": "front", "sku": "NWC-1042",
+                            "upc": "012345678905"}))
+
+    # First lookup is by UPC, before the external_id fallback.
+    _, first_lookup, _, _ = fake.calls[0]
+    assert urllib.parse.parse_qs(
+        first_lookup.split("?", 1)[1])["upc"] == ["012345678905"]
+
+    create = next(c for c in fake.calls
+                  if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create[2]["product_details"] == {"upc": "012345678905"}
+    assert create[2]["name"] == "NWC-1042"  # UPC is not smuggled into the name
 
 
 def test_upload_product_name_titles_a_created_product(tmp_path, monkeypatch):
@@ -974,8 +1045,10 @@ def test_upload_product_name_titles_a_created_product(tmp_path, monkeypatch):
         "product_name": "Northwood Chore Coat - Duck Brown",
     }))
 
-    _, upsert_path, body, _ = fake.calls[0]
-    assert upsert_path == "/api/v1/reference_items"
+    _, create_path, body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create_path == "/api/v1/reference_items"
     assert body["external_id"] == "NWC-1042"
     assert body["name"] == "Northwood Chore Coat - Duck Brown"
 
@@ -991,13 +1064,15 @@ def test_upload_blank_product_name_falls_back_to_sku(tmp_path, monkeypatch):
         "paths": paths, "name": "front", "sku": "NWC-1042", "product_name": "   ",
     }))
 
-    _, _, body, _ = fake.calls[0]
+    _, _, body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
     assert body["name"] == "NWC-1042"
 
 
-def test_upload_same_sku_upserts_once(tmp_path, monkeypatch):
-    """The reference-item id is cached per SKU, so a multi-shot submit hits
-    the upsert endpoint once and the append endpoint per shot."""
+def test_upload_same_sku_resolves_once(tmp_path, monkeypatch):
+    """The reference-item id is cached per SKU, so a multi-shot submit resolves
+    the product once (one lookup, one create) and appends per shot."""
     cc, fake = _nines_component(tmp_path, monkeypatch)
 
     asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0001"),
@@ -1005,9 +1080,12 @@ def test_upload_same_sku_upserts_once(tmp_path, monkeypatch):
     asyncio.run(cc._upload({"paths": _shot_set(tmp_path, "IMG_0002"),
                             "sku": "NWC-1042"}))
 
-    upserts = [c for c in fake.calls if c[1] == "/api/v1/reference_items"]
+    lookups = [c for c in fake.calls if c[0] == "GET"]
+    creates = [c for c in fake.calls
+               if c[0] == "POST" and c[1] == "/api/v1/reference_items"]
     appends = [c for c in fake.calls if c[1].endswith("/images")]
-    assert len(upserts) == 1
+    assert len(lookups) == 1
+    assert len(creates) == 1
     assert len(appends) == 2
 
 
@@ -1061,9 +1139,10 @@ def test_nines_failure_keeps_delivery_image_for_retry(tmp_path, monkeypatch):
             assert not os.path.exists(p)  # the rest archived and cleaned up
 
 
-def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
+def test_stale_cached_item_id_reresolves_once(tmp_path, monkeypatch):
     """A cached reference-item id that 404s (product deleted on the Nines
-    side) is dropped, re-upserted, and the append retried once."""
+    side) is dropped, re-resolved (lookup then create), and the append retried
+    once."""
     paths = _shot_set(tmp_path)
     cc, fake = _nines_component(tmp_path, monkeypatch, item_id="ritem_new",
                                 dead_item_ids=("ritem_dead",))
@@ -1072,8 +1151,11 @@ def test_stale_cached_item_id_reupserts_once(tmp_path, monkeypatch):
 
     out = asyncio.run(cc._upload({"paths": paths, "sku": "NWC-1042"}))
 
-    assert [(m, p) for m, p, _, _ in fake.calls] == [
+    # The cached id is used straight away; only after its 404 does the client
+    # fall back to a fresh lookup + create.
+    assert [(m, p.split("?", 1)[0]) for m, p, _, _ in fake.calls] == [
         ("POST", "/api/v1/reference_items/ritem_dead/images"),
+        ("GET", "/api/v1/reference_items"),
         ("POST", "/api/v1/reference_items"),
         ("POST", "/api/v1/reference_items/ritem_new/images"),
     ]
@@ -1119,9 +1201,12 @@ def test_nines_upload_command_sends_listed_files(tmp_path, monkeypatch):
         "product_name": "Northwood Chore Coat",
     }}))["nines_upload"]
 
-    _, _, upsert_body, _ = fake.calls[0]
-    assert upsert_body["name"] == "Northwood Chore Coat"
-    _, _, append_body, _ = fake.calls[1]
+    _, _, create_body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create_body["name"] == "Northwood Chore Coat"
+    _, _, append_body, _ = next(
+        c for c in fake.calls if c[1].endswith("/images"))
     images = append_body["images"]
     assert [i["filename"] for i in images] == ["front.jpg", "back.png"]
     assert [i["content_type"] for i in images] == ["image/jpeg", "image/png"]
@@ -1142,10 +1227,16 @@ def test_upload_request_slug_overrides_config_slug(tmp_path, monkeypatch):
         "shots_organization_slug": "buyer-org",
     }))
 
-    _, upsert_path, upsert_body, _ = fake.calls[0]
-    assert upsert_path == "/api/v1/reference_items"
-    assert upsert_body["shots_organization_slug"] == "buyer-org"
-    _, _, append_body, _ = fake.calls[1]
+    # The per-request slug rides on every call: the lookup, the create, the append.
+    _, lookup_path, _, _ = fake.calls[0]
+    assert urllib.parse.parse_qs(
+        lookup_path.split("?", 1)[1])["shots_organization_slug"] == ["buyer-org"]
+    _, _, create_body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create_body["shots_organization_slug"] == "buyer-org"
+    _, _, append_body, _ = next(
+        c for c in fake.calls if c[1].endswith("/images"))
     assert append_body["shots_organization_slug"] == "buyer-org"
     assert out["nines"]["external_id"] == "NWC-1042"
 
@@ -1191,8 +1282,10 @@ def test_upload_with_request_slug_needs_only_api_key(tmp_path, monkeypatch):
 
     assert "skipped" not in out["nines"]
     assert out["nines"]["reference_item_id"] == "ritem_1"
-    _, _, upsert_body, _ = fake.calls[0]
-    assert upsert_body["shots_organization_slug"] == "buyer-org"
+    _, _, create_body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create_body["shots_organization_slug"] == "buyer-org"
 
 
 def test_nines_upload_command_honors_request_slug(tmp_path, monkeypatch):
@@ -1208,9 +1301,12 @@ def test_nines_upload_command_honors_request_slug(tmp_path, monkeypatch):
         "shots_organization_slug": "retry-org",
     }}))
 
-    _, _, upsert_body, _ = fake.calls[0]
-    assert upsert_body["shots_organization_slug"] == "retry-org"
-    _, _, append_body, _ = fake.calls[1]
+    _, _, create_body, _ = next(
+        c for c in fake.calls
+        if c[0] == "POST" and c[1] == "/api/v1/reference_items")
+    assert create_body["shots_organization_slug"] == "retry-org"
+    _, _, append_body, _ = next(
+        c for c in fake.calls if c[1].endswith("/images"))
     assert append_body["shots_organization_slug"] == "retry-org"
 
 

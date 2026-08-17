@@ -2,8 +2,12 @@
 nines.py
 --------
 Client for the Nines partner API (the REST API documented in the nines-webapp
-repo's partner-api-guide.md): products ("reference items") are upserted by
-``external_id`` - our SKU - and imagery is appended to them.
+repo's partner-api-guide.md). Products ("reference items") are pre-loaded on
+the Nines platform ahead of a shoot; delivery *looks one up* - by UPC
+(``product_details.upc``), then by exact ``external_id`` (our SKU) - and
+appends imagery to it. A product is created only when the lookup finds nothing
+and we have a real SKU (never a placeholder), with the UPC carried in
+``product_details`` rather than the name.
 
 :class:`NinesClient` holds the credentials and the per-``(org, SKU)``
 reference-item cache; it knows nothing about Viam. The component in
@@ -17,6 +21,7 @@ import base64
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -119,17 +124,23 @@ class NinesClient:
         return ranked[0][1] if ranked else None
 
     def request(
-        self, method: str, path: str, body: Mapping[str, Any], timeout_s: float
+        self,
+        method: str,
+        path: str,
+        body: Optional[Mapping[str, Any]],
+        timeout_s: float,
     ) -> Dict[str, Any]:
         """
         One JSON request to the Nines partner API. Synchronous (urllib) - call
-        it via ``asyncio.to_thread``. Raises :class:`NinesAPIError` carrying
-        the HTTP status and the API's ``error`` description on a non-2xx
-        response, or without a status when the API was unreachable.
+        it via ``asyncio.to_thread``. Pass ``body=None`` for a GET (a bodyless
+        request); a mapping is JSON-encoded for POST/PATCH. Raises
+        :class:`NinesAPIError` carrying the HTTP status and the API's ``error``
+        description on a non-2xx response, or without a status when the API was
+        unreachable.
         """
         request = urllib.request.Request(
             f"{self.base_url}{path}",
-            data=json.dumps(body).encode(),
+            data=json.dumps(body).encode() if body is not None else None,
             method=method,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -155,26 +166,98 @@ class NinesClient:
                 f"Nines API {method} {path} unreachable: {exc.reason}"
             ) from exc
 
-    async def upsert_item(
-        self, sku: str, product_name: Optional[str], org_slug: Optional[str] = None
+    async def find_item(
+        self, sku: str, org: Optional[str], upc: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Look up an already-loaded reference item's id in ``org`` without
+        creating anything, via ``GET /api/v1/reference_items``. Tries the
+        ``upc`` filter first (the operator's primary identifier once catalogs
+        are pre-loaded; matches ``product_details->>'upc'``), then the exact
+        ``external_id``/SKU filter. Returns the id, or ``None`` when the product
+        isn't loaded in the org yet. Does not cache - the caller does.
+        """
+        # UPC before SKU: a pre-loaded catalog is keyed to the client's UPC, and
+        # the SKU we were handed may just be its fallback label.
+        attempts: List[Dict[str, str]] = []
+        if upc:
+            attempts.append({"upc": str(upc)})
+        attempts.append({"external_id": sku})
+        for filt in attempts:
+            query = urllib.parse.urlencode({"shots_organization_slug": org, **filt})
+            response = await asyncio.to_thread(
+                self.request,
+                "GET",
+                f"/api/v1/reference_items?{query}",
+                None,
+                self.request_timeout_s,
+            )
+            for item in response.get("reference_items") or []:
+                # The server filter is trusted for UPC, but re-check exact
+                # (case-insensitive) SKU: an external_id lookup must not match a
+                # near-neighbour product.
+                if "external_id" in filt and (
+                    str(item.get("external_id") or "").lower() != sku.lower()
+                ):
+                    continue
+                item_id = str(item.get("id") or "")
+                if item_id:
+                    return item_id
+        return None
+
+    async def _resolve_item(
+        self,
+        sku: str,
+        product_name: Optional[str],
+        org: Optional[str],
+        upc: Optional[str] = None,
     ) -> str:
         """
-        Upsert the Nines reference item whose ``external_id`` is ``sku`` in the
-        effective org (``org_slug`` when given, else the configured slug) and
-        cache its id under ``(org, sku)``. Deliberately sends no ``images``
-        field - on an existing product that would *replace* all of its imagery;
-        appending happens through the non-destructive images endpoint only.
+        Resolve the reference item id for ``(org, sku)``: look the pre-loaded
+        product up first, and create it only when the lookup finds nothing.
+        Caches and returns the id.
+        """
+        item_id = await self.find_item(sku, org, upc=upc)
+        if item_id is not None:
+            self.item_ids[(org, sku)] = item_id
+            self.logger.info(
+                f"Nines reference item {item_id} found for SKU {sku!r} "
+                f"in org {org!r}"
+            )
+            return item_id
+        return await self.upsert_item(sku, product_name, org_slug=org, upc=upc)
+
+    async def upsert_item(
+        self,
+        sku: str,
+        product_name: Optional[str],
+        org_slug: Optional[str] = None,
+        upc: Optional[str] = None,
+    ) -> str:
+        """
+        Create (or, for an existing SKU, update) the Nines reference item whose
+        ``external_id`` is ``sku`` in the effective org (``org_slug`` when
+        given, else the configured slug) and cache its id under ``(org, sku)``.
+        A ``upc`` is carried in flat ``product_details`` - never in the name.
+        Deliberately sends no ``images`` field: on an existing product that
+        would *replace* all of its imagery; appending happens through the
+        non-destructive images endpoint only. Reserved for the create path in
+        :meth:`_resolve_item` - a re-POST also overwrites ``product_details``,
+        so callers must confirm the product is absent first.
         """
         org = org_slug or self.org_slug
+        body: Dict[str, Any] = {
+            "shots_organization_slug": org,
+            "name": product_name or sku,
+            "external_id": sku,
+        }
+        if upc:
+            body["product_details"] = {"upc": str(upc)}
         response = await asyncio.to_thread(
             self.request,
             "POST",
             "/api/v1/reference_items",
-            {
-                "shots_organization_slug": org,
-                "name": product_name or sku,
-                "external_id": sku,
-            },
+            body,
             self.request_timeout_s,
         )
         item_id = str(response.get("id") or "")
@@ -194,20 +277,23 @@ class NinesClient:
         images: Sequence[Tuple[str, str, List[str]]],
         product_name: Optional[str] = None,
         org_slug: Optional[str] = None,
+        upc: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Deliver on-disk image files to the Nines product identified by ``sku``
-        in the effective org (``org_slug`` when given, else the configured
-        slug): upsert the reference item (once per ``(org, SKU)`` for this
-        client's lifetime), then append every image non-destructively as inline
-        base64. ``images`` is ``[(path, upload_filename, tags)]``; every file
-        must carry a jpeg/png/webp/gif extension. Raises on any API failure -
-        callers decide whether that fails their operation.
+        (and, when known, ``upc``) in the effective org (``org_slug`` when
+        given, else the configured slug): resolve the reference item once per
+        ``(org, SKU)`` for this client's lifetime - looking the pre-loaded
+        product up and creating it only if absent - then append every image
+        non-destructively as inline base64. ``images`` is
+        ``[(path, upload_filename, tags)]``; every file must carry a
+        jpeg/png/webp/gif extension. Raises on any API failure - callers decide
+        whether that fails their operation.
         """
         org = org_slug or self.org_slug
         cached = (org, sku) in self.item_ids
-        item_id = self.item_ids.get((org, sku)) or await self.upsert_item(
-            sku, product_name, org_slug=org
+        item_id = self.item_ids.get((org, sku)) or await self._resolve_item(
+            sku, product_name, org, upc=upc
         )
 
         payload: List[Dict[str, Any]] = []
@@ -240,10 +326,10 @@ class NinesClient:
                 raise
             self.logger.warning(
                 f"cached Nines item {item_id} for SKU {sku!r} in org {org!r} is "
-                "gone (404); re-upserting and retrying"
+                "gone (404); re-resolving and retrying"
             )
             self.item_ids.pop((org, sku), None)
-            item_id = await self.upsert_item(sku, product_name, org_slug=org)
+            item_id = await self._resolve_item(sku, product_name, org, upc=upc)
             response = await append(item_id)
 
         return {

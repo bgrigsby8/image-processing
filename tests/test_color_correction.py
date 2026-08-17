@@ -1460,3 +1460,130 @@ def test_preview_honors_the_crop_region(tmp_path):
 
     assert mean(left) < 40    # dark half
     assert mean(right) > 215  # light half
+
+
+# ---------------------------------------------------------------------------
+# Per-call `ccm` override: capture/develop/preview take a 3x3 `ccm` option
+# applied instead of the configured matrix for that call only. The sidecar
+# records the matrix actually applied and where it came from.
+# ---------------------------------------------------------------------------
+
+# Halves red in linear light — visibly different from the identity config.
+_HALF_RED_CCM = [[0.5, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def _jpeg_channel_means(image_base64):
+    with Image.open(BytesIO(base64.b64decode(image_base64))) as img:
+        return np.asarray(img.convert("RGB"), dtype=float).reshape(-1, 3).mean(axis=0)
+
+
+def test_develop_per_call_ccm_overrides_config(tmp_path):
+    """A per-call `ccm` changes the developed pixels, and the sidecar records
+    the override matrix (not the config's) so the develop stays reproducible."""
+    import json
+
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc._output_formats = ["jpeg"]
+    cc._write_sidecar = True
+    p = _write_still(tmp_path)  # solid gray 120
+
+    out = asyncio.run(cc.do_command({
+        "develop": {"path": p, "ccm": _HALF_RED_CCM},
+    }))["develop"]
+
+    r, g, _ = _jpeg_channel_means(out["image_base64"])
+    assert r < g - 20  # red visibly halved, green untouched
+    assert out["ccm_applied"] is True  # override applied despite identity config
+    with open(out["sidecar"]) as f:
+        record = json.load(f)
+    assert record["ccm"] == _HALF_RED_CCM
+    assert record["ccm_source"] == "override"
+    # The configured corrector is untouched for later calls.
+    assert cc.corrector.is_identity
+
+
+def test_develop_without_ccm_uses_the_config_matrix(tmp_path):
+    """No per-call `ccm`: the configured matrix develops the frame and the
+    sidecar says so."""
+    import json
+
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc.corrector = ColorCorrector(np.array(_HALF_RED_CCM, dtype=np.float32))
+    cc._output_formats = ["jpeg"]
+    cc._write_sidecar = True
+    p = _write_still(tmp_path)
+
+    out = asyncio.run(cc.do_command({"develop": {"path": p}}))["develop"]
+
+    r, g, _ = _jpeg_channel_means(out["image_base64"])
+    assert r < g - 20  # config matrix still applied
+    with open(out["sidecar"]) as f:
+        record = json.load(f)
+    assert record["ccm"] == _HALF_RED_CCM
+    assert record["ccm_source"] == "config"
+
+
+def test_preview_per_call_ccm_overrides_config(tmp_path):
+    """`preview` honors a per-call `ccm`, so an operator can proof a candidate
+    matrix without touching the config — and without writing anything."""
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still(tmp_path)
+
+    plain = asyncio.run(cc.do_command({"preview": {"path": p}}))["preview"]
+    tinted = asyncio.run(cc.do_command({
+        "preview": {"path": p, "ccm": _HALF_RED_CCM},
+    }))["preview"]
+
+    assert plain["ccm_applied"] is False
+    assert tinted["ccm_applied"] is True
+    r0, g0, _ = _jpeg_channel_means(plain["image_base64"])
+    r1, g1, _ = _jpeg_channel_means(tinted["image_base64"])
+    assert abs(r0 - g0) < 3  # identity config: still neutral gray
+    assert r1 < g1 - 20      # override halved red for this call only
+
+
+def test_per_call_ccm_rejects_malformed_matrices(tmp_path):
+    """Anything that isn't a 3x3 grid of numbers fails with an error naming
+    `ccm`, before any pixels are touched."""
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    p = _write_still(tmp_path)
+
+    for bad in (
+        [[1, 0], [0, 1]],                 # 2x2
+        [1, 0, 0, 0, 1, 0, 0, 0, 1],      # flat 9-list, not nested
+        [["a", "b", "c"]] * 3,            # non-numeric
+    ):
+        with pytest.raises(ValueError, match="ccm"):
+            asyncio.run(cc.do_command({"develop": {"path": p, "ccm": bad}}))
+
+
+def test_deferred_capture_validates_ccm_before_the_shutter(tmp_path):
+    """A malformed per-call `ccm` fails a deferred capture up front - the
+    shutter never fires, so a bad matrix can't waste an exposure."""
+    source = _FakeSource(_write_still(tmp_path))
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    with pytest.raises(ValueError, match="ccm"):
+        asyncio.run(cc.do_command({"capture": {"defer": True, "ccm": [[1.0]]}}))
+    assert source.commands == []  # no trigger sent
+
+
+def test_deferred_capture_applies_per_call_ccm(tmp_path):
+    """The override resolved at trigger time reaches the background develop in
+    `_finish_deferred_capture` (download + decode + preview)."""
+    source = _FakeSource(_write_still(tmp_path))
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    async def run():
+        ticket = (await cc.do_command(
+            {"capture": {"defer": True, "ccm": _HALF_RED_CCM}}
+        ))["capture"]
+        return (await cc.do_command(
+            {"capture_result": {"id": ticket["capture_id"], "wait_sec": 30}}
+        ))["capture_result"]
+
+    result = asyncio.run(run())
+    assert result["status"] == "done"
+    assert result["ccm_applied"] is True  # override applied despite identity config
+    r, g, _ = _jpeg_channel_means(result["image_base64"])
+    assert r < g - 20

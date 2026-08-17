@@ -508,8 +508,10 @@ class ColorCorrection(Camera, EasyResource):
             # clients can reach its commands (focus, status, settings)
             # through this wrapper. The source rejects unknown commands
             # itself. Commands both models define (capture, delete) never
-            # get here - the branches above claim them first.
-            return await self.camera.do_command(command, timeout=timeout, **kwargs)
+            # get here - the branches above claim them first. Only the
+            # command and timeout are forwarded: kwargs holds server-side
+            # call context (grpc metadata) that a client call can't accept.
+            return await self.camera.do_command(command, timeout=timeout)
         return resp
 
     # ------------------------------------------------------------------

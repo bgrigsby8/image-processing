@@ -358,7 +358,10 @@ class _FakeSource:
         self.saves_to_disk = saves_to_disk
         self.commands = []
 
-    async def do_command(self, command, *, timeout=None, **kwargs):
+    # No **kwargs on purpose: this is a *client* call, which only takes
+    # timeout. Forwarding server-side kwargs (grpc metadata) must TypeError
+    # here like it errors against the real SDK.
+    async def do_command(self, command, *, timeout=None):
         self.commands.append(command)
         if "trigger" in command:
             if not self.supports_trigger:
@@ -464,10 +467,12 @@ def test_deferred_capture_surfaces_background_failure(tmp_path):
 
 def test_do_command_passthrough_forwards_to_source():
     """Commands this wrapper doesn't own (focus, status, ...) are forwarded
-    verbatim to the source camera and its response returned as-is."""
+    verbatim to the source camera and its response returned as-is. Called
+    with a `metadata` kwarg the way viam-server calls a component server:
+    server-side kwargs must NOT be forwarded into the client call."""
     source = _FakeSource(saved_path=None)
     cc = _component(source)
-    resp = asyncio.run(cc.do_command({"home_focus": {}}))
+    resp = asyncio.run(cc.do_command({"home_focus": {}}, metadata=object()))
     assert resp == {"home_focus": {"emulated": True, "position": 0}}
     assert source.commands == [{"home_focus": {}}]
 

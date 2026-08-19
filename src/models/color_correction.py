@@ -1519,6 +1519,18 @@ class ColorCorrection(Camera, EasyResource):
           ``delete_after_upload`` override the config attribute: remove each
                                   local file once its upload succeeds (failed
                                   uploads keep their files for retry)
+          ``upload_images_to_viam``
+                                  when false, only the ``.json`` sidecars in
+                                  ``paths`` are uploaded to Viam; the image
+                                  files are skipped (reported under
+                                  ``skipped_viam``) because Nines delivery
+                                  already carries the shot. Nines delivery and
+                                  ``delete_after_upload`` still see the full
+                                  set, so skipped images are cleaned off the
+                                  disk as if they had uploaded — after this,
+                                  Nines holds the only copy of the delivery
+                                  image and the other renders are not kept
+                                  anywhere. Default true.
         """
         raw_paths = opts.get("paths") or []
         if not raw_paths:
@@ -1530,6 +1542,17 @@ class ColorCorrection(Camera, EasyResource):
         upc = str(opts.get("upc") or "").strip() or None
         org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
         product_name = str(opts.get("product_name") or "").strip() or None
+
+        upload_images = bool(opts.get("upload_images_to_viam", True))
+        # The Viam pass may cover a subset, but Nines delivery, stem naming,
+        # and the delete pass all keep working from the full `paths` set.
+        viam_paths = paths
+        skipped_viam: List[str] = []
+        if not upload_images:
+            viam_paths = [
+                p for p in paths if os.path.splitext(p)[1].lower() == ".json"
+            ]
+            skipped_viam = [p for p in paths if p not in set(viam_paths)]
 
         name = opts.get("name")
         name = str(name) if name else None      # falsy/empty -> keep current behavior
@@ -1554,12 +1577,12 @@ class ColorCorrection(Camera, EasyResource):
 
         uploaded: List[str] = []
         failed: List[Dict[str, str]] = []
-        for i, path in enumerate(paths):
+        for i, path in enumerate(viam_paths):
             try:
                 size = os.path.getsize(path)
                 self.logger.info(
                     f"uploading {os.path.basename(path)} ({size / 1e6:.1f} MB) "
-                    f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
+                    f"[{i + 1}/{len(viam_paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
                 )
                 t_upload = time.perf_counter()
                 file_name = (
@@ -1608,7 +1631,10 @@ class ColorCorrection(Camera, EasyResource):
 
         deleted: List[str] = []
         if delete_after:
-            for path in uploaded:
+            # Images skipped for Viam are done once Nines delivery has run —
+            # they delete on the same terms as uploaded ones (a failed
+            # delivery's image is still held back via nines_keep).
+            for path in uploaded + skipped_viam:
                 if path == nines_keep:
                     self.logger.info(
                         f"keeping {os.path.basename(path)} on disk for a Nines "
@@ -1624,8 +1650,12 @@ class ColorCorrection(Camera, EasyResource):
                     self.logger.warning(f"uploaded but could not delete {path}: {exc}")
 
         self.logger.info(
-            f"uploaded {len(uploaded)}/{len(paths)} file(s)"
+            f"uploaded {len(uploaded)}/{len(viam_paths)} file(s)"
             + (f" with tags {tags}" if tags else "")
+            + (
+                f" ({len(skipped_viam)} image(s) skipped for Viam)"
+                if skipped_viam else ""
+            )
             + (f", deleted {len(deleted)} local cop(ies)" if delete_after else "")
         )
         result: Dict[str, ValueTypes] = {
@@ -1634,6 +1664,8 @@ class ColorCorrection(Camera, EasyResource):
             "failed": failed,
             "deleted": deleted,
         }
+        if skipped_viam:
+            result["skipped_viam"] = skipped_viam
         if nines is not None:
             result["nines"] = nines
         return result

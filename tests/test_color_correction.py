@@ -778,6 +778,52 @@ def test_delete_after_upload_command_overrides_config(tmp_path, monkeypatch):
     assert not path.exists()
 
 
+def test_upload_images_to_viam_off_uploads_only_sidecar(tmp_path, monkeypatch):
+    """With `upload_images_to_viam: false` only the .json sidecar reaches the
+    Viam uploader; the image files are reported under `skipped_viam` (the shot
+    is already delivered to Nines, so a Viam copy would be redundant)."""
+    names = ["IMG_0042.cr3", "IMG_0042_16.png", "IMG_0042.jpg", "IMG_0042.json"]
+    paths = []
+    for n in names:
+        p = tmp_path / n
+        p.write_bytes(b"x")
+        paths.append(str(p))
+    cc = _uploader_component(tmp_path, monkeypatch)
+
+    out = asyncio.run(
+        cc._upload({"paths": paths, "upload_images_to_viam": False})
+    )
+
+    sidecar = str(tmp_path / "IMG_0042.json")
+    assert [p for p, _ in cc._uploaded_names] == [sidecar]
+    assert out["uploaded"] == [sidecar]
+    assert sorted(out["skipped_viam"]) == sorted(p for p in paths if p != sidecar)
+    # Without delete_after_upload every file stays on disk, skipped included.
+    assert all((tmp_path / n).exists() for n in names)
+
+
+def test_upload_images_to_viam_off_still_deletes_skipped_images(tmp_path, monkeypatch):
+    """Skipped images delete on the same terms as uploaded files - leaving
+    them would fill the machine's disk once the Viam archive stops draining
+    it."""
+    raw = tmp_path / "IMG_0042.cr3"
+    sidecar = tmp_path / "IMG_0042.json"
+    raw.write_bytes(b"raw")
+    sidecar.write_bytes(b"{}")
+    cc = _uploader_component(tmp_path, monkeypatch)
+    cc._delete_after_upload = True
+
+    out = asyncio.run(
+        cc._upload(
+            {"paths": [str(raw), str(sidecar)], "upload_images_to_viam": False}
+        )
+    )
+
+    assert out["uploaded"] == [str(sidecar)]
+    assert sorted(out["deleted"]) == sorted([str(raw), str(sidecar)])
+    assert not raw.exists() and not sidecar.exists()
+
+
 def test_delete_removes_files_inside_output_dir(tmp_path):
     cc = _component(_FakeSource(None), output_dir=str(tmp_path))
     keep = tmp_path / "keep.CR3"

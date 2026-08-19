@@ -208,7 +208,11 @@ Options: `paths` (required), `tags`, `name` (operator-chosen stem replacing the
 capture stem on every file), `sku` (deliver to Nines — see below), `part_id`
 (override the configured/env part id), `component_name` (camera to associate
 the data with; defaults to this component's name), `delete_after_upload`
-(override the config attribute). Authentication uses the `VIAM_API_KEY` /
+(override the config attribute), `upload_images_to_viam` (default `true`; when
+`false` only the `.json` sidecars in `paths` are archived to Viam, and the
+image files — reported back under `skipped_viam` — are left to the Nines
+delivery, still deleting under `delete_after_upload` as if they had uploaded).
+Authentication uses the `VIAM_API_KEY` /
 `VIAM_API_KEY_ID` that Viam injects into the module process — no credentials
 need configuring, but the machine must be cloud-connected. Returns
 `{"uploaded": [...paths], "count": N, "failed": [{"path", "error"}], "deleted":

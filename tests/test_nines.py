@@ -20,6 +20,7 @@ import pytest
 
 from models.nines import (
     NINES_RETRY_FIRST_DELAY_SEC,
+    NINES_USER_AGENT,
     NinesAPIError,
     NinesClient,
     NinesDeliveryQueue,
@@ -98,6 +99,35 @@ def test_unreachable_api_arrives_as_a_retryable_nines_error():
     assert caught.value.status is None and caught.value.retryable
 
 
+def test_requests_identify_the_integration(monkeypatch):
+    """Every call names this integration in its User-Agent (urllib's default
+    is an anonymous "Python-urllib/x.y" Nines cannot attribute) and asks for
+    the JSON the API speaks."""
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(request, timeout=None):
+        captured["request"] = request
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = _client("http://nines.test")
+    client.request("GET", "/api/v1/reference_items", None, 1.0)
+    request = captured["request"]
+    assert request.get_header("User-agent") == NINES_USER_AGENT
+    assert request.get_header("Accept") == "application/json"
+    assert request.get_header("Authorization") == "Bearer nines_live_test"
+
+
 # ---------------------------------------------------------------------------
 # Did a lost append actually land? The evidence, without the HTTP.
 # ---------------------------------------------------------------------------
@@ -119,6 +149,10 @@ def _remote(*tags):
     # A tag match proves nothing - `nines_upload` reuses tags like "front",
     # so claiming True here would silently drop a re-shoot.
     (None, [_remote("IMG_0042")], [["IMG_0042"]], None),
+    # The API lowercases tags on ingest, so a landed batch comes back
+    # lowercased. It must still count as a match (None) - calling it absent
+    # (False) would re-append it, the duplicate this check exists to prevent.
+    (None, [_remote("img_0042")], [["IMG_0042"]], None),
     # Nothing to match on at all.
     (None, [_remote("front")], [[]], None),
 ])
@@ -532,6 +566,27 @@ def test_a_list_hit_carrying_the_count_costs_no_extra_request():
     assert client.item_image_counts["ritem_1"] == 7
     assert not any(p.startswith("/api/v1/reference_items/ritem_1")
                    for _, p in fake.calls)
+
+
+def test_exact_lookups_ask_for_a_single_row():
+    """The upc/external_id filters are exact matches, so find_item requests
+    limit=1 - the webapp client's convention - rather than accepting the list
+    endpoint's default 50-item page."""
+    fake = _FakeAPI(existing=[{"id": "ritem_1", "external_id": "SKU",
+                               "images_count": 0}])
+    client = _client("http://nines.test")
+    client.request = fake
+
+    assert asyncio.run(
+        client.find_item("SKU", "viam-org", upc="012345678905")
+    ) == "ritem_1"
+    lookups = [path for method, path in fake.calls
+               if method == "GET"
+               and path.split("?")[0] == "/api/v1/reference_items"]
+    assert len(lookups) == 2  # the upc leg missed, the external_id leg hit
+    for path in lookups:
+        query = urllib.parse.parse_qs(path.split("?", 1)[1])
+        assert query["limit"] == ["1"]
 
 
 def test_a_created_product_starts_from_the_count_its_upsert_reported():

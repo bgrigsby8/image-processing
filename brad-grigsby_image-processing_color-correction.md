@@ -69,9 +69,9 @@ installs those automatically on Debian/Ubuntu.
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
-| `nines_api_key`  | string       | Optional  | Nines partner-API key (`nines_live_…`). Falls back to the `NINES_API_KEY` env var. Nines delivery (the `sku` option on `upload`, and `nines_upload`) is enabled only when this and `nines_organization_slug` are both set. |
+| `nines_api_key`  | string       | Optional  | Nines partner-API key (`nines_live_…`). Falls back to the `NINES_API_KEY` env var. Nines delivery (the `sku` option on `upload`, and `nines_upload`) is enabled when this is set and an org slug is available — `nines_organization_slug` here, or a per-request `shots_organization_slug` (which is how one machine serves multiple orgs). |
 | `nines_organization_slug` | string | Optional | Sent as `shots_organization_slug` on every Nines call — the brand you upload for (list valid slugs with the API's `GET /api/v1/organizations`). |
-| `nines_base_url` | string       | Optional  | Nines API base URL. Default `https://review-app.ninesstyle.com`. |
+| `nines_base_url` | string       | Optional  | Nines API base URL. Default `https://review-app.ninesstyle.com`. Must be `https://` (the API key rides every request as a bearer token); `http://` is accepted only for `localhost`. |
 | `nines_retry_first_delay_s` | number | Optional | How long after a failed Nines delivery the first re-attempt is scheduled. Default `3`. Spread ±20% so a fleet coming back from one outage doesn't re-hit the API in lockstep. |
 | `nines_retry_max_delay_s` | number | Optional | Ceiling on the doubling backoff between re-attempts. Default `300`. |
 | `nines_retry_max_attempts` | int  | Optional  | Total delivery attempts including the inline one, after which the delivery is abandoned and its file left on disk. Default `6` (delays of 3, 6, 12, 24, 48s). `1` disables retrying. |
@@ -283,8 +283,9 @@ duplicate a human can delete.
 Appends image files already on disk to a Nines product — the manual
 counterpart to the `sku` option on `upload`. Sends exactly the files listed
 (each must be jpeg/png/webp/gif), non-destructively, with no Viam upload and
-no local deletion. Requires the `nines_api_key` and `nines_organization_slug`
-attributes.
+no local deletion. Requires the `nines_api_key` attribute plus an org slug —
+`nines_organization_slug` in config, or `shots_organization_slug` in the
+command.
 
 ```json
 {

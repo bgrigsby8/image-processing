@@ -53,6 +53,11 @@ from typing import (
 
 NINES_DEFAULT_BASE_URL = "https://review-app.ninesstyle.com"
 
+# Sent on every request so Nines can attribute this traffic to the Viam
+# integration; urllib's default "Python-urllib/x.y" is anonymous, which makes
+# our calls impossible to pick out on their side when debugging an incident.
+NINES_USER_AGENT = "viam-image-processing/color-correction"
+
 # Content types the Nines image-append endpoint accepts, by file extension.
 # The RAW master, TIFFs, and JSON sidecar of a capture set are Viam-archival
 # only - Nines rejects them.
@@ -251,6 +256,8 @@ class NinesClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": NINES_USER_AGENT,
             },
         )
         try:
@@ -308,7 +315,12 @@ class NinesClient:
             attempts.append({"upc": str(upc)})
         attempts.append({"external_id": sku})
         for filt in attempts:
-            query = urllib.parse.urlencode({"shots_organization_slug": org, **filt})
+            # limit=1 mirrors the webapp's Go client: both filters are exact
+            # matches, so one row decides the answer - no point accepting the
+            # list endpoint's default 50-item page.
+            query = urllib.parse.urlencode(
+                {"shots_organization_slug": org, "limit": 1, **filt}
+            )
             response = await asyncio.to_thread(
                 self.request,
                 "GET",
@@ -379,7 +391,11 @@ class NinesClient:
         with its filename stem, which is unique per shot, but ``nines_upload``
         passes operator tags like ``["front"]`` that an earlier session may
         already have used. Claiming ``True`` off that would silently drop a
-        re-shoot, so it degrades to ``None``.
+        re-shoot, so it degrades to ``None``. Tags are compared
+        case-insensitively: the API lowercases them on ingest, so the
+        mixed-case stems the upload path sends (``IMG_0042``) come back
+        lowercased, and an exact comparison would call a landed batch absent -
+        and re-append it, the very duplicate this check exists to prevent.
         """
         after = len(remote_images)
         if before_count is not None:
@@ -390,9 +406,11 @@ class NinesClient:
             return None
         if any(not tags for tags in batch_tags):
             return None
-        wanted = {frozenset(str(t) for t in tags) for tags in batch_tags}
+        wanted = {frozenset(str(t).lower() for t in tags) for tags in batch_tags}
         for image in remote_images:
-            if frozenset(str(t) for t in (image.get("tags") or [])) in wanted:
+            if frozenset(
+                str(t).lower() for t in (image.get("tags") or [])
+            ) in wanted:
                 return None
         return False
 

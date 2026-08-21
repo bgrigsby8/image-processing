@@ -65,7 +65,9 @@ Two ways to get corrected images out of this component:
    command below). ``nines_retry_first_delay_s`` (3), ``nines_retry_max_delay_s``
    (300) and ``nines_retry_max_attempts`` (6) pace the background re-delivery
    of a Nines upload that failed on something transient; ``nines_status``
-   reports what is still waiting.
+   reports what is still waiting (all of it, or one ``sku``'s) and
+   ``nines_cancel`` withdraws it, for an operator replacing a take rather than
+   waiting for it to land.
 
    ``capture``, ``develop``, and ``preview`` also take a per-call ``ccm``
    option — a 3x3 nested list applied instead of the configured matrix for
@@ -593,7 +595,14 @@ class ColorCorrection(Camera, EasyResource):
             )
 
         if "nines_status" in command:
-            resp["nines_status"] = self._nines_status()
+            resp["nines_status"] = self._nines_status(
+                command.get("nines_status") or {}
+            )
+
+        if "nines_cancel" in command:
+            resp["nines_cancel"] = self._nines_cancel(
+                command.get("nines_cancel") or {}
+            )
 
         if "delete" in command:
             resp["delete"] = self._delete_local(command.get("delete") or {})
@@ -2093,20 +2102,67 @@ class ColorCorrection(Camera, EasyResource):
             on_abandon=abandoned,
         )
 
-    def _nines_status(self) -> Mapping[str, ValueTypes]:
+    def _nines_status(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
         Nines deliveries still waiting to be re-attempted, plus the ones
-        recently given up on. Takes no options.
+        recently given up on.
 
         Without this a queued retry is invisible: the ``upload`` response that
         announced it is the last the caller hears until the delivery lands or
         does not. ``pending`` entries carry ``job_id``, ``sku``, ``org``,
         ``attempt``, ``next_attempt_in_s`` and the ``files`` being held on
-        disk; ``abandoned`` entries (the most recent 32) carry the same plus
-        the final ``error``, and name files that are still on disk and can be
-        re-sent with ``nines_upload``.
+        disk, plus ``in_flight`` on the one being attempted right now;
+        ``abandoned`` entries (the most recent 32) carry the same plus the final
+        ``error``, and name files that are still on disk and can be re-sent with
+        ``nines_upload``.
+
+        ``opts``:
+          ``sku``                       report only this product's deliveries,
+                                        which is how a caller asks "is anything
+                                        still outstanding for this SKU?" before
+                                        starting another take of it. Filters
+                                        ``abandoned`` as well as ``pending``.
+          ``shots_organization_slug``   narrow ``sku`` to one org, for a machine
+                                        that serves several
+
+        With no options the whole queue is reported, as it always was.
         """
-        return self._nines_queue.snapshot()
+        sku = str(opts.get("sku") or "").strip() or None
+        org = str(opts.get("shots_organization_slug") or "").strip() or None
+        return self._nines_queue.snapshot(sku=sku, org=org)
+
+    def _nines_cancel(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Withdraw queued Nines deliveries - the operator is replacing this
+        product's shot rather than waiting for the retry to land.
+
+        ``opts`` (at least one is required):
+          ``sku``                       cancel this product's pending deliveries
+          ``shots_organization_slug``   narrow ``sku`` to one org
+          ``job_id``                    cancel exactly this job, from a
+                                        ``nines_status`` entry or an ``upload``
+                                        response's ``retry`` block
+
+        Returns ``{"cancelled": [job_id], "in_flight": [job_id], "files":
+        [path]}``. ``in_flight`` names a delivery whose append was already on
+        the wire: it cannot be recalled, so it may still reach the product, and
+        that image then has to be removed in the Nines review app - the partner
+        API has no endpoint that deletes one.
+
+        ``files`` are the local copies that were being held for these
+        deliveries. They are reported rather than removed: send them to the
+        ``delete`` command, which is where the ``output_dir`` boundary is
+        enforced.
+        """
+        sku = str(opts.get("sku") or "").strip() or None
+        org = str(opts.get("shots_organization_slug") or "").strip() or None
+        job_id = str(opts.get("job_id") or "").strip() or None
+        if sku is None and org is None and job_id is None:
+            raise ValueError(
+                "`nines_cancel` needs a `sku`, a `shots_organization_slug` or a "
+                "`job_id` - it will not cancel every pending delivery"
+            )
+        return self._nines_queue.cancel(sku=sku, org=org, job_id=job_id)
 
     async def _nines_upload(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """

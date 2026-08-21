@@ -306,19 +306,55 @@ the sku). Returns `{"reference_item_id", "external_id", "added_count",
 ### Nines retry status
 
 Reports the Nines deliveries still waiting to be re-attempted, and the ones
-recently given up on. Takes no options — a queued retry is otherwise invisible
-after the `upload` response that announced it.
+recently given up on — a queued retry is otherwise invisible after the `upload`
+response that announced it.
 
 ```json
 {"nines_status": {}}
+{"nines_status": {"sku": "ABC123"}}
 ```
 
 Returns `{"pending": [...], "pending_count": N, "abandoned": [...]}`. Each
 pending entry is `{"job_id", "sku", "org", "attempt", "next_attempt_in_s",
-"files", "error"}` — `files` being the local copies held back for the retry.
-Each abandoned entry (the most recent 32) is `{"job_id", "sku", "org",
-"attempts", "error", "files"}`; those files are still on disk and can be
+"files", "error"}` — `files` being the local copies held back for the retry —
+plus `"in_flight": true` on the delivery being attempted at that moment (it is
+outstanding work, but its wait is over, so `next_attempt_in_s` says nothing
+about it). Each abandoned entry (the most recent 32) is `{"job_id", "sku",
+"org", "attempts", "error", "files"}`; those files are still on disk and can be
 re-sent with `nines_upload`.
+
+Options: `sku` narrows both lists to one product, and
+`shots_organization_slug` narrows that SKU to one org. That is how a caller
+asks *is anything still outstanding for this SKU?* before starting another take
+of it — the product's image count in Nines can't answer it, because a delivery
+that hasn't landed yet isn't in the count.
+
+### Cancel pending Nines deliveries
+
+Withdraws queued deliveries: the operator is replacing this product's shot
+rather than waiting for the retry to land. Needs at least one of `sku`,
+`shots_organization_slug` or `job_id` — with no options at all it raises rather
+than emptying the queue.
+
+```json
+{"nines_cancel": {"sku": "ABC123"}}
+{"nines_cancel": {"job_id": "nines-3"}}
+```
+
+Returns `{"cancelled": [...job_ids], "in_flight": [...job_ids], "files":
+[...paths]}`.
+
+`in_flight` names a delivery whose append was already on the wire when the
+cancel arrived. That request can't be recalled, so it runs to its end and is
+then discarded — never re-queued — but it may well have reached the product. The
+partner API has no endpoint that deletes an image, so **a cancel can only stop
+what hasn't landed**: anything already appended has to be removed by hand in
+the Nines review app.
+
+`files` are the local copies that were being held for these deliveries. They
+are reported, not removed — send them to `delete`, which is where the
+`output_dir` boundary is enforced. A cancelled delivery's `on_success` cleanup
+never runs, so nothing removes them on its own.
 
 ### Delete local files
 

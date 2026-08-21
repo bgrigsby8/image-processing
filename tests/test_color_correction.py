@@ -1482,6 +1482,69 @@ def test_nines_status_reports_a_delivery_given_up_on(tmp_path, monkeypatch):
     assert os.path.exists(gone["files"][0])
 
 
+def test_nines_status_can_be_asked_about_one_sku(tmp_path, monkeypatch):
+    """What the webapp asks before starting a second take: the product's image
+    count in Nines cannot see a delivery that has not landed yet, so the queue
+    has to be asked directly."""
+    paths = _shot_set(tmp_path)
+    other = _shot_set(tmp_path, stem="IMG_0043")
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+
+    async def scenario():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        await cc.do_command({"upload": {"paths": other, "sku": "OTHER-1"}})
+        mine = await cc.do_command({"nines_status": {"sku": "NWC-1042"}})
+        everything = await cc.do_command({"nines_status": {}})
+        await cc._nines_queue.close()
+        return mine, everything
+
+    mine, everything = asyncio.run(scenario())
+    assert everything["nines_status"]["pending_count"] == 2
+    assert mine["nines_status"]["pending_count"] == 1
+    assert mine["nines_status"]["pending"][0]["sku"] == "NWC-1042"
+
+
+def test_nines_cancel_withdraws_a_sku_s_queued_delivery(tmp_path, monkeypatch):
+    """The overwrite half of the webapp's prompt: the operator is replacing
+    this take, so the retry that is still waiting must not land after it."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+
+    async def scenario():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        cancelled = await cc.do_command({"nines_cancel": {"sku": "NWC-1042"}})
+        after = await cc.do_command({"nines_status": {}})
+        await cc._nines_queue.close()
+        return cancelled, after
+
+    cancelled, after = asyncio.run(scenario())
+    out = cancelled["nines_cancel"]
+    assert out["cancelled"] == ["nines-1"]
+    assert out["in_flight"] == []
+    jpeg = next(p for p in paths if p.endswith(".jpg"))
+    assert out["files"] == [jpeg]
+    assert after["nines_status"]["pending_count"] == 0
+    # Reported for the caller to send to `delete`, which owns the output_dir
+    # boundary - `nines_cancel` removes nothing itself.
+    assert os.path.exists(jpeg)
+
+
+def test_nines_cancel_needs_something_to_aim_at(tmp_path, monkeypatch):
+    """An empty command must not be able to empty the queue."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="will not cancel every pending"):
+        asyncio.run(cc.do_command({"nines_cancel": {}}))
+
+
 def test_validate_config_checks_the_retry_attributes():
     from viam.proto.app.robot import ComponentConfig
     from viam.utils import dict_to_struct

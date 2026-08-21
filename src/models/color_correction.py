@@ -137,6 +137,7 @@ import base64
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
@@ -305,6 +306,23 @@ class ColorCorrection(Camera, EasyResource):
             value = attrs.get(key)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"`{key}` must be a string")
+
+        base_url = attrs.get("nines_base_url")
+        if base_url:
+            # Catch a scheme-less URL here, where the platform surfaces the
+            # error at configure time, instead of as urllib's opaque "unknown
+            # url type" on the first delivery. And require https: the API key
+            # rides every request as a bearer token, so plain http would send
+            # it in cleartext. http is allowed only against localhost, for
+            # testing against a local stand-in server.
+            parsed = urllib.parse.urlparse(str(base_url))
+            local = parsed.hostname in ("localhost", "127.0.0.1", "::1")
+            if parsed.scheme != "https" and not (parsed.scheme == "http" and local):
+                raise ValueError(
+                    "`nines_base_url` must be an https:// URL (the Nines API "
+                    "key is sent as a bearer token on every request, so plain "
+                    f"http would expose it); got {base_url!r}"
+                )
 
         for key in ("nines_retry_first_delay_s", "nines_retry_max_delay_s"):
             value = attrs.get(key)
@@ -2087,6 +2105,8 @@ class ColorCorrection(Camera, EasyResource):
             attempt=1,
             ambiguous=exc.ambiguous,
             error=str(exc),
+            # A server-sent Retry-After floors the first scheduled attempt.
+            retry_after_s=exc.retry_after_s,
             # Carried in the journal so a restart can rebuild the callbacks.
             context={"delete_after": delete_after},
             on_success=delivered,
@@ -2113,7 +2133,9 @@ class ColorCorrection(Camera, EasyResource):
         Deliver image files already on disk to the Nines partner API - the
         manual / retry counterpart to the ``sku`` option on ``upload``. Sends
         exactly the files listed (no best-of-set picking, no Viam upload, no
-        local deletion), appended to the SKU's product non-destructively.
+        local deletion), appended to the SKU's product non-destructively. The
+        whole batch is held in memory base64-encoded while it uploads, so send
+        a very large set in a few calls rather than one.
 
         ``opts``:
           ``sku``                       product code matched as the Nines

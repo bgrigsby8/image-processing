@@ -8,11 +8,14 @@ which is the only honest way to prove what urllib actually raises.
 """
 
 import asyncio
+import email.utils
+import io
 import json
 import logging
 import os
 import socket
 import threading
+import urllib.error
 import urllib.parse
 import time
 
@@ -20,9 +23,11 @@ import pytest
 
 from models.nines import (
     NINES_RETRY_FIRST_DELAY_SEC,
+    NINES_USER_AGENT,
     NinesAPIError,
     NinesClient,
     NinesDeliveryQueue,
+    _retry_after_seconds,
 )
 
 LOGGER = logging.getLogger("test-nines")
@@ -98,6 +103,142 @@ def test_unreachable_api_arrives_as_a_retryable_nines_error():
     assert caught.value.status is None and caught.value.retryable
 
 
+def test_requests_identify_the_integration(monkeypatch):
+    """Every call names this integration in its User-Agent (urllib's default
+    is an anonymous "Python-urllib/x.y" Nines cannot attribute) and asks for
+    the JSON the API speaks."""
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(request, timeout=None):
+        captured["request"] = request
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = _client("http://nines.test")
+    client.request("GET", "/api/v1/reference_items", None, 1.0)
+    request = captured["request"]
+    assert request.get_header("User-agent") == NINES_USER_AGENT
+    assert request.get_header("Accept") == "application/json"
+    assert request.get_header("Authorization") == "Bearer nines_live_test"
+
+
+def test_retry_after_accepts_both_header_forms():
+    """RFC 9110 allows a delta in seconds or an HTTP-date; anything else -
+    absent, garbage, already elapsed - is simply no floor at all."""
+    assert _retry_after_seconds({"Retry-After": "7"}) == 7.0
+    date = email.utils.formatdate(time.time() + 30, usegmt=True)
+    seconds = _retry_after_seconds({"Retry-After": date})
+    assert seconds is not None and 25 <= seconds <= 31
+    assert _retry_after_seconds({"Retry-After": "soon"}) is None
+    assert _retry_after_seconds({"Retry-After": "-3"}) is None
+    assert _retry_after_seconds({}) is None
+    assert _retry_after_seconds(None) is None
+
+
+def test_a_rate_limit_carries_its_retry_after_onto_the_error(monkeypatch):
+    def raising_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 429, "Too Many Requests",
+            {"Retry-After": "7"}, io.BytesIO(b'{"error": "rate limited"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", raising_urlopen)
+    client = _client("http://nines.test")
+    with pytest.raises(NinesAPIError) as caught:
+        client.request("GET", "/api/v1/reference_items", None, 1.0)
+    assert caught.value.status == 429
+    assert caught.value.retryable and not caught.value.ambiguous
+    assert caught.value.retry_after_s == 7.0
+
+
+def test_handled_http_failures_do_not_log_error(monkeypatch, caplog):
+    """request() raises for its caller to classify; the caller that finds a
+    failure terminal escalates, so an error log here too would double-report
+    every handled 404 (stale cache) and 503 (queued retry)."""
+    def raising_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", {},
+            io.BytesIO(b'{"error": "no such record"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", raising_urlopen)
+    client = _client("http://nines.test")
+    with caplog.at_level(logging.DEBUG, logger="test-nines"):
+        with pytest.raises(NinesAPIError):
+            client.request("GET", "/api/v1/reference_items/ritem_9", None, 1.0)
+    ours = [r for r in caplog.records if r.name == "test-nines"]
+    assert not [r for r in ours if r.levelno >= logging.ERROR]
+    assert [r for r in ours if r.levelno == logging.WARNING]
+
+
+def test_a_403_names_the_orgs_the_key_can_reach(monkeypatch, caplog):
+    """A key fenced to one org pointed at another's slug fails every delivery
+    with a bare 403; the one-time diagnostic names the valid slugs so the
+    operator can fix the config instead of guessing."""
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'[{"id": "sorg_1", "slug": "viam-testing", "name": "Viam"}]'
+
+    def fake_urlopen(request, timeout=None):
+        if "/api/v1/organizations" in request.full_url:
+            return _Resp()
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "Forbidden", {},
+            io.BytesIO(b'{"error": "wrong organization"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = _client("http://nines.test")
+    with caplog.at_level(logging.DEBUG, logger="test-nines"):
+        for _ in range(2):
+            with pytest.raises(NinesAPIError):
+                client.request(
+                    "GET",
+                    "/api/v1/reference_items?shots_organization_slug=vans-org",
+                    None, 1.0,
+                )
+    complaints = [r for r in caplog.records
+                  if r.levelno == logging.ERROR and "viam-testing" in r.message]
+    assert len(complaints) == 1  # diagnosed once per client, not per failure
+    assert "vans-org" in complaints[0].message
+
+
+def test_a_403_diagnosis_that_itself_fails_stays_quiet(monkeypatch, caplog):
+    """A key without organizations:read must still get its original 403, with
+    the failed diagnostic demoted to debug - and no recursion."""
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "Forbidden", {},
+            io.BytesIO(b'{"error": "missing scope"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = _client("http://nines.test")
+    with caplog.at_level(logging.DEBUG, logger="test-nines"):
+        with pytest.raises(NinesAPIError) as caught:
+            client.request("GET", "/api/v1/reference_items", None, 1.0)
+    assert caught.value.status == 403
+    ours = [r for r in caplog.records if r.name == "test-nines"]
+    assert not [r for r in ours if "can reach" in r.message]
+    assert [r for r in ours if r.levelno == logging.DEBUG]
+
+
 # ---------------------------------------------------------------------------
 # Did a lost append actually land? The evidence, without the HTTP.
 # ---------------------------------------------------------------------------
@@ -119,6 +260,10 @@ def _remote(*tags):
     # A tag match proves nothing - `nines_upload` reuses tags like "front",
     # so claiming True here would silently drop a re-shoot.
     (None, [_remote("IMG_0042")], [["IMG_0042"]], None),
+    # The API lowercases tags on ingest, so a landed batch comes back
+    # lowercased. It must still count as a match (None) - calling it absent
+    # (False) would re-append it, the duplicate this check exists to prevent.
+    (None, [_remote("img_0042")], [["IMG_0042"]], None),
     # Nothing to match on at all.
     (None, [_remote("front")], [[]], None),
 ])
@@ -213,6 +358,19 @@ def test_verify_first_re_appends_when_the_earlier_attempt_missed(tmp_path):
     assert "deduplicated" not in result
     # The successful append refreshes the baseline for the next question.
     assert client.item_image_counts["ritem_1"] == 2
+
+
+def test_deliver_refuses_when_unconfigured():
+    """The DoCommand entry points check ready() and answer politely; a direct
+    call must fail cleanly rather than urlencode org=None into the query or
+    send "Bearer None" to the API."""
+    client = NinesClient(None, None, "http://nines.test", logger=LOGGER,
+                         request_timeout_s=1.0, upload_timeout_s=1.0)
+    with pytest.raises(NinesAPIError) as caught:
+        asyncio.run(client.deliver("SKU", [("/a.jpg", "a.jpg", [])]))
+    assert not caught.value.retryable and not caught.value.ambiguous
+    with pytest.raises(NinesAPIError):
+        client.request("GET", "/api/v1/organizations", None, 1.0)
 
 
 def test_unreadable_file_is_a_terminal_failure(tmp_path):
@@ -342,6 +500,39 @@ def test_each_failure_widens_the_gap():
     assert len(gaps) == 4
     for gap, expected in zip(gaps, [0.05, 0.10, 0.20, 0.40]):
         assert gap >= expected * 0.9, gaps
+
+
+def test_the_server_s_retry_after_floors_the_backoff():
+    """Re-attempting before the moment the server named would burn one of the
+    job's attempts on a certain refusal, so Retry-After stretches the gap."""
+    client = _ScriptedClient({"S": [
+        NinesAPIError("busy", status=429, retry_after_s=0.3),
+        {"ok": True},
+    ]})
+    queue = _queue(client, first_delay_s=0.01)
+
+    async def scenario():
+        queue.enqueue("S", IMAGES)
+        await _drain(queue)
+
+    asyncio.run(scenario())
+    assert client.calls[1]["at"] - client.calls[0]["at"] >= 0.3 * 0.9
+
+
+def test_the_inline_failure_s_retry_after_floors_the_first_attempt():
+    """The Retry-After the caller saw on its failed inline attempt reaches the
+    schedule too, not just the ones the queue sees itself."""
+    client = _ScriptedClient({"S": [{"ok": True}]})
+    queue = _queue(client, first_delay_s=0.01)
+
+    async def scenario():
+        start = time.monotonic()
+        queue.enqueue("S", IMAGES, retry_after_s=0.3)
+        await _drain(queue)
+        return start
+
+    start = asyncio.run(scenario())
+    assert client.calls[0]["at"] - start >= 0.3 * 0.9
 
 
 def test_a_failed_delivery_goes_behind_what_is_already_waiting():
@@ -532,6 +723,27 @@ def test_a_list_hit_carrying_the_count_costs_no_extra_request():
     assert client.item_image_counts["ritem_1"] == 7
     assert not any(p.startswith("/api/v1/reference_items/ritem_1")
                    for _, p in fake.calls)
+
+
+def test_exact_lookups_ask_for_a_single_row():
+    """The upc/external_id filters are exact matches, so find_item requests
+    limit=1 - the webapp client's convention - rather than accepting the list
+    endpoint's default 50-item page."""
+    fake = _FakeAPI(existing=[{"id": "ritem_1", "external_id": "SKU",
+                               "images_count": 0}])
+    client = _client("http://nines.test")
+    client.request = fake
+
+    assert asyncio.run(
+        client.find_item("SKU", "viam-org", upc="012345678905")
+    ) == "ritem_1"
+    lookups = [path for method, path in fake.calls
+               if method == "GET"
+               and path.split("?")[0] == "/api/v1/reference_items"]
+    assert len(lookups) == 2  # the upc leg missed, the external_id leg hit
+    for path in lookups:
+        query = urllib.parse.parse_qs(path.split("?", 1)[1])
+        assert query["limit"] == ["1"]
 
 
 def test_a_created_product_starts_from_the_count_its_upsert_reported():

@@ -1507,6 +1507,29 @@ def test_validate_config_checks_the_retry_attributes():
         validate(nines_retry_max_attempts=2.5)
 
 
+def test_validate_config_requires_an_https_nines_base_url():
+    """The API key rides every Nines request as a bearer token, so a plain
+    http base URL would send it in cleartext - and a scheme-less one would
+    only fail later, deep inside urllib, on the first delivery."""
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    def validate(**attrs):
+        return ColorCorrection.validate_config(
+            ComponentConfig(attributes=dict_to_struct({"camera": "src", **attrs}))
+        )
+
+    assert validate(nines_base_url="https://review-app.ninesstyle.com") == (
+        ["src"], []
+    )
+    # http passes only against localhost, for a local stand-in server.
+    assert validate(nines_base_url="http://localhost:3000") == (["src"], [])
+    with pytest.raises(ValueError, match="https"):
+        validate(nines_base_url="review-app.ninesstyle.com")  # no scheme
+    with pytest.raises(ValueError, match="https"):
+        validate(nines_base_url="http://review-app.ninesstyle.com")
+
+
 def test_reconfigure_applies_the_retry_attributes(tmp_path, monkeypatch):
     from viam.components.camera import Camera
     from viam.proto.app.robot import ComponentConfig

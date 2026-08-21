@@ -50,6 +50,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -916,6 +917,11 @@ class NinesDeliveryQueue:
     :meth:`enqueue` starts a fresh one. Failures that cannot improve
     (``NinesAPIError.retryable`` false - a bad key, the wrong org, a rejected
     image) are abandoned immediately rather than re-tried on a schedule.
+
+    :meth:`snapshot` and :meth:`cancel` take a SKU, which is what lets a caller
+    ask "is a delivery for this product still outstanding?" before adding
+    another - and withdraw the first one if the operator is replacing rather
+    than adding to it.
     """
 
     def __init__(
@@ -950,6 +956,16 @@ class NinesDeliveryQueue:
         # machine with a dead key must not grow this without limit.
         self._abandoned: Deque[Dict[str, Any]] = deque(maxlen=32)
         self._worker: Optional["asyncio.Task[None]"] = None
+        # The job the worker is attempting right now. The deque doesn't hold it
+        # (it comes out before the attempt), so without this a delivery in
+        # flight is invisible to snapshot() and unreachable by cancel() - the
+        # exact window a caller asking "is anything still going for this SKU?"
+        # most needs to see.
+        self._inflight: Optional[NinesDeliveryJob] = None
+        # Job ids cancelled while their attempt was in flight. The attempt
+        # can't be un-sent, so it runs to its end and is discarded here
+        # instead: no re-queue, no callbacks. Emptied as each is consumed.
+        self._cancelled: Set[str] = set()
         # Lets a fresh enqueue interrupt a worker that is sleeping out some
         # other job's backoff, so new work is never stuck behind a timer.
         self._wake = asyncio.Event()
@@ -1048,14 +1064,128 @@ class NinesDeliveryQueue:
             "queued": len(self._jobs),
         }
 
-    def snapshot(self) -> Dict[str, Any]:
-        """Pending and recently abandoned jobs, for a status command."""
+    def snapshot(
+        self, sku: Optional[str] = None, org: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Pending and recently abandoned jobs, for a status command. The delivery
+        being attempted right now is included in ``pending`` and marked
+        ``in_flight`` - it is out of the deque but very much still work.
+
+        ``sku`` (and, with it, ``org``) narrows both lists to one product, which
+        is what turns this into an "is anything still outstanding for this SKU?"
+        question a caller can ask before adding more work for it. ``org`` alone
+        narrows nothing: an unfiltered snapshot is the whole queue.
+        """
         now = time.monotonic()
+        pending: List[Dict[str, Any]] = [
+            job.summary(now) for job in self._jobs if self._matches(job, sku, org)
+        ]
+        if self._inflight is not None and self._matches(self._inflight, sku, org):
+            pending.append({**self._inflight.summary(now), "in_flight": True})
+        abandoned = [
+            record for record in self._abandoned
+            if sku is None or (
+                record.get("sku") == sku
+                and (org is None or record.get("org") == org)
+            )
+        ]
         return {
-            "pending": [job.summary(now) for job in self._jobs],
-            "pending_count": len(self._jobs),
-            "abandoned": list(self._abandoned),
+            "pending": pending,
+            "pending_count": len(pending),
+            "abandoned": abandoned,
         }
+
+    def cancel(
+        self,
+        *,
+        sku: Optional[str] = None,
+        org: Optional[str] = None,
+        job_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Give up on queued deliveries on purpose - the operator has decided this
+        product's shot is being replaced, not retried. Returns
+        ``{"cancelled": [job_id], "in_flight": [job_id], "files": [path]}``.
+
+        At least one of ``sku`` / ``org`` / ``job_id`` is required: an empty
+        command must not be able to empty the queue. ``org`` narrows a ``sku``
+        (a bare ``org`` cancels that org's jobs); ``job_id`` names one job.
+
+        ``in_flight`` lists jobs whose attempt was already on the wire. That
+        request cannot be un-sent, so it runs to its end and is then discarded -
+        no re-queue, no callbacks - but it may well have reached Nines, and the
+        caller is told rather than shown a clean cancellation.
+
+        ``files`` are the local copies the queue was holding for these
+        deliveries. They are reported, not deleted: the component's ``delete``
+        command owns the ``output_dir`` boundary check, and a second route to
+        removing files is how that boundary stops being one.
+
+        ``on_abandon`` is deliberately not invoked - it means "we gave up, send
+        it by hand", which is the opposite of what was just asked for.
+        """
+        if sku is None and org is None and job_id is None:
+            raise ValueError(
+                "cancel needs at least one of sku / org / job_id - refusing to "
+                "cancel every pending delivery"
+            )
+
+        def selected(job: NinesDeliveryJob) -> bool:
+            if job_id is not None and job.job_id != job_id:
+                return False
+            return self._matches(job, sku, org)
+
+        cancelled = [job for job in self._jobs if selected(job)]
+        for job in cancelled:
+            self._jobs.remove(job)
+        files = [path for job in cancelled for path, _, _ in job.images]
+
+        in_flight: List[str] = []
+        if self._inflight is not None and selected(self._inflight):
+            self._cancelled.add(self._inflight.job_id)
+            in_flight.append(self._inflight.job_id)
+            files.extend(path for path, _, _ in self._inflight.images)
+
+        if cancelled or in_flight:
+            # Includes the in-flight case, which is not in the deque: the
+            # journal still carries it from before its attempt started, and
+            # without this a restart would resume a delivery already withdrawn.
+            self._persist()
+        if cancelled:
+            self.logger.info(
+                f"cancelled {len(cancelled)} pending Nines deliver(ies) "
+                f"({[job.job_id for job in cancelled]}); their image(s) are "
+                f"still on disk: {files}"
+            )
+        if in_flight:
+            self.logger.warning(
+                f"Nines deliver(ies) {in_flight} were already in flight when "
+                "cancelled; the append may still reach Nines, in which case the "
+                "image has to be removed in the review app"
+            )
+        if not cancelled and not in_flight:
+            self.logger.info(
+                f"nothing to cancel for sku={sku!r} org={org!r} "
+                f"job_id={job_id!r}"
+            )
+        return {
+            "cancelled": [job.job_id for job in cancelled],
+            "in_flight": in_flight,
+            "files": files,
+        }
+
+    @staticmethod
+    def _matches(
+        job: NinesDeliveryJob, sku: Optional[str], org: Optional[str]
+    ) -> bool:
+        """Whether ``job`` is for this product. ``None`` matches anything, so an
+        unfiltered call sees the whole queue."""
+        if sku is not None and job.sku != sku:
+            return False
+        if org is not None and job.org != org:
+            return False
+        return True
 
     def restore(
         self, rebuild: Optional[Callable[[NinesDeliveryJob], Any]] = None
@@ -1176,6 +1306,15 @@ class NinesDeliveryQueue:
 
     # -- internals ----------------------------------------------------------
 
+    def _discard_if_cancelled(self, job: NinesDeliveryJob) -> bool:
+        """Whether ``job`` was cancelled while this attempt was in flight. The
+        id is consumed on the way out, so the set stays the size of what is
+        actually in flight rather than growing with every cancel."""
+        if job.job_id not in self._cancelled:
+            return False
+        self._cancelled.discard(job.job_id)
+        return True
+
     def _delay(self, attempt: int) -> float:
         """Seconds to wait after the ``attempt``-th failure: the first delay
         doubled once per failure, capped, then jittered."""
@@ -1225,7 +1364,13 @@ class NinesDeliveryQueue:
                         pass
                     continue
                 self._jobs.remove(job)
-                await self._attempt(job)
+                # Out of the deque but still outstanding: a status check or a
+                # cancel arriving mid-attempt has to be able to see it.
+                self._inflight = job
+                try:
+                    await self._attempt(job)
+                finally:
+                    self._inflight = None
         except asyncio.CancelledError:
             raise
         finally:
@@ -1278,6 +1423,18 @@ class NinesDeliveryQueue:
             + (" (already present, not re-appended)"
                if result.get("deduplicated") else "")
         )
+        if self._discard_if_cancelled(job):
+            # The append had already been sent when the cancel arrived, and it
+            # worked. Skipping on_success leaves the local file in place: the
+            # operator asked for this delivery to be replaced, and a copy on
+            # disk is the recoverable side of getting that wrong.
+            self.logger.warning(
+                f"Nines delivery {job.job_id} for SKU {job.sku!r} was cancelled "
+                "but had already reached Nines; the image is on the product and "
+                "the local file was kept"
+            )
+            self._persist()
+            return
         await self._invoke(job.on_success, result)
         # After the callback, so a crash in between leaves the job in the
         # journal: the restored attempt finds the images already there and
@@ -1294,6 +1451,16 @@ class NinesDeliveryQueue:
         job.attempt += 1
         job.ambiguous = bool(ambiguous)
         job.error = str(exc)
+        if self._discard_if_cancelled(job):
+            # Cancelled while this attempt was in flight, and it failed anyway -
+            # the tidiest possible outcome. Not re-queued, and not recorded as
+            # abandoned either: nobody gave up on it, the operator withdrew it.
+            self.logger.info(
+                f"Nines delivery {job.job_id} for SKU {job.sku!r} was cancelled; "
+                f"its failed attempt ({exc}) will not be retried"
+            )
+            self._persist()
+            return
         if not retryable or job.attempt >= self.max_attempts:
             reason = (
                 "the failure cannot be retried"

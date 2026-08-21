@@ -687,6 +687,197 @@ def test_closing_keeps_pending_work_and_the_next_enqueue_resumes_it():
 
 
 # ---------------------------------------------------------------------------
+# Asking about, and withdrawing, one product's queued deliveries - what the
+# webapp needs before it starts a second take of a SKU the first take may still
+# be uploading.
+# ---------------------------------------------------------------------------
+
+class _GatedClient(_ScriptedClient):
+    """A scripted client whose deliver() waits to be released, so a test can
+    look at (or cancel) a delivery while it is genuinely in flight - the window
+    where the job is out of the deque and the old code could not see it."""
+
+    def __init__(self, script):
+        super().__init__(script)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def deliver(self, sku, images, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return await super().deliver(sku, images, **kwargs)
+
+
+def test_the_snapshot_can_be_narrowed_to_one_product():
+    """The filter is the whole point: a product's image count in Nines cannot
+    answer "is anything still outstanding for this SKU?", because a delivery
+    that has not landed yet is not in that count."""
+    queue = _queue(_ScriptedClient({}))
+    queue.enqueue("A", IMAGES, org="acme")
+    queue.enqueue("B", IMAGES, org="acme")
+    queue.enqueue("A", IMAGES, org="rival")
+
+    assert queue.snapshot()["pending_count"] == 3
+    assert [j["sku"] for j in queue.snapshot(sku="A")["pending"]] == ["A", "A"]
+    narrowed = queue.snapshot(sku="A", org="acme")["pending"]
+    assert [(j["sku"], j["org"]) for j in narrowed] == [("A", "acme")]
+    assert queue.snapshot(sku="C")["pending_count"] == 0
+
+
+def test_the_snapshot_filter_covers_abandoned_deliveries_too():
+    """A give-up for another SKU is not this SKU's problem, and a caller
+    checking one product should not have to filter the answer itself."""
+    dead = lambda: NinesAPIError("bad key", status=401)  # noqa: E731
+    client = _ScriptedClient({"A": [dead()], "B": [dead()]})
+    queue = _queue(client)
+
+    async def scenario():
+        queue.enqueue("A", IMAGES)
+        queue.enqueue("B", IMAGES)
+        await _drain(queue)
+
+    asyncio.run(scenario())
+    assert len(queue.snapshot()["abandoned"]) == 2
+    assert [e["sku"] for e in queue.snapshot(sku="A")["abandoned"]] == ["A"]
+
+
+def test_a_delivery_in_flight_is_still_reported_as_pending():
+    """It leaves the deque for the length of its attempt. Reporting nothing for
+    that window would tell a caller the SKU is clear at the exact moment it is
+    least clear."""
+    client = _GatedClient({"S": [{"ok": True}]})
+    queue = _queue(client)
+
+    async def scenario():
+        queue.enqueue("S", IMAGES)
+        await client.started.wait()
+        report = queue.snapshot(sku="S")
+        client.release.set()
+        await _drain(queue)
+        return report
+
+    report = asyncio.run(scenario())
+    assert report["pending_count"] == 1
+    assert report["pending"][0]["in_flight"] is True
+    assert report["pending"][0]["job_id"] == "nines-1"
+
+
+def test_cancel_takes_one_product_and_leaves_the_others_waiting():
+    queue = _queue(_ScriptedClient({}))
+    queue.enqueue("A", IMAGES)
+    queue.enqueue("B", [("/photos/b.jpg", "b.jpg", ["s"])])
+
+    assert queue.cancel(sku="A") == {
+        "cancelled": ["nines-1"],
+        "in_flight": [],
+        # Reported, not deleted: `delete` is where the output_dir boundary is.
+        "files": ["/photos/a.jpg"],
+    }
+    assert [job.sku for job in queue._jobs] == ["B"]
+
+
+def test_cancel_can_name_one_job():
+    queue = _queue(_ScriptedClient({}))
+    queue.enqueue("A", IMAGES)
+    queue.enqueue("A", IMAGES)
+
+    assert queue.cancel(job_id="nines-2")["cancelled"] == ["nines-2"]
+    assert [job.job_id for job in queue._jobs] == ["nines-1"]
+
+
+def test_cancel_without_a_selector_refuses():
+    """An empty command must not be able to empty the queue."""
+    queue = _queue(_ScriptedClient({}))
+    queue.enqueue("A", IMAGES)
+    with pytest.raises(ValueError):
+        queue.cancel()
+    assert len(queue._jobs) == 1
+
+
+def test_cancelling_does_not_tell_the_operator_to_send_it_by_hand():
+    """on_abandon means "we gave up, re-send it yourself" - the opposite of a
+    withdrawal the operator asked for."""
+    abandoned = []
+    queue = _queue(_ScriptedClient({}))
+    queue.enqueue("A", IMAGES, on_abandon=lambda job, exc: abandoned.append(job))
+
+    queue.cancel(sku="A")
+    assert abandoned == []
+
+
+def test_a_delivery_cancelled_in_flight_is_not_retried():
+    """The attempt on the wire cannot be recalled, so it runs out - but it is
+    then discarded rather than re-queued, and it is not a give-up either."""
+    client = _GatedClient({"S": [NinesAPIError("down", status=503), {"ok": True}]})
+    queue = _queue(client)
+
+    async def scenario():
+        queue.enqueue("S", IMAGES)
+        await client.started.wait()
+        result = queue.cancel(sku="S")
+        client.release.set()
+        await _drain(queue)
+        return result
+
+    result = asyncio.run(scenario())
+    assert result["cancelled"] == []
+    assert result["in_flight"] == ["nines-1"], "the caller must be told it was sent"
+    assert len(client.calls) == 1, "the failure was re-attempted anyway"
+    assert queue.snapshot() == {"pending": [], "pending_count": 0, "abandoned": []}
+
+
+def test_a_cancelled_delivery_that_already_landed_keeps_its_local_file():
+    """Its on_success is the file cleanup. The append reached Nines, so the
+    image is on the product either way - and keeping the local copy is the
+    recoverable side of having got this wrong."""
+    client = _GatedClient({"S": [{"reference_item_id": "ritem_1"}]})
+    queue = _queue(client)
+    delivered = []
+
+    async def scenario():
+        queue.enqueue("S", IMAGES, on_success=delivered.append)
+        await client.started.wait()
+        queue.cancel(job_id="nines-1")
+        client.release.set()
+        await _drain(queue)
+
+    asyncio.run(scenario())
+    assert delivered == []
+
+
+def test_cancelling_the_last_delivery_clears_the_journal(tmp_path):
+    journal = str(tmp_path / "queue.json")
+    queue = _queue(_ScriptedClient({}), journal_path=journal)
+    queue.enqueue("A", IMAGES)
+    assert os.path.exists(journal)
+
+    queue.cancel(sku="A")
+    assert not os.path.exists(journal)
+
+
+def test_a_cancel_in_flight_leaves_nothing_for_a_restart_to_resume(tmp_path):
+    """The journal still carries a job while its attempt runs - that is what
+    makes a crash mid-attempt recoverable. A cancel has to clear it anyway, or
+    the next start resumes a delivery that was withdrawn."""
+    journal = str(tmp_path / "queue.json")
+    client = _GatedClient({"S": [NinesAPIError("down", status=503), {"ok": True}]})
+    queue = _queue(client, journal_path=journal)
+
+    async def scenario():
+        queue.enqueue("S", IMAGES)
+        await client.started.wait()
+        assert os.path.exists(journal)
+        queue.cancel(sku="S")
+        assert not os.path.exists(journal)
+        client.release.set()
+        await _drain(queue)
+
+    asyncio.run(scenario())
+    assert not os.path.exists(journal)
+    assert _queue(client, journal_path=journal).restore() == 0
+
+
+# ---------------------------------------------------------------------------
 # The image-count baseline: what makes a lost append answerable by arithmetic
 # rather than by matching tags.
 # ---------------------------------------------------------------------------

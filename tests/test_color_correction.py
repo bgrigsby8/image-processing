@@ -345,7 +345,7 @@ import asyncio
 from PIL import Image
 
 from models.color_correction import ColorCorrection
-from models.nines import NinesClient
+from models.nines import NinesClient, NinesDeliveryQueue
 
 
 class _FakeSource:
@@ -406,6 +406,12 @@ def _component(source, output_dir=None):
         logger=cc.logger,
         request_timeout_s=cc._upload_dial_timeout_s,
         upload_timeout_s=cc._upload_file_timeout_s,
+    )
+    cc._nines_queue = NinesDeliveryQueue(
+        cc._nines, logger=cc.logger,
+        journal_path=(os.path.join(output_dir, ".nines_retry_queue.json")
+                      if output_dir else None),
+        first_delay_s=0.01, max_delay_s=0.05, jitter=0.0,
     )
     cc._pending_captures = {}
     cc._capture_seq = 0
@@ -892,9 +898,14 @@ def test_delete_requires_paths(tmp_path):
 
 import base64
 import os
+import time
 import urllib.parse
 
-from models.nines import NinesAPIError
+from models.nines import (
+    NINES_RETRY_FIRST_DELAY_SEC,
+    NINES_RETRY_MAX_DELAY_SEC,
+    NinesAPIError,
+)
 
 
 class _FakeNinesAPI:
@@ -908,11 +919,14 @@ class _FakeNinesAPI:
     """
 
     def __init__(self, item_id="ritem_1", append_error=None, dead_item_ids=(),
-                 existing=()):
+                 existing=(), images=()):
         self.item_id = item_id
         self.append_error = append_error
         self.dead_item_ids = dead_item_ids
         self.existing = list(existing)
+        # Images the show endpoint reports as already on the product - what
+        # `already_appended` reads when a retry has to rule out a duplicate.
+        self.images = list(images)
         self.calls = []
 
     def __call__(self, method, path, body, timeout_s):
@@ -932,6 +946,9 @@ class _FakeNinesAPI:
                         matches.append(item)
             return {"reference_items": matches, "total": len(matches),
                     "offset": 0, "limit": 200}
+        if method == "GET" and base.startswith("/api/v1/reference_items/"):
+            return {"id": base.rsplit("/", 1)[-1], "external_id": "NWC-1042",
+                    "images": list(self.images)}
         if base == "/api/v1/reference_items":  # POST upsert / create
             return {"id": self.item_id, "external_id": body["external_id"],
                     "created": True, "updated": False, "images_count": 0}
@@ -947,6 +964,11 @@ class _FakeNinesAPI:
             return {"id": rid, "added_count": len(body["images"]),
                     "images_count": len(body["images"]) + 2}
         raise AssertionError(f"unexpected Nines path {path}")
+
+
+def _nines_image(*tags):
+    """A remote image record as the show endpoint reports one."""
+    return {"id": "rimg", "position": 0, "tags": list(tags)}
 
 
 def _nines_component(tmp_path, monkeypatch, **fake_kwargs):
@@ -1050,11 +1072,21 @@ def test_upload_appends_to_preloaded_product_without_creating(tmp_path, monkeypa
     out = asyncio.run(cc._upload({"paths": paths, "name": "front",
                                   "sku": "NWC-1042"}))
 
-    methods = [m for m, _, _, _ in fake.calls]
-    assert methods == ["GET", "POST"]  # lookup, then append - no create
-    _, append_path, _, _ = fake.calls[1]
-    assert append_path == "/api/v1/reference_items/ritem_preloaded/images"
+    # Lookup, then one show request to learn how many images the product
+    # already has (the baseline a lost append is settled against), then the
+    # append. Notably no POST to /reference_items: that is the create.
+    assert [(m, p.split("?")[0]) for m, p, _, _ in fake.calls] == [
+        ("GET", "/api/v1/reference_items"),
+        ("GET", "/api/v1/reference_items/ritem_preloaded"),
+        ("POST", "/api/v1/reference_items/ritem_preloaded/images"),
+    ]
     assert out["nines"]["reference_item_id"] == "ritem_preloaded"
+    # A second shot for the same SKU pays for neither: the id is cached and
+    # the append response keeps the count current.
+    fake.calls.clear()
+    asyncio.run(cc._upload({"paths": _shot_set(tmp_path, stem="IMG_0043"),
+                            "name": "back", "sku": "NWC-1042"}))
+    assert [m for m, _, _, _ in fake.calls] == ["POST"]
 
 
 def test_upload_upc_looks_up_first_and_lands_in_product_details(tmp_path, monkeypatch):
@@ -1207,6 +1239,427 @@ def test_stale_cached_item_id_reresolves_once(tmp_path, monkeypatch):
     ]
     assert out["nines"]["reference_item_id"] == "ritem_new"
     assert cc._nines.item_ids[("viam-org", "NWC-1042")] == "ritem_new"
+
+
+# ---------------------------------------------------------------------------
+# Retrying a failed delivery: a transient Nines problem is queued and
+# re-attempted, a permanent one is reported and dropped.
+# ---------------------------------------------------------------------------
+
+async def _drain_nines_queue(cc, timeout=5.0):
+    """Wait for the retry queue to empty. Must run inside the same event loop
+    as the upload that filled it - the worker is a task on that loop."""
+    queue = cc._nines_queue
+    deadline = time.monotonic() + timeout
+    while queue._jobs or (queue._worker and not queue._worker.done()):
+        if time.monotonic() > deadline:
+            raise AssertionError("Nines retry queue did not drain")
+        await asyncio.sleep(0.005)
+
+
+def test_upload_queues_a_retryable_nines_failure(tmp_path, monkeypatch):
+    """A 503 is the kind of failure that clears on its own: the submit reports
+    it *and* that a retry is coming, and the delivery image stays on disk even
+    though delete_after_upload removed the rest of the set."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+
+    # The production pacing, so this pins the "retry within 3 seconds" the
+    # queue promises rather than the millisecond delay the helper uses to keep
+    # the other tests quick.
+    cc._nines_queue.first_delay_s = NINES_RETRY_FIRST_DELAY_SEC
+    cc._nines_queue.max_delay_s = NINES_RETRY_MAX_DELAY_SEC
+
+    async def scenario():
+        out = await cc.do_command({"upload": {
+            "paths": paths, "sku": "NWC-1042", "delete_after_upload": True,
+        }})
+        await cc._nines_queue.close()
+        return out
+
+    out = asyncio.run(scenario())
+    nines = out["upload"]["nines"]
+    assert "503" in nines["error"]
+    assert nines["retry"]["job_id"] == "nines-1"
+    assert nines["retry"]["attempt"] == 1
+    assert nines["retry"]["queued"] == 1
+    assert nines["retry"]["next_attempt_in_s"] == 3.0
+    # The delivery image is held for the retry; the rest of the set is gone.
+    jpeg = next(p for p in paths if p.endswith(".jpg"))
+    assert os.path.exists(jpeg)
+    assert not any(os.path.exists(p) for p in paths if p != jpeg)
+    assert cc._nines_queue.snapshot()["pending_count"] == 1
+
+
+def test_upload_does_not_queue_a_terminal_nines_failure(tmp_path, monkeypatch):
+    """A 403 (wrong org / missing scope) fails identically forever - retrying
+    it would only delay the moment the operator finds out."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 403: wrong org",
+                                   status=403),
+    )
+    out = asyncio.run(cc.do_command({"upload": {
+        "paths": paths, "sku": "NWC-1042", "delete_after_upload": True,
+    }}))
+    nines = out["upload"]["nines"]
+    assert "403" in nines["error"]
+    assert "retry" not in nines
+    assert cc._nines_queue.snapshot()["pending_count"] == 0
+    # Still held on disk for a manual `nines_upload`.
+    assert os.path.exists(next(p for p in paths if p.endswith(".jpg")))
+
+
+def test_queued_retry_delivers_and_then_removes_the_held_file(tmp_path, monkeypatch):
+    """The delete that `delete_after_upload` deferred happens when the retry
+    finally lands - the held image is not leaked on disk forever."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+    jpeg = next(p for p in paths if p.endswith(".jpg"))
+
+    async def scenario():
+        out = await cc.do_command({"upload": {
+            "paths": paths, "sku": "NWC-1042", "delete_after_upload": True,
+        }})
+        assert os.path.exists(jpeg)
+        fake.append_error = None          # the outage clears
+        await _drain_nines_queue(cc)
+        return out
+
+    out = asyncio.run(scenario())
+    assert out["upload"]["nines"]["retry"]["job_id"] == "nines-1"
+    assert not os.path.exists(jpeg)
+    assert cc._nines_queue.snapshot() == {
+        "pending": [], "pending_count": 0, "abandoned": [],
+    }
+    # A 503 is ambiguous, so the retry checked the product's existing images
+    # before re-appending rather than risking a duplicate.
+    assert any(method == "GET" and path.startswith("/api/v1/reference_items/ritem_1?")
+               for method, path, _, _ in fake.calls)
+
+
+def test_queued_retry_skips_an_append_that_already_landed(tmp_path, monkeypatch):
+    """The ambiguous case that matters: the append was committed and only the
+    answer was lost. The retry must not deliver the shot a second time."""
+    paths = _shot_set(tmp_path)
+    stem = os.path.splitext(os.path.basename(
+        next(p for p in paths if p.endswith(".jpg"))))[0]
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST timed out after 180s"),
+        # The product already carries the shot: the lost attempt did land.
+        images=[{"id": "rimg_1", "position": 0, "tags": [stem]}],
+    )
+
+    async def scenario():
+        await cc.do_command({"upload": {
+            "paths": paths, "sku": "NWC-1042", "delete_after_upload": True,
+        }})
+        await _drain_nines_queue(cc)
+
+    asyncio.run(scenario())
+    appends = [c for c in fake.calls if c[1].endswith("/images")]
+    assert len(appends) == 1, "the retry re-appended an image that was already there"
+    # Delivered as far as the machine is concerned, so the file is cleaned up.
+    assert not os.path.exists(next(p for p in paths if p.endswith(".jpg")))
+
+
+def test_reconfigure_keeps_pending_retries_and_repoints_them(tmp_path, monkeypatch):
+    """A config change is often the fix for what the queued jobs are failing
+    on, so they survive it and are re-pointed at the rebuilt client."""
+    from viam.components.camera import Camera
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+
+    async def scenario():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        await cc._nines_queue.close()
+
+    asyncio.run(scenario())
+    queue = cc._nines_queue
+    assert len(queue._jobs) == 1
+
+    config = ComponentConfig(attributes=dict_to_struct({
+        "camera": "src", "nines_api_key": "nines_live_fixed",
+        "nines_organization_slug": "viam-org",
+    }))
+    cc.reconfigure(config, {Camera.get_resource_name("src"): cc.camera})
+
+    assert cc._nines_queue is queue, "the pending retry was thrown away"
+    assert len(cc._nines_queue._jobs) == 1
+    assert cc._nines_queue.client is cc._nines, "retries kept the stale client"
+    assert cc._nines.api_key == "nines_live_fixed"
+
+
+def test_concurrent_deliveries_resolve_one_product(tmp_path, monkeypatch):
+    """Two deliveries for the same SKU that both miss the cache must not both
+    create the product - the loser's re-POST would overwrite product_details."""
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+    a = tmp_path / "a.jpg"; a.write_bytes(b"a")
+    b = tmp_path / "b.jpg"; b.write_bytes(b"b")
+
+    async def scenario():
+        return await asyncio.gather(
+            cc._nines.deliver("NWC-1042", [(str(a), "a.jpg", ["a"])]),
+            cc._nines.deliver("NWC-1042", [(str(b), "b.jpg", ["b"])]),
+        )
+
+    results = asyncio.run(scenario())
+    creates = [c for c in fake.calls
+               if c[0] == "POST" and c[1] == "/api/v1/reference_items"]
+    assert len(creates) == 1, "the product was created twice"
+    assert {r["reference_item_id"] for r in results} == {"ritem_1"}
+    # Both images still reached the product; only the lookup was shared.
+    appends = [c for c in fake.calls if c[1].endswith("/images")]
+    assert len(appends) == 2
+
+
+def test_nines_status_reports_pending_and_abandoned(tmp_path, monkeypatch):
+    """A queued retry is otherwise invisible after the response that announced
+    it; `nines_status` is how the webapp sees one still in flight."""
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+
+    async def scenario():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        pending = await cc.do_command({"nines_status": {}})
+        await cc._nines_queue.close()
+        return pending
+
+    out = asyncio.run(scenario())["nines_status"]
+    assert out["pending_count"] == 1
+    job = out["pending"][0]
+    assert job["job_id"] == "nines-1"
+    assert job["sku"] == "NWC-1042"
+    assert job["org"] == "viam-org"
+    assert job["files"] == [next(p for p in paths if p.endswith(".jpg"))]
+    assert "503" in job["error"]
+    assert out["abandoned"] == []
+
+
+def test_nines_status_reports_a_delivery_given_up_on(tmp_path, monkeypatch):
+    paths = _shot_set(tmp_path)
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+    cc._nines_queue.max_attempts = 2       # one inline try, one retry
+
+    async def scenario():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        await _drain_nines_queue(cc)
+        return await cc.do_command({"nines_status": {}})
+
+    out = asyncio.run(scenario())["nines_status"]
+    assert out["pending_count"] == 0
+    gone = out["abandoned"][0]
+    assert gone["sku"] == "NWC-1042"
+    assert gone["attempts"] == 2
+    assert "503" in gone["error"]
+    # Named so an operator can re-send them by hand, and still on disk.
+    assert gone["files"] == [next(p for p in paths if p.endswith(".jpg"))]
+    assert os.path.exists(gone["files"][0])
+
+
+def test_validate_config_checks_the_retry_attributes():
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    def validate(**attrs):
+        return ColorCorrection.validate_config(
+            ComponentConfig(attributes=dict_to_struct({"camera": "src", **attrs}))
+        )
+
+    assert validate(nines_retry_first_delay_s=1.5, nines_retry_max_delay_s=60,
+                    nines_retry_max_attempts=3) == (["src"], [])
+    # Defaults are valid by omission.
+    assert validate() == (["src"], [])
+    with pytest.raises(ValueError, match="positive number of seconds"):
+        validate(nines_retry_first_delay_s=0)
+    with pytest.raises(ValueError, match="positive number of seconds"):
+        validate(nines_retry_max_delay_s=-1)
+    with pytest.raises(ValueError, match="positive number of seconds"):
+        validate(nines_retry_first_delay_s="soon")
+    with pytest.raises(ValueError, match="whole number of attempts"):
+        validate(nines_retry_max_attempts=0)
+    with pytest.raises(ValueError, match="whole number of attempts"):
+        validate(nines_retry_max_attempts=2.5)
+
+
+def test_reconfigure_applies_the_retry_attributes(tmp_path, monkeypatch):
+    from viam.components.camera import Camera
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    cc, fake = _nines_component(tmp_path, monkeypatch)
+    config = ComponentConfig(attributes=dict_to_struct({
+        "camera": "src",
+        "nines_retry_first_delay_s": 1.5,
+        "nines_retry_max_delay_s": 30,
+        "nines_retry_max_attempts": 3,
+    }))
+    cc.reconfigure(config, {Camera.get_resource_name("src"): cc.camera})
+    assert cc._nines_queue.first_delay_s == 1.5
+    assert cc._nines_queue.max_delay_s == 30.0
+    assert cc._nines_queue.max_attempts == 3
+    # Unset attributes fall back to the documented defaults.
+    cc.reconfigure(
+        ComponentConfig(attributes=dict_to_struct({"camera": "src"})),
+        {Camera.get_resource_name("src"): cc.camera},
+    )
+    assert cc._nines_queue.first_delay_s == NINES_RETRY_FIRST_DELAY_SEC
+    assert cc._nines_queue.max_delay_s == NINES_RETRY_MAX_DELAY_SEC
+
+
+def test_a_pending_retry_survives_a_restart(tmp_path, monkeypatch):
+    """The whole point of the journal: a module restart mid-shoot must not
+    silently drop a delivery whose image is sitting on disk waiting for it."""
+    from viam.components.camera import Camera
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    paths = _shot_set(tmp_path)
+    jpeg = next(p for p in paths if p.endswith(".jpg"))
+    journal = str(tmp_path / ".nines_retry_queue.json")
+
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        append_error=NinesAPIError("Nines API POST failed with 503: down",
+                                   status=503),
+    )
+    # Still waiting when we pull the plug (max_delay_s caps first_delay_s,
+    # so both have to move).
+    cc._nines_queue.first_delay_s = 60.0
+    cc._nines_queue.max_delay_s = 60.0
+
+    async def before_the_restart():
+        await cc.do_command({"upload": {
+            "paths": paths, "sku": "NWC-1042", "delete_after_upload": True,
+        }})
+        await cc._nines_queue.close()
+
+    asyncio.run(before_the_restart())
+    assert os.path.exists(journal), "the pending retry was not journalled"
+    assert os.path.exists(jpeg), "its image was not held for it"
+
+    # A fresh process: a component with no queue yet, configured over the same
+    # output_dir, which is where reconfigure looks for the journal.
+    revived = _uploader_component(tmp_path, monkeypatch)
+    del revived._nines_queue
+    revived.reconfigure(
+        ComponentConfig(attributes=dict_to_struct({
+            "camera": "src", "output_dir": str(tmp_path),
+            "nines_api_key": "nines_live_test",
+            "nines_organization_slug": "viam-org",
+            # Test pacing, applied through the real config attributes.
+            "nines_retry_first_delay_s": 0.01,
+            "nines_retry_max_delay_s": 0.05,
+        })),
+        {Camera.get_resource_name("src"): revived.camera},
+    )
+    assert revived._nines_queue.snapshot()["pending_count"] == 1
+    # reconfigure rebuilt the client, so re-fake the transport (this time the
+    # outage has cleared).
+    monkeypatch.setattr(revived._nines, "request", _FakeNinesAPI())
+
+    async def after_the_restart():
+        # reconfigure is synchronous and had no event loop to start the worker
+        # on, so the first command the webapp sends is what picks the restored
+        # queue up. Any command does; this one also shows what is pending.
+        status = await revived.do_command({"nines_status": {}})
+        assert status["nines_status"]["pending"][0]["sku"] == "NWC-1042"
+        await _drain_nines_queue(revived)
+
+    asyncio.run(after_the_restart())
+
+    assert not os.path.exists(jpeg), \
+        "delete_after_upload was not honoured across the restart"
+    assert not os.path.exists(journal)
+    assert revived._nines_queue.snapshot()["pending_count"] == 0
+
+
+def test_a_restored_retry_does_not_deliver_a_shot_twice(tmp_path, monkeypatch):
+    """The nastiest case: the append reached Nines, the answer was lost, and
+    the module restarted before it could record either. The restored attempt
+    must recognise its own image rather than appending a second copy."""
+    from viam.components.camera import Camera
+    from viam.proto.app.robot import ComponentConfig
+    from viam.utils import dict_to_struct
+
+    paths = _shot_set(tmp_path)
+    jpeg = next(p for p in paths if p.endswith(".jpg"))
+    stem = os.path.splitext(os.path.basename(jpeg))[0]
+
+    cc, fake = _nines_component(
+        tmp_path, monkeypatch,
+        existing=[{"id": "ritem_preloaded", "external_id": "NWC-1042"}],
+        images=[_nines_image("a"), _nines_image("b")],   # two before the shot
+        append_error=NinesAPIError("Nines API POST timed out after 180s"),
+    )
+    cc._nines_queue.first_delay_s = 60.0
+    cc._nines_queue.max_delay_s = 60.0
+
+    async def before_the_restart():
+        await cc.do_command({"upload": {"paths": paths, "sku": "NWC-1042"}})
+        await cc._nines_queue.close()
+
+    asyncio.run(before_the_restart())
+    assert os.path.exists(jpeg)
+
+    # The append had in fact landed: the product now carries the shot.
+    delivered_state = [_nines_image("a"), _nines_image("b"),
+                       _nines_image(stem)]
+
+    revived = _uploader_component(tmp_path, monkeypatch)
+    del revived._nines_queue
+    revived.reconfigure(
+        ComponentConfig(attributes=dict_to_struct({
+            "camera": "src", "output_dir": str(tmp_path),
+            "nines_api_key": "nines_live_test",
+            "nines_organization_slug": "viam-org",
+            "nines_retry_first_delay_s": 0.01,
+            "nines_retry_max_delay_s": 0.05,
+        })),
+        {Camera.get_resource_name("src"): revived.camera},
+    )
+    revived_fake = _FakeNinesAPI(
+        existing=[{"id": "ritem_preloaded", "external_id": "NWC-1042"}],
+        images=delivered_state,
+    )
+    monkeypatch.setattr(revived._nines, "request", revived_fake)
+
+    async def after_the_restart():
+        await revived.do_command({"nines_status": {}})
+        await _drain_nines_queue(revived)
+
+    asyncio.run(after_the_restart())
+
+    # The whole point: no second append.
+    assert not any(path.endswith("/images")
+                   for _, path, _, _ in revived_fake.calls), \
+        "the restored retry delivered the shot a second time"
+    assert revived._nines_queue.snapshot()["pending_count"] == 0
 
 
 def test_nines_upload_command_validates(tmp_path, monkeypatch):

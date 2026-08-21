@@ -62,7 +62,10 @@ Two ways to get corrected images out of this component:
    ``delete_after_upload`` (false), and ``nines_api_key`` /
    ``nines_organization_slug`` / ``nines_base_url`` (Nines partner-API
    delivery: enables the ``sku`` option on ``upload`` and the ``nines_upload``
-   command below).
+   command below). ``nines_retry_first_delay_s`` (3), ``nines_retry_max_delay_s``
+   (300) and ``nines_retry_max_attempts`` (6) pace the background re-delivery
+   of a Nines upload that failed on something transient; ``nines_status``
+   reports what is still waiting.
 
    ``capture``, ``develop``, and ``preview`` also take a per-call ``ccm``
    option — a 3x3 nested list applied instead of the configured matrix for
@@ -138,6 +141,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -200,7 +204,12 @@ from models.image_io import (
 from models.nines import (
     NINES_CONTENT_TYPES,
     NINES_DEFAULT_BASE_URL,
+    NINES_RETRY_FIRST_DELAY_SEC,
+    NINES_RETRY_MAX_ATTEMPTS,
+    NINES_RETRY_MAX_DELAY_SEC,
+    NinesAPIError,
     NinesClient,
+    NinesDeliveryQueue,
 )
 
 # Default delivery set when `output_formats` isn't configured. Override in
@@ -291,10 +300,29 @@ class ColorCorrection(Camera, EasyResource):
         if demosaic is not None and demosaic not in DEMOSAIC_ALGORITHMS:
             raise ValueError(f"`demosaic` must be one of {list(DEMOSAIC_ALGORITHMS)}")
 
-        for key in ("nines_api_key", "nines_organization_slug", "nines_base_url"):
+        for key in ("nines_api_key", "nines_organization_slug",
+                    "nines_base_url", "nines_retry_journal"):
             value = attrs.get(key)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"`{key}` must be a string")
+
+        for key in ("nines_retry_first_delay_s", "nines_retry_max_delay_s"):
+            value = attrs.get(key)
+            if value is not None and (
+                not isinstance(value, (int, float)) or value <= 0
+            ):
+                raise ValueError(f"`{key}` must be a positive number of seconds")
+
+        max_attempts = attrs.get("nines_retry_max_attempts")
+        if max_attempts is not None and (
+            not isinstance(max_attempts, (int, float))
+            or max_attempts < 1
+            or max_attempts != int(max_attempts)
+        ):
+            raise ValueError(
+                "`nines_retry_max_attempts` must be a whole number of attempts "
+                ">= 1 (1 means the inline attempt only - no retries)"
+            )
 
         return [str(camera)], []
 
@@ -395,6 +423,60 @@ class ColorCorrection(Camera, EasyResource):
             upload_timeout_s=self._upload_file_timeout_s,
         )
 
+        # Deliveries waiting to be re-attempted (see NinesDeliveryQueue).
+        # Preserved across reconfigure like `_pending_captures` below, and
+        # re-pointed at the freshly built client rather than rebuilt with it:
+        # the config change that prompted the reconfigure may be the fix for
+        # whatever the queued jobs are failing on - a corrected `nines_api_key`
+        # or `nines_base_url` reaches them on their next attempt instead of
+        # being thrown away or retried against the old credentials. The org is
+        # deliberately *not* re-pointed: it is resolved per job when the submit
+        # arrives, and re-routing a queued delivery to a different brand would
+        # be worse than failing it.
+        retry_first_delay_s = float(
+            attrs.get("nines_retry_first_delay_s", NINES_RETRY_FIRST_DELAY_SEC)
+        )
+        retry_max_delay_s = float(
+            attrs.get("nines_retry_max_delay_s", NINES_RETRY_MAX_DELAY_SEC)
+        )
+        retry_max_attempts = int(
+            attrs.get("nines_retry_max_attempts", NINES_RETRY_MAX_ATTEMPTS)
+        )
+        # Pending retries are journalled so a module restart or a power cycle
+        # mid-shoot doesn't silently drop deliveries whose images are sitting
+        # on the disk waiting for them. It lives beside the exports by default
+        # (a dotfile, so an image sweep won't touch it) and can be pointed
+        # elsewhere; without an `output_dir` there is no obvious place for it,
+        # so persistence is simply off and the queue is in-memory only.
+        journal_path = attrs.get("nines_retry_journal") or (
+            os.path.join(self._output_dir, ".nines_retry_queue.json")
+            if self._output_dir else None
+        )
+        queue: Optional[NinesDeliveryQueue] = getattr(self, "_nines_queue", None)
+        if queue is None:
+            self._nines_queue = NinesDeliveryQueue(
+                self._nines,
+                logger=self.logger,
+                journal_path=journal_path,
+                first_delay_s=retry_first_delay_s,
+                max_delay_s=retry_max_delay_s,
+                max_attempts=retry_max_attempts,
+            )
+            # Only on first build: on a later reconfigure the jobs are already
+            # in the live queue, and re-reading the journal would duplicate
+            # them.
+            self._nines_queue.restore(self._nines_retry_callbacks_for)
+        else:
+            if queue.journal_path != journal_path:
+                # A moved output_dir must not leave a stale journal behind for
+                # some later restart to restore already-delivered work from.
+                queue.retarget_journal(journal_path)
+            queue.client = self._nines
+            queue.logger = self.logger
+            queue.first_delay_s = retry_first_delay_s
+            queue.max_delay_s = retry_max_delay_s
+            queue.max_attempts = retry_max_attempts
+
         # In-flight deferred captures (`capture` with `defer: true`), keyed by
         # the capture_id handed back to the caller. Preserved across
         # reconfigure so a mid-sequence config change doesn't orphan results.
@@ -476,6 +558,11 @@ class ColorCorrection(Camera, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         resp: Dict[str, ValueTypes] = {}
 
+        # Deliveries restored from the journal are queued during reconfigure,
+        # which is synchronous and may have had no event loop to start the
+        # worker on. This is the first place that reliably does.
+        self._nines_queue.ensure_running()
+
         if "calibrate_color" in command:
             resp["calibrate_color"] = await self._calibrate_color(
                 command.get("calibrate_color") or {}, timeout
@@ -504,6 +591,9 @@ class ColorCorrection(Camera, EasyResource):
             resp["nines_upload"] = await self._nines_upload(
                 command.get("nines_upload") or {}
             )
+
+        if "nines_status" in command:
+            resp["nines_status"] = self._nines_status()
 
         if "delete" in command:
             resp["delete"] = self._delete_local(command.get("delete") or {})
@@ -1498,7 +1588,15 @@ class ColorCorrection(Camera, EasyResource):
                                   A Nines failure never marks the Viam uploads
                                   as failed, and keeps the delivery image on
                                   disk for retry even with
-                                  ``delete_after_upload``.
+                                  ``delete_after_upload``. A failure that could
+                                  clear on its own (unreachable, timed out,
+                                  5xx, rate-limited) is queued for re-delivery
+                                  in the background and reported as
+                                  ``nines.retry``
+                                  (``job_id`` / ``attempt`` /
+                                  ``next_attempt_in_s`` / ``queued``); one that
+                                  cannot (bad key, wrong org, rejected image)
+                                  is reported as ``nines.error`` alone.
           ``upc``                 product UPC, when known: used to look the
                                   pre-loaded Nines product up first (before the
                                   SKU), and carried in ``product_details`` if a
@@ -1627,6 +1725,7 @@ class ColorCorrection(Camera, EasyResource):
             nines, nines_keep = await self._nines_deliver_for_upload(
                 sku, paths, name, capture_stem, org_slug=org_slug,
                 product_name=product_name, upc=upc,
+                delete_after=delete_after,
             )
 
         deleted: List[str] = []
@@ -1636,6 +1735,9 @@ class ColorCorrection(Camera, EasyResource):
             # delivery's image is still held back via nines_keep).
             for path in uploaded + skipped_viam:
                 if path == nines_keep:
+                    # Held back, not leaked: a queued retry deletes it once the
+                    # delivery lands, and an abandoned one leaves it for a
+                    # manual `nines_upload`.
                     self.logger.info(
                         f"keeping {os.path.basename(path)} on disk for a Nines "
                         "retry despite delete_after_upload"
@@ -1810,6 +1912,7 @@ class ColorCorrection(Camera, EasyResource):
         org_slug: Optional[str] = None,
         product_name: Optional[str] = None,
         upc: Optional[str] = None,
+        delete_after: bool = False,
     ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
         """
         The ``upload``-integrated Nines delivery: pick the one delivery image
@@ -1823,6 +1926,15 @@ class ColorCorrection(Camera, EasyResource):
         delete pass must leave on disk for a retry (the delivery image, when
         delivery failed). Never raises: a Nines problem is reported in the
         result, not allowed to fail the Viam half of the submit.
+
+        The attempt itself stays inline, so a submit that works reports the
+        real delivery in the same response it always did. Only a failure that
+        could plausibly clear on its own is handed to the retry queue, and
+        then the result carries a ``retry`` block alongside the ``error`` -
+        this submit still did not land, and the operator should see both that
+        and the fact that it will be tried again. ``delete_after`` is carried
+        into the queue so the held-back image is finally removed by whichever
+        attempt succeeds.
         """
         org = org_slug or self._nines.org_slug
         if not self._nines.ready(org):
@@ -1852,13 +1964,149 @@ class ColorCorrection(Camera, EasyResource):
             )
         except Exception as exc:  # noqa: BLE001 - reported, never fails the upload
             self.logger.error(f"Nines delivery failed for SKU {sku!r}: {exc}")
-            return {"error": str(exc)}, delivery
+            result = {"error": str(exc)}
+            retry = self._nines_enqueue_retry(
+                sku,
+                [(delivery, filename, [os.path.splitext(filename)[0]])],
+                exc,
+                org=org,
+                product_name=product_name,
+                upc=upc,
+                delete_after=delete_after,
+            )
+            if retry is not None:
+                result["retry"] = retry
+            return result, delivery
         self.logger.info(
             f"delivered {filename} to Nines item "
             f"{result.get('reference_item_id')} (SKU {sku!r}, "
             f"{result.get('images_count')} image(s) total)"
         )
         return result, None
+
+    def _nines_retry_callbacks(
+        self, sku: str, paths: Sequence[str], delete_after: bool
+    ) -> Tuple[Callable[..., None], Callable[..., None]]:
+        """
+        The ``(on_success, on_abandon)`` pair for a queued Nines delivery.
+
+        They close the loop that ``nines_keep`` opened: when a later attempt
+        lands, the delivery image the delete pass held back is finally removed
+        (if that upload asked for it); when the queue gives up, it stays on
+        disk and the log says how to send it by hand. Built here rather than
+        inline so a job restored from the journal - which cannot carry a
+        closure - gets exactly the same behaviour as one that never left
+        memory.
+        """
+        def delivered(result: Mapping[str, Any]) -> None:
+            self.logger.info(
+                f"Nines retry delivered SKU {sku!r} to item "
+                f"{result.get('reference_item_id')}"
+            )
+            if not delete_after:
+                return
+            for path in paths:
+                try:
+                    os.remove(path)
+                    self.logger.info(
+                        f"removed {os.path.basename(path)} now that its Nines "
+                        "delivery has landed"
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as os_exc:
+                    self.logger.warning(
+                        f"delivered but could not delete {path}: {os_exc}"
+                    )
+
+        def abandoned(job: Any, error: BaseException) -> None:
+            self.logger.error(
+                f"Nines delivery for SKU {sku!r} abandoned after "
+                f"{getattr(job, 'attempt', '?')} attempts ({error}). The "
+                f"image is still on disk - re-send it with the `nines_upload` "
+                f"command: {list(paths)}"
+            )
+
+        return delivered, abandoned
+
+    def _nines_retry_callbacks_for(
+        self, job: Any
+    ) -> Tuple[Callable[..., None], Callable[..., None]]:
+        """Rebuild a restored job's callbacks from what the journal carried."""
+        return self._nines_retry_callbacks(
+            job.sku,
+            [path for path, _, _ in job.images],
+            bool(job.context.get("delete_after")),
+        )
+
+    def _nines_enqueue_retry(
+        self,
+        sku: str,
+        images: List[Tuple[str, str, List[str]]],
+        exc: BaseException,
+        *,
+        org: Optional[str],
+        product_name: Optional[str],
+        upc: Optional[str],
+        delete_after: bool,
+    ) -> Optional[Dict[str, ValueTypes]]:
+        """
+        Hand a failed delivery to the retry queue, returning the ``retry``
+        block for the response - or ``None`` when the failure is not worth
+        retrying, which is as much a decision as queueing it. A bad key, the
+        wrong org slug or an image the API rejected fails the same way every
+        time; scheduling five more attempts would only delay the moment the
+        operator finds out. Only :class:`NinesAPIError` is classified, so an
+        unexpected exception is treated as terminal rather than looped on.
+
+        The callbacks close the loop that ``nines_keep`` opened: when a later
+        attempt lands, the delivery image the delete pass held back is finally
+        removed (if this upload asked for that); when the queue gives up, it
+        stays on disk and the log says how to send it by hand.
+        """
+        if not isinstance(exc, NinesAPIError) or not exc.retryable:
+            self.logger.info(
+                f"not retrying Nines delivery for SKU {sku!r}: {exc} is not a "
+                "failure a later attempt would survive"
+            )
+            return None
+
+        paths = [path for path, _, _ in images]
+        delivered, abandoned = self._nines_retry_callbacks(
+            sku, paths, delete_after
+        )
+
+        return self._nines_queue.enqueue(
+            sku,
+            images,
+            org=org,
+            product_name=product_name,
+            upc=upc,
+            # One inline attempt has already failed, and whether it left the
+            # outcome unknown decides if the next one checks for a duplicate.
+            attempt=1,
+            ambiguous=exc.ambiguous,
+            error=str(exc),
+            # Carried in the journal so a restart can rebuild the callbacks.
+            context={"delete_after": delete_after},
+            on_success=delivered,
+            on_abandon=abandoned,
+        )
+
+    def _nines_status(self) -> Mapping[str, ValueTypes]:
+        """
+        Nines deliveries still waiting to be re-attempted, plus the ones
+        recently given up on. Takes no options.
+
+        Without this a queued retry is invisible: the ``upload`` response that
+        announced it is the last the caller hears until the delivery lands or
+        does not. ``pending`` entries carry ``job_id``, ``sku``, ``org``,
+        ``attempt``, ``next_attempt_in_s`` and the ``files`` being held on
+        disk; ``abandoned`` entries (the most recent 32) carry the same plus
+        the final ``error``, and name files that are still on disk and can be
+        re-sent with ``nines_upload``.
+        """
+        return self._nines_queue.snapshot()
 
     async def _nines_upload(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """

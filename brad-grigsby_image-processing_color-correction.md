@@ -72,6 +72,12 @@ installs those automatically on Debian/Ubuntu.
 | `nines_api_key`  | string       | Optional  | Nines partner-API key (`nines_live_…`). Falls back to the `NINES_API_KEY` env var. Nines delivery (the `sku` option on `upload`, and `nines_upload`) is enabled only when this and `nines_organization_slug` are both set. |
 | `nines_organization_slug` | string | Optional | Sent as `shots_organization_slug` on every Nines call — the brand you upload for (list valid slugs with the API's `GET /api/v1/organizations`). |
 | `nines_base_url` | string       | Optional  | Nines API base URL. Default `https://review-app.ninesstyle.com`. |
+| `nines_retry_first_delay_s` | number | Optional | How long after a failed Nines delivery the first re-attempt is scheduled. Default `3`. Spread ±20% so a fleet coming back from one outage doesn't re-hit the API in lockstep. |
+| `nines_retry_max_delay_s` | number | Optional | Ceiling on the doubling backoff between re-attempts. Default `300`. |
+| `nines_retry_max_attempts` | int  | Optional  | Total delivery attempts including the inline one, after which the delivery is abandoned and its file left on disk. Default `6` (delays of 3, 6, 12, 24, 48s). `1` disables retrying. |
+| `nines_retry_journal` | string | Optional | Where pending retries are written so they survive a module restart. Default `<output_dir>/.nines_retry_queue.json`; with no `output_dir` there is nowhere obvious to put it and persistence is off (the queue still works, it just forgets on restart). |
+| `upload_dial_timeout_s` | number | Optional  | Deadline for authenticating to app.viam.com on the first `upload`. Default `30`. Also bounds the small Nines lookup/create calls. |
+| `upload_file_timeout_s` | number | Optional  | Per-file deadline for an `upload` transfer (a stalled file fails on its own rather than wedging the submit). Default `180`. Also bounds the Nines image append. |
 
 If no `ccm` is given, the component passes images through unchanged (identity
 matrix); the RAW develop still runs (demosaic + export) but applies no color
@@ -229,6 +235,49 @@ success, `{"error": …}` on failure, or `{"skipped": …}` when Nines isn't
 configured. A Nines failure never marks the Viam uploads failed, and the
 delivery image is kept on disk for retry even with `delete_after_upload`.
 
+A delivery that failed on something transient — the API unreachable, timed
+out, rate-limited, or a 5xx — is retried in the background, and the response
+carries a `retry` block next to the `error`:
+`{"job_id", "attempt", "next_attempt_in_s", "queued"}`. The first re-attempt
+is about three seconds out, and each further failure doubles the gap. If other
+deliveries are already waiting, a failed one goes *behind* them rather than
+ahead — one product Nines refuses can't stall the rest of a shoot — so
+`next_attempt_in_s` is a floor rather than a promise; `queued` above 1 says so.
+When a re-attempt succeeds, the delivery image that was held back is finally
+removed if that upload asked for `delete_after_upload`; when the attempts run
+out, the file stays on disk to be sent by hand with `nines_upload`. Track both
+with `nines_status`.
+
+A failure that *can't* improve — a bad key, the wrong organization, an image
+the API rejected — is reported as `error` alone, with no `retry` block.
+Retrying it would only delay the moment the operator finds out.
+
+Pending retries are written to `nines_retry_journal`, so a module restart or a
+power cycle mid-shoot doesn't drop deliveries whose images are still sitting on
+disk waiting for them. They come back on the next `reconfigure` and resume on
+the first command after it — rescheduled from now, so a machine that was off
+for an hour retries immediately rather than sitting out a backoff it already
+served. A restored delivery always checks the product before appending: there
+is no way to know whether the attempt that was in flight when the process
+stopped reached Nines. The journal carries the product's image count from
+*before* that attempt along with the job, so the check across a restart is the
+same arithmetic as one in memory — without it a restored retry would read the
+count after its own committed append and deliver the shot twice. The journal is removed once nothing is outstanding, and
+a damaged one is reported and ignored rather than blocking configuration.
+
+Deliveries whose answer was lost (a timeout or a 5xx, where the API may have
+committed the append before the connection dropped) are checked against the
+product's existing images before being re-sent, so a retry doesn't leave a
+duplicate. The check is arithmetic — how many images the product had before
+the attempt versus after — which costs one extra `GET
+/api/v1/reference_items/:id` the first time a pre-loaded product is delivered
+to in a session, and nothing after that (the append response keeps the count
+current, and a product created by delivery starts from zero). Where the count
+is unavailable the check falls back to matching image tags, which can only
+prove a batch *absent*, never present; an image whose fate can't be determined
+is re-sent anyway and the log says so — losing a shot is worse than a
+duplicate a human can delete.
+
 ### Deliver to Nines (manual / retry)
 
 Appends image files already on disk to a Nines product — the manual
@@ -253,6 +302,23 @@ use), `paths` (required), `tags` (applied to every appended image),
 `product_name` (display name if the product doesn't exist yet; defaults to
 the sku). Returns `{"reference_item_id", "external_id", "added_count",
 "images_count"}`.
+
+### Nines retry status
+
+Reports the Nines deliveries still waiting to be re-attempted, and the ones
+recently given up on. Takes no options — a queued retry is otherwise invisible
+after the `upload` response that announced it.
+
+```json
+{"nines_status": {}}
+```
+
+Returns `{"pending": [...], "pending_count": N, "abandoned": [...]}`. Each
+pending entry is `{"job_id", "sku", "org", "attempt", "next_attempt_in_s",
+"files", "error"}` — `files` being the local copies held back for the retry.
+Each abandoned entry (the most recent 32) is `{"job_id", "sku", "org",
+"attempts", "error", "files"}`; those files are still on disk and can be
+re-sent with `nines_upload`.
 
 ### Delete local files
 

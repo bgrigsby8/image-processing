@@ -46,8 +46,7 @@ Two ways to get corrected images out of this component:
    This is a non-destructive, Capture One-style pipeline: 16-bit linear math,
    no auto-brightness, the original RAW preserved, adjustments recorded in a
    sidecar. See image_io.py for the decode/export details and color-space
-   notes, calibration.py for the ColorChecker detection / CCM math, and
-   nines.py for the Nines partner-API client.
+   notes, and calibration.py for the ColorChecker detection / CCM math.
 
    Relevant config attributes: ``output_dir`` (default: next to the source),
    ``output_formats`` (default ["tiff16", "jpeg", "png16", "png8"]),
@@ -59,15 +58,7 @@ Two ways to get corrected images out of this component:
    ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
    since RAW is soft before sharpening), ``demosaic`` ("DHT" - RAW demosaic
    algorithm, sharper than libraw's stock AHD), ``write_sidecar`` (true),
-   ``delete_after_upload`` (false), and ``nines_api_key`` /
-   ``nines_organization_slug`` / ``nines_base_url`` (Nines partner-API
-   delivery: enables the ``sku`` option on ``upload`` and the ``nines_upload``
-   command below). ``nines_retry_first_delay_s`` (3), ``nines_retry_max_delay_s``
-   (300) and ``nines_retry_max_attempts`` (6) pace the background re-delivery
-   of a Nines upload that failed on something transient; ``nines_status``
-   reports what is still waiting (all of it, or one ``sku``'s) and
-   ``nines_cancel`` withdraws it, for an operator replacing a take rather than
-   waiting for it to land.
+   and ``delete_after_upload`` (false).
 
    ``capture``, ``develop``, and ``preview`` also take a per-call ``ccm``
    option — a 3x3 nested list applied instead of the configured matrix for
@@ -139,12 +130,10 @@ import base64
 import json
 import os
 import time
-import urllib.parse
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
     Any,
-    Callable,
     ClassVar,
     Dict,
     List,
@@ -204,17 +193,6 @@ from models.image_io import (
     render_raw_for_detection,
     srgb_to_linear,
 )
-from models.nines import (
-    NINES_CONTENT_TYPES,
-    NINES_DEFAULT_BASE_URL,
-    NINES_RETRY_FIRST_DELAY_SEC,
-    NINES_RETRY_MAX_ATTEMPTS,
-    NINES_RETRY_MAX_DELAY_SEC,
-    NinesAPIError,
-    NinesClient,
-    NinesDeliveryQueue,
-)
-
 # Default delivery set when `output_formats` isn't configured. Override in
 # config to trim it (e.g. just ["tiff16", "jpeg"] for a master + proof).
 DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
@@ -303,47 +281,6 @@ class ColorCorrection(Camera, EasyResource):
         if demosaic is not None and demosaic not in DEMOSAIC_ALGORITHMS:
             raise ValueError(f"`demosaic` must be one of {list(DEMOSAIC_ALGORITHMS)}")
 
-        for key in ("nines_api_key", "nines_organization_slug",
-                    "nines_base_url", "nines_retry_journal"):
-            value = attrs.get(key)
-            if value is not None and not isinstance(value, str):
-                raise ValueError(f"`{key}` must be a string")
-
-        base_url = attrs.get("nines_base_url")
-        if base_url:
-            # Catch a scheme-less URL here, where the platform surfaces the
-            # error at configure time, instead of as urllib's opaque "unknown
-            # url type" on the first delivery. And require https: the API key
-            # rides every request as a bearer token, so plain http would send
-            # it in cleartext. http is allowed only against localhost, for
-            # testing against a local stand-in server.
-            parsed = urllib.parse.urlparse(str(base_url))
-            local = parsed.hostname in ("localhost", "127.0.0.1", "::1")
-            if parsed.scheme != "https" and not (parsed.scheme == "http" and local):
-                raise ValueError(
-                    "`nines_base_url` must be an https:// URL (the Nines API "
-                    "key is sent as a bearer token on every request, so plain "
-                    f"http would expose it); got {base_url!r}"
-                )
-
-        for key in ("nines_retry_first_delay_s", "nines_retry_max_delay_s"):
-            value = attrs.get(key)
-            if value is not None and (
-                not isinstance(value, (int, float)) or value <= 0
-            ):
-                raise ValueError(f"`{key}` must be a positive number of seconds")
-
-        max_attempts = attrs.get("nines_retry_max_attempts")
-        if max_attempts is not None and (
-            not isinstance(max_attempts, (int, float))
-            or max_attempts < 1
-            or max_attempts != int(max_attempts)
-        ):
-            raise ValueError(
-                "`nines_retry_max_attempts` must be a whole number of attempts "
-                ">= 1 (1 means the inline attempt only - no retries)"
-            )
-
         return [str(camera)], []
 
     def reconfigure(
@@ -426,77 +363,6 @@ class ColorCorrection(Camera, EasyResource):
             attrs.get("upload_file_timeout_s", 180.0)
         )
 
-        # Optional Nines partner-API delivery (see models/nines.py). With an
-        # API key and organization slug configured, `upload` calls that carry a
-        # `sku` also upsert the Nines product for that SKU and append the
-        # shot's delivery image to it, and the `nines_upload` command sends
-        # arbitrary on-disk images. Left unconfigured, `upload` behaves exactly
-        # as before. Rebuilt on every reconfigure, which also resets the
-        # client's reference-item cache (its ids are scoped to the base URL,
-        # which may just have changed).
-        self._nines = NinesClient(
-            api_key=attrs.get("nines_api_key") or os.environ.get("NINES_API_KEY") or None,
-            org_slug=attrs.get("nines_organization_slug") or None,
-            base_url=str(attrs.get("nines_base_url") or NINES_DEFAULT_BASE_URL),
-            logger=self.logger,
-            request_timeout_s=self._upload_dial_timeout_s,
-            upload_timeout_s=self._upload_file_timeout_s,
-        )
-
-        # Deliveries waiting to be re-attempted (see NinesDeliveryQueue).
-        # Preserved across reconfigure like `_pending_captures` below, and
-        # re-pointed at the freshly built client rather than rebuilt with it:
-        # the config change that prompted the reconfigure may be the fix for
-        # whatever the queued jobs are failing on - a corrected `nines_api_key`
-        # or `nines_base_url` reaches them on their next attempt instead of
-        # being thrown away or retried against the old credentials. The org is
-        # deliberately *not* re-pointed: it is resolved per job when the submit
-        # arrives, and re-routing a queued delivery to a different brand would
-        # be worse than failing it.
-        retry_first_delay_s = float(
-            attrs.get("nines_retry_first_delay_s", NINES_RETRY_FIRST_DELAY_SEC)
-        )
-        retry_max_delay_s = float(
-            attrs.get("nines_retry_max_delay_s", NINES_RETRY_MAX_DELAY_SEC)
-        )
-        retry_max_attempts = int(
-            attrs.get("nines_retry_max_attempts", NINES_RETRY_MAX_ATTEMPTS)
-        )
-        # Pending retries are journalled so a module restart or a power cycle
-        # mid-shoot doesn't silently drop deliveries whose images are sitting
-        # on the disk waiting for them. It lives beside the exports by default
-        # (a dotfile, so an image sweep won't touch it) and can be pointed
-        # elsewhere; without an `output_dir` there is no obvious place for it,
-        # so persistence is simply off and the queue is in-memory only.
-        journal_path = attrs.get("nines_retry_journal") or (
-            os.path.join(self._output_dir, ".nines_retry_queue.json")
-            if self._output_dir else None
-        )
-        queue: Optional[NinesDeliveryQueue] = getattr(self, "_nines_queue", None)
-        if queue is None:
-            self._nines_queue = NinesDeliveryQueue(
-                self._nines,
-                logger=self.logger,
-                journal_path=journal_path,
-                first_delay_s=retry_first_delay_s,
-                max_delay_s=retry_max_delay_s,
-                max_attempts=retry_max_attempts,
-            )
-            # Only on first build: on a later reconfigure the jobs are already
-            # in the live queue, and re-reading the journal would duplicate
-            # them.
-            self._nines_queue.restore(self._nines_retry_callbacks_for)
-        else:
-            if queue.journal_path != journal_path:
-                # A moved output_dir must not leave a stale journal behind for
-                # some later restart to restore already-delivered work from.
-                queue.retarget_journal(journal_path)
-            queue.client = self._nines
-            queue.logger = self.logger
-            queue.first_delay_s = retry_first_delay_s
-            queue.max_delay_s = retry_max_delay_s
-            queue.max_attempts = retry_max_attempts
-
         # In-flight deferred captures (`capture` with `defer: true`), keyed by
         # the capture_id handed back to the caller. Preserved across
         # reconfigure so a mid-sequence config change doesn't orphan results.
@@ -578,11 +444,6 @@ class ColorCorrection(Camera, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         resp: Dict[str, ValueTypes] = {}
 
-        # Deliveries restored from the journal are queued during reconfigure,
-        # which is synchronous and may have had no event loop to start the
-        # worker on. This is the first place that reliably does.
-        self._nines_queue.ensure_running()
-
         if "calibrate_color" in command:
             resp["calibrate_color"] = await self._calibrate_color(
                 command.get("calibrate_color") or {}, timeout
@@ -606,21 +467,6 @@ class ColorCorrection(Camera, EasyResource):
 
         if "upload" in command:
             resp["upload"] = await self._upload(command.get("upload") or {})
-
-        if "nines_upload" in command:
-            resp["nines_upload"] = await self._nines_upload(
-                command.get("nines_upload") or {}
-            )
-
-        if "nines_status" in command:
-            resp["nines_status"] = self._nines_status(
-                command.get("nines_status") or {}
-            )
-
-        if "nines_cancel" in command:
-            resp["nines_cancel"] = self._nines_cancel(
-                command.get("nines_cancel") or {}
-            )
 
         if "delete" in command:
             resp["delete"] = self._delete_local(command.get("delete") or {})
@@ -1605,57 +1451,11 @@ class ColorCorrection(Camera, EasyResource):
                                   its full post-stem suffix (``_16.png``,
                                   ``.cr3``, ``.json``, ...). When absent, the
                                   camera's on-disk basename is used.
-          ``sku``                 product code for Nines delivery: when set (and
-                                  ``nines_api_key`` plus an org slug are
-                                  available), the pre-loaded Nines product with
-                                  this ``external_id`` is looked up (created only
-                                  if absent) and the set's delivery image (the
-                                  full-res JPEG, by preference) is appended to
-                                  it. Reported under ``nines`` in the response.
-                                  A Nines failure never marks the Viam uploads
-                                  as failed, and keeps the delivery image on
-                                  disk for retry even with
-                                  ``delete_after_upload``. A failure that could
-                                  clear on its own (unreachable, timed out,
-                                  5xx, rate-limited) is queued for re-delivery
-                                  in the background and reported as
-                                  ``nines.retry``
-                                  (``job_id`` / ``attempt`` /
-                                  ``next_attempt_in_s`` / ``queued``); one that
-                                  cannot (bad key, wrong org, rejected image)
-                                  is reported as ``nines.error`` alone.
-          ``upc``                 product UPC, when known: used to look the
-                                  pre-loaded Nines product up first (before the
-                                  SKU), and carried in ``product_details`` if a
-                                  product has to be created. Optional.
-          ``shots_organization_slug``
-                                  deliver to this Nines org instead of the
-                                  configured ``nines_organization_slug`` (so one
-                                  machine can serve multiple orgs); falls back to
-                                  the config slug when absent
-          ``product_name``        product display name used when this ``sku``
-                                  doesn't exist in Nines yet, so a newly created
-                                  product reads as the product rather than the
-                                  bare code (default: the sku). Ignored for a
-                                  product that already exists - a found product
-                                  is never renamed.
           ``part_id``             override the configured / env machine part id
           ``component_name``      camera name to associate the data with (optional)
           ``delete_after_upload`` override the config attribute: remove each
                                   local file once its upload succeeds (failed
                                   uploads keep their files for retry)
-          ``upload_images_to_viam``
-                                  when false, only the ``.json`` sidecars in
-                                  ``paths`` are uploaded to Viam; the image
-                                  files are skipped (reported under
-                                  ``skipped_viam``) because Nines delivery
-                                  already carries the shot. Nines delivery and
-                                  ``delete_after_upload`` still see the full
-                                  set, so skipped images are cleaned off the
-                                  disk as if they had uploaded — after this,
-                                  Nines holds the only copy of the delivery
-                                  image and the other renders are not kept
-                                  anywhere. Default true.
         """
         raw_paths = opts.get("paths") or []
         if not raw_paths:
@@ -1663,21 +1463,6 @@ class ColorCorrection(Camera, EasyResource):
         paths = [str(p) for p in raw_paths]
         tags = [str(t) for t in (opts.get("tags") or [])]
         delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
-        sku = str(opts.get("sku") or "").strip() or None
-        upc = str(opts.get("upc") or "").strip() or None
-        org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
-        product_name = str(opts.get("product_name") or "").strip() or None
-
-        upload_images = bool(opts.get("upload_images_to_viam", True))
-        # The Viam pass may cover a subset, but Nines delivery, stem naming,
-        # and the delete pass all keep working from the full `paths` set.
-        viam_paths = paths
-        skipped_viam: List[str] = []
-        if not upload_images:
-            viam_paths = [
-                p for p in paths if os.path.splitext(p)[1].lower() == ".json"
-            ]
-            skipped_viam = [p for p in paths if p not in set(viam_paths)]
 
         name = opts.get("name")
         name = str(name) if name else None      # falsy/empty -> keep current behavior
@@ -1702,12 +1487,12 @@ class ColorCorrection(Camera, EasyResource):
 
         uploaded: List[str] = []
         failed: List[Dict[str, str]] = []
-        for i, path in enumerate(viam_paths):
+        for i, path in enumerate(paths):
             try:
                 size = os.path.getsize(path)
                 self.logger.info(
                     f"uploading {os.path.basename(path)} ({size / 1e6:.1f} MB) "
-                    f"[{i + 1}/{len(viam_paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
+                    f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
                 )
                 t_upload = time.perf_counter()
                 file_name = (
@@ -1742,34 +1527,9 @@ class ColorCorrection(Camera, EasyResource):
                 self.logger.error(f"failed to upload {path}: {exc}")
                 failed.append({"path": path, "error": str(exc)})
 
-        # Nines delivery runs before the delete pass so `delete_after_upload`
-        # can't remove the delivery image out from under it. It's independent
-        # of the Viam results: an archival failure doesn't block delivery, and
-        # a delivery failure is reported under `nines`, never in `failed`.
-        nines: Optional[Dict[str, ValueTypes]] = None
-        nines_keep: Optional[str] = None
-        if sku:
-            nines, nines_keep = await self._nines_deliver_for_upload(
-                sku, paths, name, capture_stem, org_slug=org_slug,
-                product_name=product_name, upc=upc,
-                delete_after=delete_after,
-            )
-
         deleted: List[str] = []
         if delete_after:
-            # Images skipped for Viam are done once Nines delivery has run —
-            # they delete on the same terms as uploaded ones (a failed
-            # delivery's image is still held back via nines_keep).
-            for path in uploaded + skipped_viam:
-                if path == nines_keep:
-                    # Held back, not leaked: a queued retry deletes it once the
-                    # delivery lands, and an abandoned one leaves it for a
-                    # manual `nines_upload`.
-                    self.logger.info(
-                        f"keeping {os.path.basename(path)} on disk for a Nines "
-                        "retry despite delete_after_upload"
-                    )
-                    continue
+            for path in uploaded:
                 try:
                     os.remove(path)
                     deleted.append(path)
@@ -1779,25 +1539,16 @@ class ColorCorrection(Camera, EasyResource):
                     self.logger.warning(f"uploaded but could not delete {path}: {exc}")
 
         self.logger.info(
-            f"uploaded {len(uploaded)}/{len(viam_paths)} file(s)"
+            f"uploaded {len(uploaded)}/{len(paths)} file(s)"
             + (f" with tags {tags}" if tags else "")
-            + (
-                f" ({len(skipped_viam)} image(s) skipped for Viam)"
-                if skipped_viam else ""
-            )
             + (f", deleted {len(deleted)} local cop(ies)" if delete_after else "")
         )
-        result: Dict[str, ValueTypes] = {
+        return {
             "uploaded": uploaded,
             "count": len(uploaded),
             "failed": failed,
             "deleted": deleted,
         }
-        if skipped_viam:
-            result["skipped_viam"] = skipped_viam
-        if nines is not None:
-            result["nines"] = nines
-        return result
 
     def _delete_local(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
@@ -1910,7 +1661,7 @@ class ColorCorrection(Camera, EasyResource):
             return response.binary_data_id
 
     # ------------------------------------------------------------------
-    # Nines partner-API delivery
+    # Upload naming
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1921,336 +1672,13 @@ class ColorCorrection(Camera, EasyResource):
         Apply the operator-chosen upload ``name`` to one file of a capture set:
         the shared ``capture_stem`` prefix is swapped for ``name``, preserving
         the file's post-stem suffix (``_16.tif``, ``.json``, ...). With no
-        ``name`` the on-disk basename is returned unchanged. Used for both the
-        Viam cloud file name and the Nines image filename, so the two sides
-        agree on what a shot is called.
+        ``name`` the on-disk basename is returned unchanged, so every file in
+        one upload set ends up named consistently.
         """
         base = os.path.basename(path)
         if not name or capture_stem is None:
             return base
         return name + base[len(capture_stem):]
-
-    async def _nines_deliver_for_upload(
-        self,
-        sku: str,
-        paths: Sequence[str],
-        name: Optional[str],
-        capture_stem: Optional[str],
-        org_slug: Optional[str] = None,
-        product_name: Optional[str] = None,
-        upc: Optional[str] = None,
-        delete_after: bool = False,
-    ) -> Tuple[Optional[Dict[str, ValueTypes]], Optional[str]]:
-        """
-        The ``upload``-integrated Nines delivery: pick the one delivery image
-        out of the capture set and append it to the product in the effective
-        org (``org_slug`` when the webapp names one, else the configured slug),
-        tagged with its final filename stem. The product is looked up by ``upc``
-        (when known) then SKU; ``product_name`` names it if delivery has to
-        create it - without it a new product is titled with the raw SKU.
-        Returns
-        ``(nines_result, keep_path)`` where ``keep_path`` names a file the
-        delete pass must leave on disk for a retry (the delivery image, when
-        delivery failed). Never raises: a Nines problem is reported in the
-        result, not allowed to fail the Viam half of the submit.
-
-        The attempt itself stays inline, so a submit that works reports the
-        real delivery in the same response it always did. Only a failure that
-        could plausibly clear on its own is handed to the retry queue, and
-        then the result carries a ``retry`` block alongside the ``error`` -
-        this submit still did not land, and the operator should see both that
-        and the fact that it will be tried again. ``delete_after`` is carried
-        into the queue so the held-back image is finally removed by whichever
-        attempt succeeds.
-        """
-        org = org_slug or self._nines.org_slug
-        if not self._nines.ready(org):
-            self.logger.info(
-                f"`upload` got sku {sku!r} but Nines delivery is not configured"
-            )
-            return {
-                "skipped": "Nines delivery not configured: set `nines_api_key` "
-                           "and an org slug (config `nines_organization_slug` "
-                           "or a per-request `shots_organization_slug`)"
-            }, None
-
-        delivery = self._nines.pick_image(paths)
-        if delivery is None:
-            return {
-                "error": "no Nines-compatible image (jpeg/png/webp/gif) in "
-                         "this upload set"
-            }, None
-
-        filename = self._renamed_basename(delivery, name, capture_stem)
-        try:
-            result = await self._nines.deliver(
-                sku, [(delivery, filename, [os.path.splitext(filename)[0]])],
-                product_name=product_name,
-                org_slug=org,
-                upc=upc,
-            )
-        except Exception as exc:  # noqa: BLE001 - reported, never fails the upload
-            self.logger.error(f"Nines delivery failed for SKU {sku!r}: {exc}")
-            result = {"error": str(exc)}
-            retry = self._nines_enqueue_retry(
-                sku,
-                [(delivery, filename, [os.path.splitext(filename)[0]])],
-                exc,
-                org=org,
-                product_name=product_name,
-                upc=upc,
-                delete_after=delete_after,
-            )
-            if retry is not None:
-                result["retry"] = retry
-            return result, delivery
-        self.logger.info(
-            f"delivered {filename} to Nines item "
-            f"{result.get('reference_item_id')} (SKU {sku!r}, "
-            f"{result.get('images_count')} image(s) total)"
-        )
-        return result, None
-
-    def _nines_retry_callbacks(
-        self, sku: str, paths: Sequence[str], delete_after: bool
-    ) -> Tuple[Callable[..., None], Callable[..., None]]:
-        """
-        The ``(on_success, on_abandon)`` pair for a queued Nines delivery.
-
-        They close the loop that ``nines_keep`` opened: when a later attempt
-        lands, the delivery image the delete pass held back is finally removed
-        (if that upload asked for it); when the queue gives up, it stays on
-        disk and the log says how to send it by hand. Built here rather than
-        inline so a job restored from the journal - which cannot carry a
-        closure - gets exactly the same behaviour as one that never left
-        memory.
-        """
-        def delivered(result: Mapping[str, Any]) -> None:
-            self.logger.info(
-                f"Nines retry delivered SKU {sku!r} to item "
-                f"{result.get('reference_item_id')}"
-            )
-            if not delete_after:
-                return
-            for path in paths:
-                try:
-                    os.remove(path)
-                    self.logger.info(
-                        f"removed {os.path.basename(path)} now that its Nines "
-                        "delivery has landed"
-                    )
-                except FileNotFoundError:
-                    pass
-                except OSError as os_exc:
-                    self.logger.warning(
-                        f"delivered but could not delete {path}: {os_exc}"
-                    )
-
-        def abandoned(job: Any, error: BaseException) -> None:
-            self.logger.error(
-                f"Nines delivery for SKU {sku!r} abandoned after "
-                f"{getattr(job, 'attempt', '?')} attempts ({error}). The "
-                f"image is still on disk - re-send it with the `nines_upload` "
-                f"command: {list(paths)}"
-            )
-
-        return delivered, abandoned
-
-    def _nines_retry_callbacks_for(
-        self, job: Any
-    ) -> Tuple[Callable[..., None], Callable[..., None]]:
-        """Rebuild a restored job's callbacks from what the journal carried."""
-        return self._nines_retry_callbacks(
-            job.sku,
-            [path for path, _, _ in job.images],
-            bool(job.context.get("delete_after")),
-        )
-
-    def _nines_enqueue_retry(
-        self,
-        sku: str,
-        images: List[Tuple[str, str, List[str]]],
-        exc: BaseException,
-        *,
-        org: Optional[str],
-        product_name: Optional[str],
-        upc: Optional[str],
-        delete_after: bool,
-    ) -> Optional[Dict[str, ValueTypes]]:
-        """
-        Hand a failed delivery to the retry queue, returning the ``retry``
-        block for the response - or ``None`` when the failure is not worth
-        retrying, which is as much a decision as queueing it. A bad key, the
-        wrong org slug or an image the API rejected fails the same way every
-        time; scheduling five more attempts would only delay the moment the
-        operator finds out. Only :class:`NinesAPIError` is classified, so an
-        unexpected exception is treated as terminal rather than looped on.
-
-        The callbacks close the loop that ``nines_keep`` opened: when a later
-        attempt lands, the delivery image the delete pass held back is finally
-        removed (if this upload asked for that); when the queue gives up, it
-        stays on disk and the log says how to send it by hand.
-        """
-        if not isinstance(exc, NinesAPIError) or not exc.retryable:
-            self.logger.info(
-                f"not retrying Nines delivery for SKU {sku!r}: {exc} is not a "
-                "failure a later attempt would survive"
-            )
-            return None
-
-        paths = [path for path, _, _ in images]
-        delivered, abandoned = self._nines_retry_callbacks(
-            sku, paths, delete_after
-        )
-
-        return self._nines_queue.enqueue(
-            sku,
-            images,
-            org=org,
-            product_name=product_name,
-            upc=upc,
-            # One inline attempt has already failed, and whether it left the
-            # outcome unknown decides if the next one checks for a duplicate.
-            attempt=1,
-            ambiguous=exc.ambiguous,
-            error=str(exc),
-            # A server-sent Retry-After floors the first scheduled attempt.
-            retry_after_s=exc.retry_after_s,
-            # Carried in the journal so a restart can rebuild the callbacks.
-            context={"delete_after": delete_after},
-            on_success=delivered,
-            on_abandon=abandoned,
-        )
-
-    def _nines_status(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
-        """
-        Nines deliveries still waiting to be re-attempted, plus the ones
-        recently given up on.
-
-        Without this a queued retry is invisible: the ``upload`` response that
-        announced it is the last the caller hears until the delivery lands or
-        does not. ``pending`` entries carry ``job_id``, ``sku``, ``org``,
-        ``attempt``, ``next_attempt_in_s`` and the ``files`` being held on
-        disk, plus ``in_flight`` on the one being attempted right now;
-        ``abandoned`` entries (the most recent 32) carry the same plus the final
-        ``error``, and name files that are still on disk and can be re-sent with
-        ``nines_upload``.
-
-        ``opts``:
-          ``sku``                       report only this product's deliveries,
-                                        which is how a caller asks "is anything
-                                        still outstanding for this SKU?" before
-                                        starting another take of it. Filters
-                                        ``abandoned`` as well as ``pending``.
-          ``shots_organization_slug``   narrow ``sku`` to one org, for a machine
-                                        that serves several
-
-        With no options the whole queue is reported, as it always was.
-        """
-        sku = str(opts.get("sku") or "").strip() or None
-        org = str(opts.get("shots_organization_slug") or "").strip() or None
-        return self._nines_queue.snapshot(sku=sku, org=org)
-
-    def _nines_cancel(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
-        """
-        Withdraw queued Nines deliveries - the operator is replacing this
-        product's shot rather than waiting for the retry to land.
-
-        ``opts`` (at least one is required):
-          ``sku``                       cancel this product's pending deliveries
-          ``shots_organization_slug``   narrow ``sku`` to one org
-          ``job_id``                    cancel exactly this job, from a
-                                        ``nines_status`` entry or an ``upload``
-                                        response's ``retry`` block
-
-        Returns ``{"cancelled": [job_id], "in_flight": [job_id], "files":
-        [path]}``. ``in_flight`` names a delivery whose append was already on
-        the wire: it cannot be recalled, so it may still reach the product, and
-        that image then has to be removed in the Nines review app - the partner
-        API has no endpoint that deletes one.
-
-        ``files`` are the local copies that were being held for these
-        deliveries. They are reported rather than removed: send them to the
-        ``delete`` command, which is where the ``output_dir`` boundary is
-        enforced.
-        """
-        sku = str(opts.get("sku") or "").strip() or None
-        org = str(opts.get("shots_organization_slug") or "").strip() or None
-        job_id = str(opts.get("job_id") or "").strip() or None
-        if sku is None and org is None and job_id is None:
-            raise ValueError(
-                "`nines_cancel` needs a `sku`, a `shots_organization_slug` or a "
-                "`job_id` - it will not cancel every pending delivery"
-            )
-        return self._nines_queue.cancel(sku=sku, org=org, job_id=job_id)
-
-    async def _nines_upload(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
-        """
-        Deliver image files already on disk to the Nines partner API - the
-        manual / retry counterpart to the ``sku`` option on ``upload``. Sends
-        exactly the files listed (no best-of-set picking, no Viam upload, no
-        local deletion), appended to the SKU's product non-destructively. The
-        whole batch is held in memory base64-encoded while it uploads, so send
-        a very large set in a few calls rather than one.
-
-        ``opts``:
-          ``sku``                       product code matched as the Nines
-                                        ``external_id`` (required)
-          ``paths``                     image files to append; each must be
-                                        jpeg/png/webp/gif (required)
-          ``upc``                       product UPC, when known: looks the
-                                        pre-loaded product up first (before the
-                                        SKU), and carried in ``product_details``
-                                        if the product has to be created
-          ``shots_organization_slug``   deliver to this org instead of the
-                                        configured one, so a webapp retry lands
-                                        in the same org as the original submit;
-                                        falls back to the config slug
-          ``tags``                      Nines tags applied to every appended
-                                        image (e.g. ["front"])
-          ``product_name``              product display name used if the SKU
-                                        doesn't exist on the Nines side yet
-                                        (default: the sku)
-
-        Requires ``nines_api_key`` plus an org slug - from config
-        (``nines_organization_slug``) or the per-request
-        ``shots_organization_slug``. Returns ``{"reference_item_id",
-        "external_id", "added_count", "images_count"}``.
-        """
-        sku = str(opts.get("sku") or "").strip()
-        if not sku:
-            raise ValueError("`nines_upload` needs a `sku`")
-        raw_paths = opts.get("paths") or []
-        if not raw_paths:
-            raise ValueError("`nines_upload` needs a non-empty `paths` list")
-        org_slug = str(opts.get("shots_organization_slug") or "").strip() or None
-        if not self._nines.ready(org_slug):
-            raise ValueError(
-                "Nines delivery is not configured: set the `nines_api_key` "
-                "config attribute (the key may also come from the NINES_API_KEY "
-                "env var) and an org slug - `nines_organization_slug` in config "
-                "or a per-request `shots_organization_slug`"
-            )
-        paths = [str(p) for p in raw_paths]
-        ineligible = [
-            p for p in paths
-            if os.path.splitext(p)[1].lower() not in NINES_CONTENT_TYPES
-        ]
-        if ineligible:
-            raise ValueError(
-                "not Nines-compatible (the API accepts jpeg/png/webp/gif): "
-                f"{ineligible}"
-            )
-        tags = [str(t) for t in (opts.get("tags") or [])]
-        product_name = opts.get("product_name")
-        upc = str(opts.get("upc") or "").strip() or None
-        return await self._nines.deliver(
-            sku,
-            [(p, os.path.basename(p), tags) for p in paths],
-            product_name=str(product_name) if product_name else None,
-            org_slug=org_slug,
-            upc=upc,
-        )
 
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None

@@ -163,6 +163,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# macOS
+.DS_Store
+
 # Viam reload files
 .VIAM_RELOAD_ARCHIVE.tar.gz
 reload-*/

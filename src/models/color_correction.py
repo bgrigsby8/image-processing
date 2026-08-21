@@ -362,6 +362,11 @@ class ColorCorrection(Camera, EasyResource):
         self._part_id: Optional[str] = (
             attrs.get("part_id") or os.environ.get("VIAM_MACHINE_PART_ID") or None
         )
+        # Dropping the old client without closing its channel leaks the gRPC
+        # connection: grpclib complains "Unclosed connection" on stderr when
+        # the channel is garbage-collected, which viam-server surfaces as an
+        # error log.
+        self._close_data_client()
         self._data_client: Optional[DataClient] = None
 
         # Bound the cloud round-trips so a stuck auth dial or a stalled file
@@ -1419,6 +1424,18 @@ class ColorCorrection(Camera, EasyResource):
             return None
         return (x, y, w, h)
 
+    def _close_data_client(self) -> None:
+        """Close the cached cloud channel, if one was ever dialed. Idempotent."""
+        # getattr: on the first reconfigure the attribute doesn't exist yet.
+        client = getattr(self, "_data_client", None)
+        self._data_client = None
+        if client is None:
+            return
+        try:
+            client._channel.close()
+        except Exception as exc:
+            self.logger.debug(f"Closing app.viam.com channel failed: {exc}")
+
     async def _get_data_client(self) -> DataClient:
         """
         Lazily build (and cache) a cloud ``DataClient`` from the API key Viam
@@ -1451,12 +1468,18 @@ class ColorCorrection(Camera, EasyResource):
             f"(dial timeout {self._upload_dial_timeout_s:.0f}s)"
         )
         t_dial = time.perf_counter()
+        dial_task = asyncio.ensure_future(_dial_app("app.viam.com", dial_options))
         try:
             channel = await asyncio.wait_for(
-                _dial_app("app.viam.com", dial_options),
+                dial_task,
                 timeout=self._upload_dial_timeout_s,
             )
         except asyncio.TimeoutError as exc:
+            # wait_for cancels the dial, but the dial can complete in the race
+            # window before the cancel lands; close that channel rather than
+            # leak it (grpclib logs "Unclosed connection" to stderr on GC).
+            if dial_task.done() and not dial_task.cancelled() and dial_task.exception() is None:
+                dial_task.result().close()
             raise TimeoutError(
                 f"`upload` timed out after {self._upload_dial_timeout_s:.0f}s "
                 "dialing app.viam.com to authenticate — the machine may be "
@@ -1930,3 +1953,6 @@ class ColorCorrection(Camera, EasyResource):
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
     ) -> Sequence[Geometry]:
         return await self.camera.get_geometries(extra=extra, timeout=timeout)
+
+    async def close(self):
+        self._close_data_client()

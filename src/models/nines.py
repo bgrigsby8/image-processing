@@ -29,6 +29,7 @@ on a widening backoff, behind whatever else is already waiting.
 
 import asyncio
 import base64
+import email.utils
 import inspect
 import json
 import os
@@ -39,6 +40,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import (
     Any,
     Callable,
@@ -117,6 +119,10 @@ class NinesAPIError(RuntimeError):
     ``status`` unless a caller overrides them, which the non-transport raise
     sites do: an unreadable local file and a malformed 2xx body both carry no
     status but are nothing like an unreachable API.
+
+    ``retry_after_s`` carries the server's ``Retry-After`` when the response
+    named one (typically on a 429/503): the earliest moment a retry could
+    succeed, which the retry queue honors as a floor on its own backoff.
     """
 
     def __init__(
@@ -126,9 +132,11 @@ class NinesAPIError(RuntimeError):
         *,
         retryable: Optional[bool] = None,
         ambiguous: Optional[bool] = None,
+        retry_after_s: Optional[float] = None,
     ):
         super().__init__(message)
         self.status = status
+        self.retry_after_s = retry_after_s
         self.retryable = (
             (status is None or status in _RETRYABLE_STATUSES)
             if retryable is None
@@ -145,6 +153,31 @@ def _read_base64(path: str) -> str:
     """Whole-file base64 for the Nines inline image form (run in a thread)."""
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
+
+
+def _retry_after_seconds(headers: Any) -> Optional[float]:
+    """
+    The ``Retry-After`` header as seconds from now, or ``None`` when it is
+    absent, unparseable, or already elapsed. Accepts both forms the header may
+    take: a delta in seconds and an HTTP-date.
+    """
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return seconds if seconds > 0 else None
 
 
 class NinesClient:
@@ -196,6 +229,49 @@ class NinesClient:
         # queue, which delivers alongside whatever the operator is doing now,
         # makes it ordinary.
         self._resolve_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        # Whether a 403 has already been followed up with the org-listing
+        # diagnostic (see _diagnose_403) - once per client, so a fleet stuck
+        # on a wrong slug does not hammer the organizations endpoint.
+        self._diagnosed_403 = False
+
+    def _diagnose_403(self, method: str, path: str) -> None:
+        """
+        One-time follow-up to a 403: list the orgs this key can actually
+        reach and log them by name. A key fenced to one org pointed at
+        another's slug fails every delivery with an error that never names
+        the fix; the organizations endpoint exists to discover the valid
+        slugs, so one small request turns "403 forever" into "the key
+        reaches [a, b] - check `nines_organization_slug`". Best-effort and
+        guarded by ``_diagnosed_403`` (set before the request, so a 403 from
+        the diagnostic itself cannot recurse); never raises.
+        """
+        if self._diagnosed_403:
+            return
+        self._diagnosed_403 = True
+        try:
+            response = self.request(
+                "GET", "/api/v1/organizations", None, self.request_timeout_s
+            )
+            items = (
+                response
+                if isinstance(response, list)
+                else (response.get("organizations") or [])
+            )
+            slugs = [
+                str(item["slug"])
+                for item in items
+                if isinstance(item, Mapping) and item.get("slug")
+            ]
+            self.logger.error(
+                f"Nines refused {method} {path} with 403. Orgs this key can "
+                f"reach: {slugs} (configured `nines_organization_slug`: "
+                f"{self.org_slug!r}). If the org slug is right, the key is "
+                "missing a scope."
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not a gate
+            self.logger.debug(
+                f"could not list this key's Nines orgs after a 403: {exc}"
+            )
 
     def ready(self, org_slug: Optional[str]) -> bool:
         """Whether Nines delivery can proceed for the given effective org slug.
@@ -248,7 +324,20 @@ class NinesClient:
         unreachable or timed out. Every transport failure arrives as a
         ``NinesAPIError`` so callers never have to catch urllib's or socket's
         types themselves.
+
+        Failures are logged at *warning* here, not error: some are expected
+        and handled (``deliver`` re-resolves a stale 404, the queue retries a
+        503), so the caller that finds a failure terminal escalates - logging
+        error here too would double-report every handled one.
         """
+        if not self.api_key:
+            # ready() stops the DoCommand entry points long before this; the
+            # guard keeps a direct caller from sending "Bearer None".
+            raise NinesAPIError(
+                "no Nines API key configured",
+                retryable=False,
+                ambiguous=False,
+            )
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=json.dumps(body).encode() if body is not None else None,
@@ -276,11 +365,17 @@ class NinesClient:
                 f"Nines API {method} {path} failed with {exc.code}"
                 + (f": {detail}" if detail else "")
             )
-            self.logger.error(message)
-            raise NinesAPIError(message, status=exc.code) from exc
+            self.logger.warning(message)
+            if exc.code == 403:
+                self._diagnose_403(method, path)
+            raise NinesAPIError(
+                message,
+                status=exc.code,
+                retry_after_s=_retry_after_seconds(exc.headers),
+            ) from exc
         except urllib.error.URLError as exc:
             message = f"Nines API {method} {path} unreachable: {exc.reason}"
-            self.logger.error(message)
+            self.logger.warning(message)
             raise NinesAPIError(message) from exc
         except TimeoutError as exc:
             # urlopen wraps a *connect* timeout in URLError (caught above) but
@@ -290,7 +385,7 @@ class NinesClient:
             # escape past every caller that catches NinesAPIError, and past
             # the retry classification entirely.
             message = f"Nines API {method} {path} timed out after {timeout_s:.0f}s"
-            self.logger.error(message)
+            self.logger.warning(message)
             raise NinesAPIError(message) from exc
         except Exception:
             # Anything else (e.g. a malformed 2xx body) - never silently lost.
@@ -592,8 +687,11 @@ class NinesClient:
         product up and creating it only if absent - then append every image
         non-destructively as inline base64. ``images`` is
         ``[(path, upload_filename, tags)]``; every file must carry a
-        jpeg/png/webp/gif extension. Raises on any API failure - callers decide
-        whether that fails their operation.
+        jpeg/png/webp/gif extension. The whole batch is held in memory
+        base64-encoded (roughly 4/3 of the files' combined size) while the
+        append is in flight, so very large sets belong in separate calls.
+        Raises on any API failure - callers decide whether that fails their
+        operation.
 
         Set ``verify_first`` when re-delivering after a failure that left the
         outcome unknown (``NinesAPIError.ambiguous``): the images already on
@@ -604,6 +702,16 @@ class NinesClient:
         a duplicate a human can delete, but it should never be silent.
         """
         org = org_slug or self.org_slug
+        if not self.ready(org):
+            # The DoCommand entry points check ready() and answer politely;
+            # this backstop keeps a direct caller from urlencoding org=None
+            # into the query string.
+            raise NinesAPIError(
+                "Nines delivery is not configured (an API key and an org "
+                "slug are both required)",
+                retryable=False,
+                ambiguous=False,
+            )
         cached = (org, sku) in self.item_ids
         item_id = self.item_ids.get((org, sku)) or await self._resolve_item(
             sku, product_name, org, upc=upc
@@ -860,6 +968,7 @@ class NinesDeliveryQueue:
         attempt: int = 1,
         ambiguous: bool = False,
         error: Optional[str] = None,
+        retry_after_s: Optional[float] = None,
         context: Optional[Mapping[str, Any]] = None,
         on_success: Optional[Callable[..., Any]] = None,
         on_abandon: Optional[Callable[..., Any]] = None,
@@ -877,8 +986,9 @@ class NinesDeliveryQueue:
         Callers pass the failure they already saw as ``attempt`` (1 after one
         inline try) and ``ambiguous`` (from ``NinesAPIError.ambiguous``), and
         are expected to have checked ``retryable`` first - a queue is the wrong
-        place to discover that a key is dead. Later failures are classified
-        here.
+        place to discover that a key is dead. ``retry_after_s`` (the failure's
+        server-sent ``Retry-After``, when it named one) floors the first
+        scheduled attempt's delay. Later failures are classified here.
 
         ``on_success(result)`` and ``on_abandon(job, error)`` may be sync or
         async; they run outside the delivery's own error handling, so a
@@ -918,6 +1028,10 @@ class NinesDeliveryQueue:
             on_abandon=on_abandon,
         )
         delay = self._delay(job.attempt)
+        if retry_after_s:
+            # The server named the earliest moment a retry can succeed;
+            # scheduling sooner would burn an attempt on a certain refusal.
+            delay = max(delay, retry_after_s)
         job.next_at = time.monotonic() + delay
         self._jobs.append(job)
         self._persist()
@@ -1206,6 +1320,11 @@ class NinesDeliveryQueue:
             return
 
         delay = self._delay(job.attempt)
+        retry_after = getattr(exc, "retry_after_s", None)
+        if retry_after:
+            # The server named the earliest moment a retry can succeed;
+            # scheduling sooner would burn an attempt on a certain refusal.
+            delay = max(delay, retry_after)
         job.next_at = time.monotonic() + delay
         self._jobs.append(job)  # the back of the queue
         self._persist()

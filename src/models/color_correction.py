@@ -2105,6 +2105,8 @@ class ColorCorrection(Camera, EasyResource):
             attempt=1,
             ambiguous=exc.ambiguous,
             error=str(exc),
+            # A server-sent Retry-After floors the first scheduled attempt.
+            retry_after_s=exc.retry_after_s,
             # Carried in the journal so a restart can rebuild the callbacks.
             context={"delete_after": delete_after},
             on_success=delivered,
@@ -2131,7 +2133,9 @@ class ColorCorrection(Camera, EasyResource):
         Deliver image files already on disk to the Nines partner API - the
         manual / retry counterpart to the ``sku`` option on ``upload``. Sends
         exactly the files listed (no best-of-set picking, no Viam upload, no
-        local deletion), appended to the SKU's product non-destructively.
+        local deletion), appended to the SKU's product non-destructively. The
+        whole batch is held in memory base64-encoded while it uploads, so send
+        a very large set in a few calls rather than one.
 
         ``opts``:
           ``sku``                       product code matched as the Nines

@@ -38,6 +38,11 @@ Two ways to get corrected images out of this component:
               and preview encode continue in the background.
               ``capture_result`` then returns {"source_path", "image_base64",
               ...} (or {"status": "pending"} if not done within ``wait_sec``).
+              The result also carries ``sensor_mean_luminance`` and
+              ``sensor_highlight_fraction`` - the frame's light level in
+              linear sensor units with the exposure trim divided back out
+              (see image_io.sensor_light_stats), so a rig can detect a flash
+              misfire without knowing how the frame was developed.
               Deferred captures never write exports or a sidecar - run
               ``develop`` on the returned ``source_path`` when the files are
               actually needed. Requires the ptp model (its ``trigger``
@@ -191,6 +196,7 @@ from models.image_io import (
     linear_to_srgb,
     load_linear_rgb,
     render_raw_for_detection,
+    sensor_light_stats,
     srgb_to_linear,
 )
 # Default delivery set when `output_formats` isn't configured. Override in
@@ -930,6 +936,12 @@ class ColorCorrection(Camera, EasyResource):
             white_balance=white_balance, exposure_stops=exposure_stops,
             half_size=True, demosaic=self._demosaic,
         )
+        # Measured pre-CCM, with the exposure trim divided back out, so a
+        # caller checking for flash misfires (a dark frame the capture itself
+        # can't report) reads the light on the sensor, not the develop.
+        sensor_mean, sensor_highlights = await asyncio.to_thread(
+            sensor_light_stats, linear, str(saved), exposure_stops
+        )
         corrected = await asyncio.to_thread(corrector.apply_to_linear, linear)
         preview = await asyncio.to_thread(
             linear_to_jpeg_base64, corrected, tone=tone, sharpen=sharpen
@@ -946,6 +958,8 @@ class ColorCorrection(Camera, EasyResource):
             "mime_type": CameraMimeType.JPEG.value,
             "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
+            "sensor_mean_luminance": sensor_mean,
+            "sensor_highlight_fraction": sensor_highlights,
         }
 
     async def _capture_result(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:

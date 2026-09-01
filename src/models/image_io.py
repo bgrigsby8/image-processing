@@ -227,16 +227,17 @@ def load_linear_rgb(
             kwargs["demosaic_algorithm"] = _demosaic_algorithm(demosaic)
         if exposure_stops:
             # exp_shift is a linear multiplier (rawpy enables the exposure
-            # correction automatically when it's set); libraw clamps it to [0.25, 8].
-            shift = float(2.0 ** exposure_stops)
-            clamped = float(np.clip(shift, 0.25, 8.0))
-            if clamped != shift:
+            # correction automatically when it's set); libraw clamps it to
+            # [0.25, 8]. applied_exposure_shift mirrors the clamp so callers
+            # can divide out exactly what was baked in.
+            shift = applied_exposure_shift(path, exposure_stops)
+            if shift != float(2.0 ** exposure_stops):
                 LOGGER.warning(
                     f"exposure_stops {exposure_stops:+.2f} exceeds libraw's "
                     f"exp_shift range (-2 to +3 stops); rendering at "
-                    f"{np.log2(clamped):+.2f} stops instead"
+                    f"{np.log2(shift):+.2f} stops instead"
                 )
-            kwargs["exp_shift"] = clamped
+            kwargs["exp_shift"] = shift
         if user_flip is not None:
             kwargs["user_flip"] = int(user_flip)
         if half_size:
@@ -253,6 +254,59 @@ def load_linear_rgb(
         with Image.open(path) as img:
             arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
         return srgb_to_linear(arr).astype(np.float32)
+
+
+def applied_exposure_shift(path: str, exposure_stops: float) -> float:
+    """
+    The linear multiplier ``load_linear_rgb`` bakes into a frame of ``path``
+    for ``exposure_stops`` - the exact value, clamp included, so a caller can
+    divide the trim back out of the loaded pixels.
+
+    1.0 for non-RAW inputs (the trim is applied at the raw stage only) and
+    for a zero trim; otherwise ``2**stops`` clamped to libraw's exp_shift
+    range [0.25, 8].
+    """
+    if not (is_raw(path) and exposure_stops):
+        return 1.0
+    return float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
+
+
+# Linear luminance at or above which a pixel counts as a clipping specular in
+# sensor_light_stats. Measured on the loaded (post-trim) pixels: a positive
+# trim multiplies before the output clamps, so everything the sensor clipped
+# still reads ~1.0 - whereas dividing the trim out would cap pre-trim values
+# at 1/shift and hide them. 0.9 leaves margin for demosaic ringing just below
+# the clamp.
+HIGHLIGHT_CLIP_LUMINANCE = 0.9
+
+
+def sensor_light_stats(
+    linear: np.ndarray, path: str, exposure_stops: float
+) -> Tuple[float, float]:
+    """
+    Measure how much light reached the sensor for a frame loaded by
+    ``load_linear_rgb``, independent of the exposure trim baked into it.
+    Feeds flash-misfire detection: a caller can threshold the result without
+    knowing (or undoing) the develop settings.
+
+    Returns ``(mean_luminance, highlight_fraction)``:
+
+    * ``mean_luminance`` - mean Rec.709 luminance of the frame with the
+      applied trim divided back out: proportional to the light that reached
+      the sensor (1.0 ~ full scale) whatever ``exposure_stops`` rendered.
+      White balance stays applied; its per-channel gains describe the
+      camera's light response, not this develop. Exact for unlit frames
+      (nothing clips); an underestimate for bright frames whose highlights
+      clipped, which only widens the gap a dark-frame check reads.
+    * ``highlight_fraction`` - fraction of pixels at or above
+      ``HIGHLIGHT_CLIP_LUMINANCE`` in the loaded (post-trim) frame: the
+      clipping speculars a strobe throws even off a black subject.
+    """
+    luma = linear @ _LUMA
+    shift = applied_exposure_shift(path, exposure_stops)
+    mean = float(luma.mean()) / shift
+    highlights = float(np.count_nonzero(luma >= HIGHLIGHT_CLIP_LUMINANCE)) / luma.size
+    return mean, highlights
 
 
 def image_dimensions(path: str) -> Tuple[int, int]:
@@ -480,8 +534,9 @@ _TONE_CURVES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
 _TONE_LUT_SIZE = 4096
 _TONE_LUT_CACHE: Dict[str, np.ndarray] = {}
 
-# Rec.709 luma weights - shared by the tone curve (lightness-only application)
-# and the capture sharpener (luminance-only unsharp mask).
+# Rec.709 luma weights - shared by the tone curve (lightness-only
+# application), the capture sharpener (luminance-only unsharp mask), and
+# sensor_light_stats (the flash-misfire measurement).
 _LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 

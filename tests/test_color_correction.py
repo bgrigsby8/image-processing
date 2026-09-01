@@ -428,6 +428,10 @@ def test_deferred_capture_round_trip(tmp_path):
     assert result["status"] == "done"
     assert result["source_path"] == source.saved_path
     assert result["image_base64"]  # preview present
+    # The sensor light stats ride along for flash-misfire detection: the
+    # still is uniform 120 sRGB (~0.188 linear), nowhere near clipping.
+    assert result["sensor_mean_luminance"] == pytest.approx(0.188, abs=0.005)
+    assert result["sensor_highlight_fraction"] == 0.0
     # Deferred captures hand off the RAW only - no exports, no sidecar.
     assert "exports" not in result
     # The ticket is collected exactly once.

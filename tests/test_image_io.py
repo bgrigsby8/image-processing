@@ -9,18 +9,21 @@ from PIL import Image
 
 from models.image_io import (
     EXPORT_FORMATS,
+    HIGHLIGHT_CLIP_LUMINANCE,
     crop_linear,
     image_dimensions,
     TONE_OPTIONS,
     _TONE_CURVES,
     _encode_srgb,
     _rawpy_wb_kwargs,
+    applied_exposure_shift,
     apply_tone_curve,
     export_renditions,
     is_raw,
     linear_to_jpeg_base64,
     linear_to_srgb,
     load_linear_rgb,
+    sensor_light_stats,
     srgb_to_linear,
 )
 
@@ -114,6 +117,54 @@ def test_load_linear_rgb_jpeg(tmp_path):
 def test_load_linear_rgb_missing_file():
     with pytest.raises(FileNotFoundError):
         load_linear_rgb("/nonexistent/IMG_0001.CR3")
+
+
+# ---------------------------------------------------------------------------
+# Sensor light stats (flash-misfire measurement)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "path,stops,expected",
+    [
+        # The trim is a RAW-stage concept: non-RAW inputs never carry it.
+        ("shot.png", 1.93, 1.0),
+        ("shot.jpg", -1.0, 1.0),
+        # A zero trim sets no exp_shift at all.
+        ("IMG_0042.CR3", 0.0, 1.0),
+        ("IMG_0042.CR3", 1.93, 2.0 ** 1.93),
+        # libraw clamps exp_shift to [0.25, 8]; the reported shift must match
+        # what was actually baked in, not the request.
+        ("IMG_0042.CR3", 4.0, 8.0),
+        ("IMG_0042.CR3", -3.0, 0.25),
+    ],
+)
+def test_applied_exposure_shift(path, stops, expected):
+    assert applied_exposure_shift(path, stops) == pytest.approx(expected)
+
+
+def test_sensor_light_stats_divides_out_the_trim():
+    """The mean must report the light on the sensor: the same loaded pixels
+    under a bigger trim mean proportionally less light."""
+    linear = np.full((4, 4, 3), 0.04, dtype=np.float32)
+    mean_untrimmed, _ = sensor_light_stats(linear, "IMG_0042.CR3", 0.0)
+    mean_trimmed, _ = sensor_light_stats(linear, "IMG_0042.CR3", 2.0)
+    assert mean_untrimmed == pytest.approx(0.04, abs=1e-6)
+    assert mean_trimmed == pytest.approx(0.01, abs=1e-6)
+    # Non-RAW: no trim was applied, so nothing is divided out.
+    mean_png, _ = sensor_light_stats(linear, "shot.png", 2.0)
+    assert mean_png == pytest.approx(0.04, abs=1e-6)
+
+
+def test_sensor_light_stats_counts_clipping_speculars_post_trim():
+    """Speculars clip at ~1.0 in the loaded frame whatever the trim did, so
+    the fraction is measured on the loaded pixels, not the divided-out ones."""
+    linear = np.full((10, 10, 3), 0.002, dtype=np.float32)
+    linear[0, :2] = 1.0  # 2 of 100 pixels are clipped speculars
+    mean, highlights = sensor_light_stats(linear, "IMG_0042.CR3", 1.93)
+    assert highlights == pytest.approx(0.02)
+    assert mean < 0.02  # the speculars barely move the divided-out mean
+    # A grey pixel below the clip line is not a specular.
+    assert HIGHLIGHT_CLIP_LUMINANCE > 0.5
 
 
 # ---------------------------------------------------------------------------

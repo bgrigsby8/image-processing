@@ -638,7 +638,10 @@ class ColorCorrection(Camera, EasyResource):
         matches reference to hit nominal brightness without touching camera
         exposure), and a ``delta_e`` report in CIE delta-E*ab 1976 (mean below
         ~3 is a solid calibration; ``after`` is exposure-normalised, so it
-        reflects pure colour accuracy).
+        reflects pure colour accuracy). RAW sources also return
+        ``sensor_mean_luminance`` - the chart frame's light level in the same
+        sensor units capture_result reports, for use as the scene's calibrated
+        reference when checking later captures for underexposure.
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
@@ -688,6 +691,7 @@ class ColorCorrection(Camera, EasyResource):
         # Fit the CCM on patches developed with the SAME white balance the
         # captures will use, so the matrix and the WB stay consistent.
         reference_linear = srgb_to_linear(REFERENCE_SRGB)
+        sensor_mean: Optional[float] = None
         if raw_path:
             linear = load_linear_rgb(
                 raw_path,
@@ -696,6 +700,13 @@ class ColorCorrection(Camera, EasyResource):
                 demosaic=self._demosaic,
             )
             measured_linear = PatchSampler.sample_linear_at_centers(linear, centers, radius)
+            # The chart frame is loaded with no exposure trim, so its mean is
+            # already in sensor units — the same scale capture_result's
+            # sensor_mean_luminance reports. A rig stores this as the scene's
+            # calibrated light level and flags later captures that come in
+            # well below it (a flash firing at the wrong power looks lit to a
+            # misfire check, but not to this comparison).
+            sensor_mean, _ = sensor_light_stats(linear, raw_path, 0.0)
         else:
             measured_linear = PatchSampler.sample_at_centers(
                 detect_img, [(int(x), int(y)) for x, y in centers], radius
@@ -759,6 +770,8 @@ class ColorCorrection(Camera, EasyResource):
             "neutral_brightness": neutral_brightness,
             "delta_e": report,
         }
+        if sensor_mean is not None:
+            result["sensor_mean_luminance"] = sensor_mean
         if wb_note:
             result["white_balance_note"] = wb_note
         return result

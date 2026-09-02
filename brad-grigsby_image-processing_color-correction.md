@@ -115,7 +115,11 @@ copy all three into the matching config attributes to persist the calibration.
 setting it renders captures at the calibrated brightness without re-shooting (use
 it when the flash can't reach the reference optically). Also returns a `delta_e`
 quality report (mean/max color error before vs. after) and a `neutral_brightness`
-readout (measured vs. reference per grey patch).
+readout (measured vs. reference per grey patch). RAW sources also return
+`sensor_mean_luminance` — the chart frame's light level in the same sensor
+units deferred captures report, for use as the scene's calibrated reference
+when checking later captures for underexposure (a flash at the wrong power
+looks lit to a misfire check, but not next to this reference).
 
 ### Capture a corrected still
 

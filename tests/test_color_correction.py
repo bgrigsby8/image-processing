@@ -1218,3 +1218,71 @@ def test_deferred_capture_applies_per_call_ccm(tmp_path):
     assert result["ccm_applied"] is True  # override applied despite identity config
     r, g, _ = _jpeg_channel_means(result["image_base64"])
     assert r < g - 20
+
+
+# ---------------------------------------------------------------------------
+# calibrate_color: the sensor-mean reference for underexposure checks
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_chart_linear():
+    """A 40x60 linear frame holding the 24 reference patches as 10x10 tiles in
+    ColorChecker order, plus the [x, y] centre of each tile."""
+    reference_linear = srgb_to_linear(REFERENCE_SRGB).astype(np.float32)
+    linear = np.zeros((40, 60, 3), dtype=np.float32)
+    centers = []
+    for i in range(24):
+        r, c = divmod(i, 6)
+        linear[r * 10:(r + 1) * 10, c * 10:(c + 1) * 10] = reference_linear[i]
+        centers.append([c * 10 + 5, r * 10 + 5])
+    return linear, centers
+
+
+def test_calibrate_color_reports_sensor_mean_for_raw(monkeypatch):
+    """A RAW calibration returns the chart frame's sensor mean luminance - the
+    reference a rig compares later captures against for underexposure. The
+    frame is loaded with no exposure trim, so the mean is already in sensor
+    units."""
+    import models.color_correction as cc_mod
+
+    linear, centers = _synthetic_chart_linear()
+    monkeypatch.setattr(cc_mod, "load_linear_rgb", lambda path, **kw: linear)
+    monkeypatch.setattr(
+        cc_mod, "render_raw_for_detection",
+        lambda path: (linear_to_srgb(linear) * 255).astype(np.uint8),
+    )
+
+    cc = _component(_FakeSource(saved_path=None))
+    out = asyncio.run(cc.do_command({"calibrate_color": {
+        "path": "/photos/chart.CR3",
+        "patch_centers": centers,
+        "compute_wb": False,
+        "radius": 3,
+    }}))["calibrate_color"]
+
+    luma = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    expected = float(np.mean(linear @ luma))
+    assert out["sensor_mean_luminance"] == pytest.approx(expected, rel=1e-4)
+    # A perfect chart needs no exposure push - sanity that the mocked pipeline
+    # measured what it should have.
+    assert out["exposure_stops"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_calibrate_color_no_sensor_mean_without_raw(tmp_path):
+    """A non-RAW calibration source has no sensor-units frame, so the field is
+    absent rather than misleading."""
+    linear, centers = _synthetic_chart_linear()
+    p = str(tmp_path / "chart.png")
+    Image.fromarray(
+        (linear_to_srgb(linear) * 255).clip(0, 255).astype(np.uint8)
+    ).save(p, format="PNG")
+
+    cc = _component(_FakeSource(saved_path=None))
+    out = asyncio.run(cc.do_command({"calibrate_color": {
+        "path": p,
+        "patch_centers": centers,
+        "compute_wb": False,
+        "radius": 3,
+    }}))["calibrate_color"]
+
+    assert "sensor_mean_luminance" not in out

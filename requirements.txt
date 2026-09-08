@@ -2,7 +2,11 @@ viam-sdk==0.77.0
 typing-extensions
 numpy
 pillow
-rawpy
+# Pinned: LibRaw's output geometry (border crop, so the sensor-frame size a
+# distortion calibration is measured in) can move between versions. The
+# calibration JSON records the rawpy/libraw versions it was made with; bump
+# this and recalibrate (or at least re-run the straight-line check) together.
+rawpy==0.27.0
 tifffile
 # contrib build needed for the cv2.mcc ColorChecker detector (color_correction).
 # Pinned <5: the 5.0.0.93 linux wheels' mcc detector finds no chart in frames

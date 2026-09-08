@@ -71,6 +71,12 @@ installs those automatically on Debian/Ubuntu.
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
 | `upload_dial_timeout_s` | number | Optional  | Deadline for authenticating to app.viam.com on the first `upload`. Default `30`. |
 | `upload_file_timeout_s` | number | Optional  | Per-file deadline for an `upload` transfer (a stalled file fails on its own rather than wedging the submit). Default `180`. |
+| `distortion_calibration` | string | Optional | Path of a lens distortion + lateral CA calibration JSON from `scripts/calibrate_distortion.py` (see the [module README](README.md#lens-distortion-calibration) and [`calibration/README.md`](calibration/README.md)). Every full-size `develop`/`capture` is undistorted right after the demosaic, before the EXIF rotation, WB, CCM, and export. A configured file that is missing or invalid is a configuration error. Absent: the pipeline is unchanged. |
+| `undistort`      | boolean      | Optional  | Apply the calibration. Default `true` when `distortion_calibration` is set; `false` loads and validates it without applying (for A/B comparison). A per-call `undistort` overrides it. |
+| `correct_lateral_ca` | boolean  | Optional  | Also remap R and B by the calibration's lateral CA model (G is the reference). Default `true`; moot for a file without a `lateral_ca` block. |
+| `undistort_interpolation` | string | Optional | Resampling filter on the 16-bit linear data: `cubic` (default), `lanczos4`, or `linear`. |
+| `strict_calibration_match` | boolean | Optional | A lens / `zoom_position` / `focus_position` mismatch between the calibration and what the source camera reported fails the develop instead of warning. Default `false`. A frame-size mismatch is always an error. |
+| `cache_undistort_maps` | boolean | Optional | Keep the remap tables in memory after the first develop (~1.4 GB at 61 MP with CA, ~0.5 GB without; a few seconds to rebuild). Default `true`; set `false` on a memory-constrained rig PC. |
 
 If no `ccm` is given, the component passes images through unchanged (identity
 matrix); the RAW develop still runs (demosaic + export) but applies no color
@@ -142,8 +148,18 @@ Options (all optional): `capture_options` (forwarded to the source's `capture`),
 `white_balance`, `exposure_stops` (exposure compensation applied at the raw
 stage), `tone` (delivery look: `none`/`medium`/`bright`), `sharpen` (capture
 sharpening: `none`/`light`/`medium`/`strong`), `demosaic` (RAW demosaic
-algorithm), `output_formats`, `output_dir`. Each overrides the config default
-for this call.
+algorithm), `output_formats`, `output_dir`, `undistort` (apply the configured
+distortion calibration; a per-call `false` gives an uncorrected frame to
+compare against). Each overrides the config default for this call.
+
+With a `distortion_calibration` configured, the capture also runs the
+calibration match check: the source's `capture` response is read for
+`zoom_position` / `focus_position` (sony-remote reports `focus_position`
+today) and its `get_status` for the mounted `lens`. A mismatch is logged and
+returned in `calibration_warnings` (or fails the capture under
+`strict_calibration_match`); a source without those commands (the ptp model)
+is developed with the match logged as not checked. A frame whose size differs
+from the calibration's `image_size` is always an error.
 
 > **Sharpness:** RAW captures are soft before sharpening — every developer
 > (Capture One, Lightroom) applies a default capture sharpen, so an unsharpened
@@ -166,10 +182,27 @@ Returns:
   "sidecar": "/photos/IMG_0042.json",
   "ccm_applied": true,
   "color_space": "sRGB",
+  "undistorted": true,
+  "lateral_ca_corrected": true,
+  "calibration": {
+    "path": "/opt/nines/calibration/a7rv-selp1635g-16mm-f8.json",
+    "created_at": "2026-09-10T15:42:00Z",
+    "rms_reprojection_px": 0.38,
+    "sha256": "…"
+  },
+  "calibration_warnings": [],
+  "calibration_match_checked": true,
   "image_base64": "<downsized JPEG preview>",
   "mime_type": "image/jpeg"
 }
 ```
+
+`undistorted` / `lateral_ca_corrected` are always present (`false` with no
+calibration configured, for a preview-only capture, or with `undistort:
+false`); `calibration`, `calibration_warnings`, and `calibration_match_checked`
+appear whenever a calibration is configured. The same fields are written to
+the sidecar, so an export can always be traced to the calibration that shaped
+it.
 
 ### Develop existing files (no camera)
 
@@ -189,6 +222,17 @@ Batch several files at once with `paths`:
 A single `path` returns the same shape as `capture` (including a preview). A
 `paths` list returns `{"developed": [ ...per-file results... ], "count": N}`
 with previews omitted to keep the response small.
+
+A `develop` has no capture response to read camera metadata from, so with a
+`distortion_calibration` configured the match check only sees the frame size
+unless you pass what the camera reported when the file was shot:
+`zoom_position`, `focus_position`, and/or `lens`. Without them the develop
+proceeds and logs that the metadata match was not checked
+(`calibration_match_checked: false`).
+
+```json
+{ "develop": { "path": "/photos/DSC00042.ARW", "zoom_position": 0, "focus_position": 1234 } }
+```
 
 ### Upload to Viam
 

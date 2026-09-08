@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/bgrigsby8/image-processing/calibration/schema.json",
+  "title": "image-processing distortion calibration",
+  "description": "Lens distortion + lateral chromatic aberration calibration consumed by color-correction's develop path (src/models/distortion.py). Produced by scripts/calibrate_distortion.py.",
+  "type": "object",
+  "required": ["schema_version", "image_size", "camera_matrix", "dist_coeffs"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "tool": { "type": "string" },
+    "camera": {
+      "type": "object",
+      "description": "Metadata for the match check. Null fields are not compared.",
+      "properties": {
+        "body": { "type": ["string", "null"] },
+        "serial": { "type": ["string", "null"] },
+        "lens": { "type": ["string", "null"] },
+        "zoom_position": { "type": ["integer", "null"], "description": "Sony SDK raw zoom position (sony-remote); the calibration is only valid here." },
+        "focus_position": { "type": ["integer", "null"], "description": "Sony SDK raw focus position (sony-remote)." },
+        "units": { "type": "string", "enum": ["sdk_raw"] },
+        "aperture": { "type": ["string", "null"] },
+        "shutter": { "type": ["string", "null"] },
+        "iso": { "type": ["integer", "null"] }
+      }
+    },
+    "develop": {
+      "type": "object",
+      "description": "Geometry-affecting rawpy.postprocess parameters the calibration frames were developed with (image_io.SENSOR_FRAME_KWARGS) plus library versions.",
+      "properties": {
+        "user_flip": { "const": 0 },
+        "half_size": { "const": false },
+        "note": { "type": "string" },
+        "rawpy_version": { "type": ["string", "null"] },
+        "libraw_version": { "type": ["string", "null"] },
+        "demosaic": { "type": "string" }
+      }
+    },
+    "image_size": {
+      "type": "array",
+      "description": "[width, height] of the rawpy user_flip=0 output. A frame of any other size cannot be undistorted with this file.",
+      "items": { "type": "integer", "minimum": 1 },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "model": { "type": "string", "enum": ["opencv_standard", "opencv_rational"] },
+    "camera_matrix": {
+      "type": "array",
+      "description": "3x3 pinhole intrinsics K (row-major).",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number" } }
+    },
+    "dist_coeffs": {
+      "type": "array",
+      "description": "OpenCV Brown-Conrady coefficients: [k1, k2, p1, p2, k3] (standard) or [k1, k2, p1, p2, k3, k4, k5, k6] (rational).",
+      "items": { "type": "number" },
+      "oneOf": [
+        { "minItems": 5, "maxItems": 5 },
+        { "minItems": 8, "maxItems": 8 }
+      ]
+    },
+    "lateral_ca": {
+      "type": ["object", "null"],
+      "description": "Radial lateral CA model per channel: d_c(p) = (p - c0) * (a0 + a1*rho^2 + a2*rho^4), rho = |p - c0| / r_norm, c0 = principal point from camera_matrix. G is the reference.",
+      "required": ["r_norm", "R", "B"],
+      "properties": {
+        "r_norm": { "type": "number", "exclusiveMinimum": 0, "description": "Half the image diagonal in px." },
+        "R": { "$ref": "#/definitions/caChannel" },
+        "B": { "$ref": "#/definitions/caChannel" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "description": "What the CLI measured. Acceptance: rms <= 0.5 px, per-image max <= 1.0 px, holdout within 20 % of training, no 4x3 cell under 3 frames, centre-crop bow after <= 1.0 px, CA residual <= 0.3 px.",
+      "properties": {
+        "n_frames_detected": { "type": "integer" },
+        "n_frames_failed_detection": { "type": "integer" },
+        "n_frames_used": { "type": "integer" },
+        "n_frames_rejected": { "type": "integer" },
+        "n_holdout": { "type": "integer" },
+        "rms_reprojection_px": { "type": "number" },
+        "holdout_rms_px": { "type": ["number", "null"] },
+        "per_image_rms_px": { "type": "object", "additionalProperties": { "type": "number" } },
+        "holdout_per_image_rms_px": { "type": "object", "additionalProperties": { "type": "number" } },
+        "rejected_frames_rms_px": { "type": "object", "additionalProperties": { "type": "number" } },
+        "detection_failures": { "type": "array", "items": { "type": "string" } },
+        "coverage_grid_4x3": {
+          "type": "array",
+          "description": "Frames contributing at least one corner to each cell; 3 rows of 4 columns, top row first.",
+          "minItems": 3, "maxItems": 3,
+          "items": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "type": "integer", "minimum": 0 } }
+        },
+        "straight_line_test": {
+          "type": "object",
+          "properties": {
+            "frame": { "type": "string" },
+            "max_bow_px_before": { "type": ["number", "null"] },
+            "max_bow_px_after": { "type": ["number", "null"] },
+            "center_crop": {
+              "type": "object",
+              "properties": {
+                "crop": { "type": "string" },
+                "max_bow_px_before": { "type": ["number", "null"] },
+                "max_bow_px_after": { "type": ["number", "null"] }
+              }
+            }
+          }
+        },
+        "invalid_output_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "model_selection": { "type": "string" }
+      }
+    },
+    "sources": { "type": "array", "items": { "type": "string" } },
+    "holdout_sources": { "type": "array", "items": { "type": "string" } },
+    "sha256_of_sources": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "definitions": {
+    "caChannel": {
+      "type": "object",
+      "required": ["coeffs"],
+      "properties": {
+        "coeffs": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number" } },
+        "rms_residual_px": { "type": "number" },
+        "max_shift_px_at_corner": { "type": "number" }
+      }
+    }
+  }
+}

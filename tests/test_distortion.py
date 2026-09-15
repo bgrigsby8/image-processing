@@ -282,6 +282,48 @@ def test_detection_reports_none_when_no_board():
         cd.detect_checkerboard(blank, PATTERN, detect_scale=0.0)
 
 
+def test_refine_corners_returns_a_new_array_and_leaves_the_start_untouched():
+    # Regression: cornerSubPix refines in place and ascontiguousarray returned
+    # the caller's own float32 buffer, so the G, R and B corner sets ended up
+    # as one shared array and the CA fit was an exact zero on real frames.
+    calib = _calib()
+    rvec, tvec, _ = _poses(1, seed=22, tilt=0.3)[0]
+    img = _render_board(calib, rvec, tvec)
+    coarse = cd.detect_checkerboard(cd.to_gray8(img), PATTERN, detect_scale=0.5)
+    assert coarse.dtype == np.float32 and coarse.flags["C_CONTIGUOUS"]
+    start = coarse + np.float32(1.5)
+    snapshot = start.copy()
+    refined = cd.refine_corners(img, start)
+    assert refined is not start
+    assert not np.shares_memory(refined, start)
+    np.testing.assert_array_equal(start, snapshot)
+    assert np.abs(refined - start).max() > 0.5   # it did refine
+
+
+def test_subpix_window_scales_with_the_imaged_square_size():
+    cols, rows = PATTERN
+    grid = np.stack(np.meshgrid(np.arange(cols) * 108.0, np.arange(rows) * 108.0), -1).reshape(-1, 2)
+    assert cd.corner_spacing_px(grid, PATTERN) == pytest.approx(108.0)
+    assert cd.subpix_half_window(108.0) == 22
+    assert cd.subpix_half_window(10.0) == cd.SUBPIX_MIN_HALF_WINDOW
+    assert cd.subpix_half_window(5000.0) == cd.SUBPIX_MAX_HALF_WINDOW
+
+
+def test_soft_board_refinement_does_not_degrade_the_coarse_corners():
+    # A soft edge (wide lens, f/8, 61 MP) wider than an 11x11 window made the
+    # fixed-window refinement wander several px; the spacing-scaled window
+    # must stay at least as good as the SB detector's coarse result.
+    calib = _calib()
+    rvec, tvec, truth = _poses(1, seed=23, tilt=0.2)[0]
+    img = _render_board(calib, rvec, tvec, blur=3.0)
+    coarse = cd.detect_checkerboard(cd.to_gray8(img), PATTERN, detect_scale=0.5)
+    half = cd.subpix_half_window(cd.corner_spacing_px(coarse, PATTERN))
+    assert half > cd.SUBPIX_MIN_HALF_WINDOW
+    coarse_err = _match_to_truth(coarse, truth).max()
+    refined_err = _match_to_truth(cd.refine_corners(img, coarse, half), truth).max()
+    assert refined_err <= max(coarse_err, 0.3) + 0.05, (coarse_err, refined_err)
+
+
 def test_stretch_for_detection_gamma_encodes_between_percentiles():
     lin = np.linspace(0.0, 0.25, 10000, dtype=np.float32).reshape(100, 100)
     out = cd.stretch_for_detection(lin)

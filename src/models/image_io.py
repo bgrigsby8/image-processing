@@ -32,7 +32,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageCms
@@ -171,6 +171,57 @@ def _rawpy_wb_kwargs(white_balance: Union[str, Sequence[float], None]) -> dict:
     return {"user_wb": mults}
 
 
+# libraw's ``flip`` codes (from the EXIF orientation) -> the np.rot90 ``k``
+# that reproduces libraw's own rotation. Verified byte-identical against
+# libraw rotating for itself (``user_flip=3/5/6`` vs ``user_flip=0`` + rot90)
+# on a flip=6 CR3. Mirrored EXIF orientations are not in the table because
+# libraw never mirrors; it collapses them to these four.
+_LIBRAW_FLIP_TO_ROT90: Dict[int, int] = {0: 0, 3: 2, 5: 1, 6: -1}
+
+#: The geometry-affecting rawpy parameters that define the **sensor frame** -
+#: the pixel frame the distortion calibration is measured in and applied to.
+#: Everything else in ``load_linear_rgb`` (white balance, exposure, colour
+#: space, demosaic algorithm) changes pixel *values*, not their positions.
+#: ``calibrate_distortion`` imports this so the CLI and the production develop
+#: can't drift apart.
+SENSOR_FRAME_KWARGS: Dict[str, object] = {"user_flip": 0, "half_size": False}
+
+
+def sensor_frame_record() -> Dict[str, object]:
+    """The ``develop`` block a distortion calibration records: the sensor-frame
+    parameters plus the rawpy/LibRaw versions, because LibRaw's border crop
+    (and so the output size) can move between versions."""
+    record: Dict[str, object] = dict(SENSOR_FRAME_KWARGS)
+    record["note"] = "geometry-affecting rawpy.postprocess params used"
+    if rawpy is not None:
+        record["rawpy_version"] = getattr(rawpy, "__version__", None)
+        libraw = getattr(rawpy, "libraw_version", None)
+        record["libraw_version"] = (
+            ".".join(str(v) for v in libraw) if libraw is not None else None
+        )
+    return record
+
+
+def apply_orientation(img: np.ndarray, flip: int) -> np.ndarray:
+    """
+    Rotate a sensor-frame (``user_flip=0``) decode the way libraw would have
+    for ``flip`` (0 / 3 / 5 / 6). Rotation is lossless, so the result is
+    pixel-identical to letting libraw rotate - but doing it here, *after* any
+    sensor-frame transform, is what keeps a distortion map from being rotated
+    underneath us by the camera's orientation sensor. The result is made
+    contiguous so callers see the same layout libraw would have produced.
+    """
+    if flip not in _LIBRAW_FLIP_TO_ROT90:
+        raise ValueError(
+            f"unknown libraw flip {flip!r}; expected one of "
+            f"{sorted(_LIBRAW_FLIP_TO_ROT90)}"
+        )
+    k = _LIBRAW_FLIP_TO_ROT90[flip]
+    if k == 0:
+        return img
+    return np.ascontiguousarray(np.rot90(img, k))
+
+
 def load_linear_rgb(
     path: str,
     *,
@@ -179,6 +230,7 @@ def load_linear_rgb(
     user_flip: Optional[int] = None,
     half_size: bool = False,
     demosaic: str = DEFAULT_DEMOSAIC,
+    sensor_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> np.ndarray:
     """
     Load an image file into a **linear-light** float32 RGB array in [0, 1],
@@ -193,6 +245,13 @@ def load_linear_rgb(
     auto-rotate from EXIF). Pass ``0`` to disable rotation so the output lines
     up pixel-for-pixel with ``raw_image_visible`` / ``render_raw_for_detection``
     - used during color calibration so detected patch centres map across renders.
+    Internally every RAW is demosaiced in that unrotated **sensor frame** and
+    rotated afterwards with ``apply_orientation`` (pixel-identical to libraw's
+    own rotation), so that ``sensor_transform`` - an optional hook such as
+    ``distortion.Undistorter.apply`` - always sees the frame the distortion
+    calibration was measured in, whatever the camera's orientation sensor said
+    for this shot. Non-RAW inputs have no EXIF rotation step; the hook is
+    applied to the decoded array as-is.
 
     ``half_size`` demosaics RAW at half resolution (each 2x2 CFA quad becomes
     one pixel - roughly 4x faster). Only for preview/throwaway renders; deliver
@@ -238,8 +297,9 @@ def load_linear_rgb(
                     f"{np.log2(shift):+.2f} stops instead"
                 )
             kwargs["exp_shift"] = shift
-        if user_flip is not None:
-            kwargs["user_flip"] = int(user_flip)
+        # Always demosaic in the sensor frame; the EXIF (or requested)
+        # rotation is applied below, after the sensor_transform hook.
+        kwargs["user_flip"] = 0
         if half_size:
             kwargs["half_size"] = True
         name = os.path.basename(path)
@@ -247,13 +307,24 @@ def load_linear_rgb(
         label = "16-bit linear (half size)" if half_size else "16-bit linear"
         with log_duration(LOGGER, f"demosaic {name} ({size_mb:.1f} MB) to {label}"):
             with rawpy.imread(path) as raw:
+                # sizes.flip is the camera's EXIF orientation as libraw would
+                # apply it; read it before postprocess, which may overwrite it
+                # with the user_flip we pass.
+                flip = int(raw.sizes.flip) if user_flip is None else int(user_flip)
                 rgb16 = raw.postprocess(**kwargs)
-        return (np.asarray(rgb16, dtype=np.float32) / 65535.0)
+        linear = np.asarray(rgb16, dtype=np.float32) / 65535.0
+        if sensor_transform is not None:
+            with log_duration(LOGGER, f"sensor-frame transform on {name}"):
+                linear = sensor_transform(linear)
+        return apply_orientation(linear, flip)
 
     with log_duration(LOGGER, f"decode + linearize {os.path.basename(path)}"):
         with Image.open(path) as img:
             arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-        return srgb_to_linear(arr).astype(np.float32)
+        linear = srgb_to_linear(arr).astype(np.float32)
+    if sensor_transform is not None:
+        linear = sensor_transform(linear)
+    return linear
 
 
 def applied_exposure_shift(path: str, exposure_stops: float) -> float:

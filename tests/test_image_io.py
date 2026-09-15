@@ -1,6 +1,7 @@
 """Tests for image_io: decode, transfer functions, WB option parsing, exports."""
 
 import base64
+import os
 from io import BytesIO
 
 import numpy as np
@@ -10,6 +11,8 @@ from PIL import Image
 from models.image_io import (
     EXPORT_FORMATS,
     HIGHLIGHT_CLIP_LUMINANCE,
+    SENSOR_FRAME_KWARGS,
+    apply_orientation,
     crop_linear,
     image_dimensions,
     TONE_OPTIONS,
@@ -23,6 +26,7 @@ from models.image_io import (
     linear_to_jpeg_base64,
     linear_to_srgb,
     load_linear_rgb,
+    sensor_frame_record,
     sensor_light_stats,
     srgb_to_linear,
 )
@@ -265,13 +269,24 @@ class _FakeRawpy:
         DHT = _Algo()
         AHD = _Algo()
 
-    def __init__(self):
+    def __init__(self, flip=0, frame=None):
         self.postprocess_kwargs = None
+        self.flip = flip
+        # The "sensor frame" the fake demosaics to (HxWx3 uint16).
+        self.frame = (
+            frame if frame is not None
+            else np.arange(4 * 6 * 3, dtype=np.uint16).reshape(4, 6, 3)
+        )
 
     def imread(self, path):
         fake = self
 
+        class _Sizes:
+            flip = fake.flip
+
         class _Raw:
+            sizes = _Sizes()
+
             def __enter__(self):
                 return self
 
@@ -280,7 +295,7 @@ class _FakeRawpy:
 
             def postprocess(self, **kwargs):
                 fake.postprocess_kwargs = kwargs
-                return np.zeros((4, 4, 3), dtype=np.uint16)
+                return fake.frame.copy()
 
         return _Raw()
 
@@ -302,6 +317,107 @@ def test_load_linear_rgb_half_size_passthrough(tmp_path, monkeypatch):
     assert "half_size" not in fake.postprocess_kwargs
     # full-size decode requests the configured demosaic algorithm.
     assert fake.postprocess_kwargs["demosaic_algorithm"] is _FakeRawpy.DemosaicAlgorithm.DHT
+
+
+# ---------------------------------------------------------------------------
+# Sensor frame: RAW is demosaiced with user_flip=0 and rotated afterwards, so a
+# sensor_transform (the distortion undistorter) always sees the frame the
+# calibration was measured in, whatever the camera's orientation sensor said.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flip, k", [(0, 0), (3, 2), (5, 1), (6, -1)])
+def test_apply_orientation_reproduces_libraw_flip_codes(flip, k):
+    img = np.arange(4 * 6 * 3, dtype=np.float32).reshape(4, 6, 3)
+    out = apply_orientation(img, flip)
+    assert np.array_equal(out, np.rot90(img, k))
+    assert out.flags["C_CONTIGUOUS"]
+
+
+def test_apply_orientation_rejects_unknown_flip():
+    with pytest.raises(ValueError, match="unknown libraw flip"):
+        apply_orientation(np.zeros((2, 2, 3), np.float32), 7)
+
+
+def test_raw_decode_always_asks_libraw_for_the_sensor_frame(tmp_path, monkeypatch):
+    """Whatever orientation the file carries, libraw is asked for user_flip=0
+    and the rotation is done here - and the result still matches what libraw's
+    own rotation would have produced (rot90 by the flip code)."""
+    import models.image_io as image_io
+
+    fake = _FakeRawpy(flip=6)
+    monkeypatch.setattr(image_io, "rawpy", fake)
+    raw_path = tmp_path / "IMG_0042.CR3"
+    raw_path.write_bytes(b"not really a raw")
+
+    out = load_linear_rgb(str(raw_path))
+    assert fake.postprocess_kwargs["user_flip"] == 0
+    expected = np.rot90(fake.frame.astype(np.float32) / 65535.0, -1)
+    assert out.shape == (6, 4, 3)
+    assert np.array_equal(out, expected)
+
+    # An explicit user_flip wins over the file's orientation.
+    out0 = load_linear_rgb(str(raw_path), user_flip=0)
+    assert fake.postprocess_kwargs["user_flip"] == 0
+    assert out0.shape == (4, 6, 3)
+    assert np.array_equal(out0, fake.frame.astype(np.float32) / 65535.0)
+
+
+def test_sensor_transform_runs_in_the_unrotated_frame(tmp_path, monkeypatch):
+    import models.image_io as image_io
+
+    fake = _FakeRawpy(flip=5)
+    monkeypatch.setattr(image_io, "rawpy", fake)
+    raw_path = tmp_path / "IMG_0042.CR3"
+    raw_path.write_bytes(b"not really a raw")
+
+    seen = {}
+
+    def transform(img):
+        seen["shape"] = img.shape
+        return img * 0.5
+
+    out = load_linear_rgb(str(raw_path), sensor_transform=transform)
+    # The hook saw the sensor frame (4x6), not the rotated 6x4 result...
+    assert seen["shape"] == (4, 6, 3)
+    # ...and its output is what got rotated.
+    expected = np.rot90(fake.frame.astype(np.float32) / 65535.0 * 0.5, 1)
+    assert np.array_equal(out, expected)
+
+
+def test_sensor_transform_applies_to_non_raw_inputs_too(tmp_path):
+    p = str(tmp_path / "still.png")
+    Image.fromarray(np.full((8, 10, 3), 128, np.uint8)).save(p)
+    out = load_linear_rgb(p, sensor_transform=lambda img: img[:4, :5])
+    assert out.shape == (4, 5, 3)
+
+
+def test_sensor_frame_record_names_the_geometry_params():
+    record = sensor_frame_record()
+    assert record["user_flip"] == 0
+    assert record["half_size"] is False
+    assert "libraw_version" in record and "rawpy_version" in record
+    assert SENSOR_FRAME_KWARGS == {"user_flip": 0, "half_size": False}
+
+
+_REAL_CR3 = os.path.join(os.path.dirname(__file__), "..", "raw.CR3")
+
+
+@pytest.mark.skipif(not os.path.exists(_REAL_CR3), reason="needs the local raw.CR3 (gitignored)")
+def test_explicit_rotation_is_byte_identical_to_libraw_rotating(monkeypatch):
+    """On a real flip=6 file, decoding in the sensor frame and rotating here
+    must reproduce libraw's own EXIF rotation exactly - the no-calibration
+    pipeline stays byte-identical to the pre-hook behaviour."""
+    import rawpy
+
+    with rawpy.imread(_REAL_CR3) as raw:
+        assert raw.sizes.flip != 0, "this check needs a rotated file"
+        libraw = raw.postprocess(
+            output_bps=16, gamma=(1, 1), no_auto_bright=True,
+            output_color=rawpy.ColorSpace.sRGB, use_camera_wb=True, half_size=True,
+        )
+    ours = load_linear_rgb(_REAL_CR3, half_size=True)
+    assert ours.shape == libraw.shape
+    assert np.array_equal(ours, libraw.astype(np.float32) / 65535.0)
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,23 @@ Two ways to get corrected images out of this component:
    this call only. The config ``ccm`` stays the default when the option is
    absent.
 
+   Lens distortion + lateral chromatic aberration (see distortion.py): with a
+   ``distortion_calibration`` JSON configured (produced by
+   ``scripts/calibrate_distortion.py`` from checkerboard ARWs), every
+   full-size develop is undistorted right after the demosaic, in the sensor
+   frame, before the EXIF rotation, WB, CCM, and export - so the webapp crops
+   an already-corrected frame. Related attributes: ``undistort`` (true),
+   ``correct_lateral_ca`` (true), ``undistort_interpolation`` ("cubic" |
+   "lanczos4" | "linear"), ``strict_calibration_match`` (false: a lens / zoom
+   / focus mismatch warns instead of failing), ``cache_undistort_maps``
+   (true: ~1.4 GB of remap tables held for the process lifetime at 61 MP).
+   ``capture`` / ``develop`` results carry ``undistorted``,
+   ``lateral_ca_corrected``, ``calibration`` {path, created_at,
+   rms_reprojection_px, sha256} and ``calibration_warnings`` as the audit
+   trail. Half-size decodes (deferred-capture previews, ``preview``) and the
+   streaming ``get_images`` path are never undistorted. Without the
+   attribute the pipeline is byte-identical to a build without this feature.
+
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
            -> develop existing RAW/image file(s) already on disk through the
@@ -139,6 +156,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -180,6 +198,14 @@ from models.calibration import (
     _neutral_brightness_report,
     delta_e76,
     detect_colorchecker,
+)
+from models.distortion import (
+    INTERPOLATIONS as UNDISTORT_INTERPOLATIONS,
+    CalibrationError,
+    CalibrationMismatch,
+    DistortionCalibration,
+    Undistorter,
+    file_sha256,
 )
 from models.image_io import (
     DEFAULT_DEMOSAIC,
@@ -287,6 +313,31 @@ class ColorCorrection(Camera, EasyResource):
         if demosaic is not None and demosaic not in DEMOSAIC_ALGORITHMS:
             raise ValueError(f"`demosaic` must be one of {list(DEMOSAIC_ALGORITHMS)}")
 
+        calibration = attrs.get("distortion_calibration")
+        if calibration is not None:
+            if not isinstance(calibration, str) or not calibration:
+                raise ValueError(
+                    "`distortion_calibration` must be the path of a calibration JSON"
+                )
+            if not os.path.isfile(calibration):
+                # Configured but absent is an error, never a silent skip: the
+                # operator asked for corrected frames and would get raw ones.
+                raise ValueError(
+                    f"`distortion_calibration` file not found: {calibration}"
+                )
+        interpolation = attrs.get("undistort_interpolation")
+        if interpolation is not None and interpolation not in UNDISTORT_INTERPOLATIONS:
+            raise ValueError(
+                f"`undistort_interpolation` must be one of "
+                f"{sorted(UNDISTORT_INTERPOLATIONS)}"
+            )
+        for flag in (
+            "undistort", "correct_lateral_ca", "strict_calibration_match",
+            "cache_undistort_maps",
+        ):
+            if flag in attrs and not isinstance(attrs[flag], bool):
+                raise ValueError(f"`{flag}` must be true or false")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -340,6 +391,10 @@ class ColorCorrection(Camera, EasyResource):
         self._sharpen: str = attrs.get("sharpen") or "none"
         self._demosaic: str = attrs.get("demosaic") or DEFAULT_DEMOSAIC
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
+
+        # Lens distortion / lateral CA correction, applied in `develop` and
+        # `capture` when a calibration file is configured (distortion.py).
+        self._configure_undistorter(attrs)
 
         # Local-disk hygiene, mirroring ptp's `delete_after_download`: once a
         # file is confirmed in the cloud, the local copy is redundant. Files
@@ -503,10 +558,13 @@ class ColorCorrection(Camera, EasyResource):
         white_balance: Any,
         exposure_stops: float,
         half_size: bool = False,
+        sensor_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ) -> Tuple[np.ndarray, Optional[str]]:
         """
         Turn a source camera's ``capture`` DoCommand response into a
         **linear-light** float RGB array (sRGB primaries) plus the source path.
+        ``sensor_transform`` (the undistorter hook) only applies to a file on
+        disk: an inline JPEG is neither full size nor in the sensor frame.
 
         Two shapes are supported, in priority order:
 
@@ -532,7 +590,7 @@ class ColorCorrection(Camera, EasyResource):
             linear = load_linear_rgb(
                 str(path), white_balance=white_balance,
                 exposure_stops=exposure_stops, half_size=half_size,
-                demosaic=self._demosaic,
+                demosaic=self._demosaic, sensor_transform=sensor_transform,
             )
             return linear, str(path)
 
@@ -800,6 +858,8 @@ class ColorCorrection(Camera, EasyResource):
                                to skip exports (preview-only capture - develop
                                the RAW later with the ``develop`` command)
           ``output_dir``       where to write exports (default: next to the source file)
+          ``undistort``        override the configured `undistort` for this call
+                               (needs a `distortion_calibration`)
           ``defer``            true -> return as soon as the shutter has fired
                                (the rig is free to move); download/decode/preview
                                continue in the background and are fetched with
@@ -836,22 +896,38 @@ class ColorCorrection(Camera, EasyResource):
             f"{time.perf_counter() - start:.2f}s"
         )
 
+        # What the source reported about this shot, for the calibration match
+        # check: sony-remote's capture carries focus_position (and, once it
+        # logs it, zoom_position); the mounted lens comes from get_status.
+        source_meta: Dict[str, Any] = {}
+        if self._undistort_wanted(opts) and not preview_only and isinstance(capture, Mapping):
+            source_meta = {
+                key: capture.get(key) for key in ("zoom_position", "focus_position")
+            }
+            source_meta["lens"] = await self._source_lens(timeout)
+        # A preview-only capture decodes at half size, which is not the
+        # calibration frame - it is never undistorted.
+        transform, undistort_info = self._undistort_plan(
+            opts, source_meta, active=not preview_only
+        )
+
         t_decode = time.perf_counter()
         # The decode and develop/export steps are seconds of pure CPU; run them
         # in a worker thread so the event loop keeps serving other requests.
         linear, source_path = await asyncio.to_thread(
             self._linear_from_capture_response,
-            capture, white_balance, exposure_stops, preview_only,
+            capture, white_balance, exposure_stops, preview_only, transform,
         )
         self.logger.debug(
-            f"[timing] decode to linear RGB (incl. white balance): "
+            f"[timing] decode to linear RGB (incl. white balance"
+            f"{' + undistort' if undistort_info.get('undistorted') else ''}): "
             f"{time.perf_counter() - t_decode:.2f}s"
         )
         result = await asyncio.to_thread(
             self._develop_one,
             linear, source_path, white_balance, exposure_stops, formats,
             out_dir_override, True, tone, sharpen,
-            corrector=corrector,
+            corrector=corrector, undistort_info=undistort_info,
         )
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
@@ -1038,6 +1114,15 @@ class ColorCorrection(Camera, EasyResource):
                              developed more than once - e.g. an uncropped master
                              plus a cropped variant - without the second pass
                              overwriting the first's exports.
+          ``undistort``      override the configured `undistort` for this call
+                             (a before/after comparison; needs a configured
+                             `distortion_calibration`)
+          ``zoom_position`` / ``focus_position`` / ``lens``
+                             what the camera reported when this file was shot,
+                             for the calibration match check. A `develop` has
+                             no capture to read them from, so pass them if you
+                             have them; otherwise the match is logged as not
+                             checked (size is always checked).
         """
         raw_paths = opts.get("paths")
         single = raw_paths is None
@@ -1070,12 +1155,15 @@ class ColorCorrection(Camera, EasyResource):
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
             t_file = time.perf_counter()
+            # One plan per file: its info dict is filled in by the hook as the
+            # file decodes and lands in that file's result.
+            transform, undistort_info = self._undistort_plan(opts)
             # Decode + export are seconds of pure CPU per file; keep them off
             # the event loop so other requests stay responsive mid-batch.
             linear = await asyncio.to_thread(
                 load_linear_rgb,
                 path, white_balance=white_balance, exposure_stops=exposure_stops,
-                demosaic=self._demosaic,
+                demosaic=self._demosaic, sensor_transform=transform,
             )
             results.append(
                 await asyncio.to_thread(
@@ -1090,6 +1178,7 @@ class ColorCorrection(Camera, EasyResource):
                     crop=crop,
                     output_stem=output_stem,
                     corrector=corrector,
+                    undistort_info=undistort_info,
                 )
             )
             self.logger.debug(
@@ -1217,21 +1306,27 @@ class ColorCorrection(Camera, EasyResource):
         crop: Optional[Tuple[float, float, float, float]] = None,
         output_stem: Optional[str] = None,
         corrector: Optional[ColorCorrector] = None,
+        undistort_info: Optional[Dict[str, ValueTypes]] = None,
     ) -> Dict[str, ValueTypes]:
         """
         Shared core for ``capture`` and ``develop``: apply the CCM in linear
         light, write the rendered exports (non-destructively) and a sidecar, and
-        return the result. ``linear`` is linear-light float RGB; ``source_path``
-        is the originating file (or None for an inline base64 capture).
+        return the result. ``linear`` is linear-light float RGB (already
+        undistorted when a calibration applied - that happens inside the
+        decode, see ``_undistort_plan``); ``source_path`` is the originating
+        file (or None for an inline base64 capture).
 
         ``crop`` is a normalized (x, y, w, h) rect applied before the color math;
         ``output_stem`` overrides the export/sidecar filename stem so a cropped
         variant can sit next to the uncropped master without clobbering it;
         ``corrector`` is the per-call CCM override (None means the configured
-        matrix).
+        matrix); ``undistort_info`` is the distortion audit trail from
+        ``_undistort_plan`` (None means no calibration was in play).
         """
         if corrector is None:
             corrector = self.corrector
+        if undistort_info is None:
+            undistort_info = {"undistorted": False, "lateral_ca_corrected": False}
         if crop is not None:
             linear = crop_linear(linear, *crop)
 
@@ -1286,6 +1381,7 @@ class ColorCorrection(Camera, EasyResource):
                     os.path.join(out_dir, stem + ".json")
                     if output_stem and out_dir else None
                 ),
+                undistort_info=undistort_info,
             )
 
         result: Dict[str, ValueTypes] = {
@@ -1295,6 +1391,9 @@ class ColorCorrection(Camera, EasyResource):
             "ccm_applied": not corrector.is_identity,
             "color_space": "sRGB",
         }
+        # The distortion audit trail: whether this frame was undistorted / CA
+        # corrected, which calibration file did it, and any metadata warnings.
+        result.update(undistort_info)
         if crop is not None:
             result["crop"] = list(crop)
         if include_preview:
@@ -1321,6 +1420,7 @@ class ColorCorrection(Camera, EasyResource):
         crop: Optional[Tuple[float, float, float, float]] = None,
         dest: Optional[str] = None,
         corrector: Optional[ColorCorrector] = None,
+        undistort_info: Optional[Mapping[str, ValueTypes]] = None,
     ) -> str:
         """
         Write a ``<stem>.json`` sidecar next to the (untouched) source file
@@ -1351,9 +1451,202 @@ class ColorCorrection(Camera, EasyResource):
             "output_formats": list(formats),
             "exports": {k: os.path.basename(v) for k, v in exports.items()},
         }
+        if undistort_info:
+            record["undistorted"] = bool(undistort_info.get("undistorted", False))
+            record["lateral_ca_corrected"] = bool(
+                undistort_info.get("lateral_ca_corrected", False)
+            )
+            if undistort_info.get("calibration") is not None:
+                record["distortion_calibration"] = undistort_info["calibration"]
+                record["calibration_warnings"] = list(
+                    undistort_info.get("calibration_warnings") or []
+                )
         with open(sidecar_path, "w") as f:
             json.dump(record, f, indent=2)
         return sidecar_path
+
+    # ------------------------------------------------------------------
+    # Lens distortion / lateral CA (distortion.py)
+    # ------------------------------------------------------------------
+
+    def _configure_undistorter(self, attrs: Mapping[str, Any]) -> None:
+        """
+        Load and validate the calibration named by ``distortion_calibration``
+        and build the ``Undistorter``. A configured file that is missing or
+        unparseable is a configuration error - never a silent skip, because
+        the operator asked for corrected frames and would quietly get raw
+        ones. With nothing configured the develop path is untouched.
+        """
+        path = attrs.get("distortion_calibration") or None
+        self._undistort_enabled: bool = bool(attrs.get("undistort", True))
+        self._correct_ca: bool = bool(attrs.get("correct_lateral_ca", True))
+        self._undistort_interpolation: str = (
+            attrs.get("undistort_interpolation") or "cubic"
+        )
+        self._strict_calibration_match: bool = bool(
+            attrs.get("strict_calibration_match", False)
+        )
+        self._cache_undistort_maps: bool = bool(attrs.get("cache_undistort_maps", True))
+
+        previous: Optional[Undistorter] = getattr(self, "_undistorter", None)
+        previous_key = getattr(self, "_undistorter_key", None)
+        self._undistorter: Optional[Undistorter] = None
+        self._undistorter_key: Optional[Tuple] = None
+        self._calibration: Optional[DistortionCalibration] = None
+        self._calibration_path: Optional[str] = None
+        self._calibration_sha256: Optional[str] = None
+        if not path:
+            return
+
+        try:
+            calib = DistortionCalibration.load(str(path))
+            sha = file_sha256(str(path))
+        except (CalibrationError, OSError) as exc:
+            raise ValueError(
+                f"`distortion_calibration` {path!r} could not be loaded: {exc}"
+            ) from exc
+        self._calibration = calib
+        self._calibration_path = str(path)
+        self._calibration_sha256 = sha
+
+        # Keep the previous instance - and its cached maps - when nothing that
+        # shapes them changed: a reconfigure for an unrelated attribute must
+        # not cost a multi-second, ~1.4 GB map rebuild.
+        key = (
+            sha, self._undistort_interpolation, self._correct_ca,
+            self._cache_undistort_maps,
+        )
+        if previous is not None and previous_key == key:
+            self._undistorter = previous
+        else:
+            self._undistorter = Undistorter(
+                calib,
+                interpolation=self._undistort_interpolation,
+                correct_ca=self._correct_ca,
+                cache_maps=self._cache_undistort_maps,
+            )
+        self._undistorter_key = key
+
+        cam = calib.camera_meta()
+        quality = calib.quality_meta()
+        self.logger.info(
+            f"distortion calibration {os.path.basename(str(path))}: "
+            f"lens {cam.get('lens')!r} zoom={cam.get('zoom_position')} "
+            f"focus={cam.get('focus_position')}, "
+            f"{calib.image_size[0]}x{calib.image_size[1]} {calib.model}, "
+            f"rms {quality.get('rms_reprojection_px')} px "
+            f"(holdout {quality.get('holdout_rms_px')} px), "
+            f"{quality.get('n_frames_used')} frames, created {calib.meta.get('created_at')}; "
+            f"lateral CA {'on' if self._undistorter.corrects_lateral_ca else 'off'}; "
+            f"maps {self._undistorter.map_memory_bytes / 1e6:.0f} MB "
+            f"{'cached after first use' if self._cache_undistort_maps else 'rebuilt per develop'}"
+            + ("" if self._undistort_enabled else "; `undistort` is false - loaded but not applied")
+        )
+
+    def _undistort_wanted(self, opts: Mapping[str, Any]) -> bool:
+        """Whether this call would undistort: a calibration is loaded and the
+        per-call ``undistort`` (or the config default) says so."""
+        return self._undistorter is not None and bool(
+            opts.get("undistort", self._undistort_enabled)
+        )
+
+    async def _source_lens(self, timeout: Optional[float]) -> Optional[str]:
+        """
+        Best effort: sony-remote's ``get_status`` reports the mounted lens;
+        the ptp (Canon) model has no such command. Only asked when a
+        calibration is in play, and a failure just leaves the lens unchecked.
+        """
+        try:
+            resp = await self.camera.do_command({"get_status": {}}, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - optional metadata
+            self.logger.debug(
+                f"source lens unavailable for the calibration match check: {exc}"
+            )
+            return None
+        status = resp.get("get_status", resp) if isinstance(resp, Mapping) else {}
+        lens = status.get("lens") if isinstance(status, Mapping) else None
+        return str(lens) if lens else None
+
+    def _undistort_plan(
+        self,
+        opts: Mapping[str, Any],
+        source_meta: Optional[Mapping[str, Any]] = None,
+        *,
+        active: bool = True,
+    ) -> Tuple[Optional[Callable[[np.ndarray], np.ndarray]], Dict[str, ValueTypes]]:
+        """
+        Decide whether a develop gets undistorted and build the sensor-frame
+        hook ``load_linear_rgb`` runs right after the demosaic (before the
+        EXIF rotation, WB is already in). Returns ``(transform, info)``:
+        ``transform`` is None when nothing applies; ``info`` is the audit
+        trail merged into the response and sidecar, filled in by the hook as
+        the frame decodes.
+
+        The hook runs the match check with the decoded size plus whatever is
+        known about the shot - ``source_meta`` from the capture response, or
+        ``zoom_position`` / ``focus_position`` / ``lens`` passed in ``opts``.
+        A size mismatch is always an error (the maps cannot apply); the rest
+        warn, or error under ``strict_calibration_match``. Nothing known ->
+        logged as not checked rather than failing.
+        """
+        info: Dict[str, ValueTypes] = {"undistorted": False, "lateral_ca_corrected": False}
+        if self._undistorter is None or self._calibration is None:
+            return None, info
+        calib = self._calibration
+        info["calibration"] = {
+            "path": self._calibration_path,
+            "created_at": calib.meta.get("created_at"),
+            "rms_reprojection_px": calib.quality_meta().get("rms_reprojection_px"),
+            "sha256": self._calibration_sha256,
+        }
+        info["calibration_warnings"] = []
+        if not active or not self._undistort_wanted(opts):
+            return None, info
+
+        meta: Dict[str, Any] = {
+            k: v for k, v in (source_meta or {}).items() if v is not None
+        }
+        for key in ("zoom_position", "focus_position", "lens"):
+            if opts.get(key) is not None:
+                meta[key] = opts[key]
+        undistorter = self._undistorter
+        strict = self._strict_calibration_match
+        logger = self.logger
+
+        def _int(value: Any) -> Optional[int]:
+            return None if value is None else int(value)
+
+        def transform(img: np.ndarray) -> np.ndarray:
+            h, w = img.shape[:2]
+            size_problem = calib.check_match(image_size=(w, h))
+            if size_problem:
+                raise CalibrationMismatch(size_problem[0])
+            warnings = calib.check_match(
+                image_size=None,
+                lens=meta.get("lens"),
+                zoom_position=_int(meta.get("zoom_position")),
+                focus_position=_int(meta.get("focus_position")),
+            )
+            if warnings and strict:
+                raise CalibrationMismatch(
+                    "strict_calibration_match: " + "; ".join(warnings)
+                )
+            for message in warnings:
+                logger.warning(f"distortion calibration mismatch: {message}")
+            checked = any(meta.get(k) is not None for k in ("zoom_position", "focus_position", "lens"))
+            if not checked:
+                logger.info(
+                    "distortion calibration metadata not checked for this develop "
+                    "(no zoom/focus/lens reported); frame size matched"
+                )
+            info["calibration_match_checked"] = checked
+            info["calibration_warnings"] = list(warnings)
+            out = undistorter.apply(img)
+            info["undistorted"] = True
+            info["lateral_ca_corrected"] = undistorter.corrects_lateral_ca
+            return out
+
+        return transform, info
 
     @staticmethod
     def _parse_crop(

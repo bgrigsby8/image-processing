@@ -402,6 +402,17 @@ def _component(source, output_dir=None):
     cc._upload_file_timeout_s = 180.0
     cc._pending_captures = {}
     cc._capture_seq = 0
+    # No distortion calibration unless a test installs one (_with_calibration).
+    cc._undistorter = None
+    cc._undistorter_key = None
+    cc._calibration = None
+    cc._calibration_path = None
+    cc._calibration_sha256 = None
+    cc._undistort_enabled = True
+    cc._correct_ca = True
+    cc._undistort_interpolation = "cubic"
+    cc._strict_calibration_match = False
+    cc._cache_undistort_maps = True
     return cc
 
 
@@ -1286,3 +1297,278 @@ def test_calibrate_color_no_sensor_mean_without_raw(tmp_path):
     }}))["calibrate_color"]
 
     assert "sensor_mean_luminance" not in out
+
+
+# ---------------------------------------------------------------------------
+# Lens distortion / lateral CA integration (distortion.py). A small synthetic
+# calibration (200x100 "sensor frame", heavy barrel) stands in for the real
+# file; the develop path is exercised end to end on PNG stills of that size.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from google.protobuf.struct_pb2 import Struct
+from viam.components.camera import Camera
+from viam.proto.app.robot import ComponentConfig
+
+from models.distortion import CalibrationMismatch, DistortionCalibration, LateralCA, Undistorter
+
+_CAL_W, _CAL_H = 200, 100
+
+
+def _synthetic_calibration(tmp_path, name="cal.json", with_ca=True, **camera):
+    """Write a calibration JSON for a 200x100 frame with strong barrel."""
+    k = np.array([[150.0, 0.0, 100.0], [0.0, 150.0, 50.0], [0.0, 0.0, 1.0]])
+    dist = np.array([-0.25, 0.05, 0.0, 0.0, 0.0])
+    ca = LateralCA(r_norm=float(np.hypot(_CAL_W, _CAL_H) / 2), coeffs_r=(0.004, 0.0, 0.0),
+                   coeffs_b=(-0.003, 0.0, 0.0)) if with_ca else None
+    meta = {
+        "created_at": "2026-09-10T15:42:00Z",
+        "camera": {"lens": "FE PZ 16-35mm F4 G", "zoom_position": 0, "focus_position": 1234, **camera},
+        "quality": {"rms_reprojection_px": 0.38, "holdout_rms_px": 0.42, "n_frames_used": 31},
+    }
+    calib = DistortionCalibration((_CAL_W, _CAL_H), k, dist, ca, meta)
+    path = str(tmp_path / name)
+    calib.save(path)
+    return path, calib
+
+
+def _with_calibration(cc, path, **attrs):
+    """Install a calibration on a test component the way reconfigure would."""
+    cc._configure_undistorter({"distortion_calibration": path, **attrs})
+    return cc
+
+
+def _patterned_still(tmp_path, name="DSC00042.PNG"):
+    """A 200x100 still with a sharp grid so undistortion visibly moves pixels."""
+    img = np.full((_CAL_H, _CAL_W, 3), 230, np.uint8)
+    img[:, ::20] = 20
+    img[::20, :] = 20
+    p = str(tmp_path / name)
+    Image.fromarray(img).save(p, format="PNG")
+    return p
+
+
+def _component_config(**attrs):
+    cfg = ComponentConfig(name="cc")
+    struct = Struct()
+    struct.update({"camera": "cam", **attrs})
+    cfg.attributes.CopyFrom(struct)
+    return cfg
+
+
+def test_validate_config_checks_distortion_attributes(tmp_path):
+    path, _ = _synthetic_calibration(tmp_path)
+    ColorCorrection.validate_config(_component_config(
+        distortion_calibration=path, undistort=True, correct_lateral_ca=False,
+        undistort_interpolation="lanczos4", strict_calibration_match=True,
+        cache_undistort_maps=False,
+    ))
+    with pytest.raises(ValueError, match="file not found"):
+        ColorCorrection.validate_config(_component_config(distortion_calibration=str(tmp_path / "nope.json")))
+    with pytest.raises(ValueError, match="path of a calibration JSON"):
+        ColorCorrection.validate_config(_component_config(distortion_calibration=""))
+    with pytest.raises(ValueError, match="undistort_interpolation"):
+        ColorCorrection.validate_config(_component_config(distortion_calibration=path, undistort_interpolation="nearest"))
+    with pytest.raises(ValueError, match="`undistort` must be true or false"):
+        ColorCorrection.validate_config(_component_config(distortion_calibration=path, undistort="yes"))
+
+
+def test_reconfigure_loads_calibration_and_rejects_a_bad_file(tmp_path):
+    path, calib = _synthetic_calibration(tmp_path)
+    source = _FakeSource(saved_path=None)
+    deps = {Camera.get_resource_name("cam"): source}
+    cc = ColorCorrection("test-cc")
+    cc.reconfigure(_component_config(distortion_calibration=path, output_dir=str(tmp_path / "out")), deps)
+    assert cc._calibration is not None and cc._calibration.image_size == (_CAL_W, _CAL_H)
+    assert cc._undistorter is not None and cc._undistorter.corrects_lateral_ca
+    assert cc._calibration_sha256 and len(cc._calibration_sha256) == 64
+
+    # An unrelated reconfigure keeps the same Undistorter (and its map cache).
+    first = cc._undistorter
+    cc.reconfigure(_component_config(distortion_calibration=path, output_dir=str(tmp_path / "out"), jpeg_quality=80), deps)
+    assert cc._undistorter is first
+    # Changing something that shapes the maps rebuilds it.
+    cc.reconfigure(_component_config(distortion_calibration=path, output_dir=str(tmp_path / "out"), correct_lateral_ca=False), deps)
+    assert cc._undistorter is not first and not cc._undistorter.corrects_lateral_ca
+
+    # Dropping the attribute returns to the plain pipeline.
+    cc.reconfigure(_component_config(output_dir=str(tmp_path / "out")), deps)
+    assert cc._undistorter is None and cc._calibration is None
+
+    junk = tmp_path / "junk.json"
+    junk.write_text("{not json")
+    with pytest.raises(ValueError, match="could not be loaded"):
+        cc.reconfigure(_component_config(distortion_calibration=str(junk)), deps)
+    with pytest.raises(ValueError, match="could not be loaded"):
+        cc.reconfigure(_component_config(distortion_calibration=str(tmp_path / "missing.json")), deps)
+
+
+def test_develop_undistorts_and_reports_the_calibration(tmp_path):
+    path, calib = _synthetic_calibration(tmp_path)
+    out_dir = str(tmp_path / "out")
+    cc = _with_calibration(_component(_FakeSource(saved_path=None), output_dir=out_dir), path)
+    cc._output_formats = ["png8"]
+    cc._write_sidecar = True
+    still = _patterned_still(tmp_path)
+
+    out = asyncio.run(cc.do_command({"develop": {"path": still}}))["develop"]
+    assert out["undistorted"] is True
+    assert out["lateral_ca_corrected"] is True
+    assert out["calibration"]["path"] == path
+    assert out["calibration"]["created_at"] == "2026-09-10T15:42:00Z"
+    assert out["calibration"]["rms_reprojection_px"] == 0.38
+    assert out["calibration"]["sha256"] == cc._calibration_sha256
+    assert out["calibration_warnings"] == []
+    assert out["calibration_match_checked"] is False   # a bare develop has no capture metadata
+    assert out["width"] == _CAL_W and out["height"] == _CAL_H
+
+    # The pixels really moved: compare with the same develop undistorted off.
+    corrected = np.array(Image.open(out["exports"]["png8"]))
+    off = asyncio.run(cc.do_command({"develop": {"path": still, "undistort": False, "output_stem": "off"}}))["develop"]
+    assert off["undistorted"] is False and "calibration" in off
+    plain = np.array(Image.open(off["exports"]["png8"]))
+    assert plain.shape == corrected.shape
+    assert not np.array_equal(plain, corrected)
+    expected = Undistorter(calib).apply(
+        srgb_to_linear(plain.astype(np.float32) / 255.0).astype(np.float32)
+    )
+    assert np.abs(linear_to_srgb(expected) * 255.0 - corrected).max() <= 1.5
+
+    # The sidecar carries the same audit trail.
+    with open(out["sidecar"]) as f:
+        record = _json.load(f)
+    assert record["undistorted"] is True and record["lateral_ca_corrected"] is True
+    assert record["distortion_calibration"]["sha256"] == cc._calibration_sha256
+    assert record["calibration_warnings"] == []
+
+
+def test_develop_without_calibration_is_the_plain_pipeline(tmp_path):
+    """No `distortion_calibration`: identical bytes to the pre-feature path,
+    and the response only says so (no calibration block)."""
+    still = _patterned_still(tmp_path)
+    plain = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "plain"))
+    plain._output_formats = ["png8"]
+    out = asyncio.run(plain.do_command({"develop": {"path": still}}))["develop"]
+    assert out["undistorted"] is False and out["lateral_ca_corrected"] is False
+    assert "calibration" not in out and "calibration_warnings" not in out
+
+    # A calibration configured but `undistort: false` writes the same bytes.
+    path, _ = _synthetic_calibration(tmp_path)
+    disabled = _with_calibration(
+        _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "disabled")),
+        path, undistort=False,
+    )
+    disabled._output_formats = ["png8"]
+    out2 = asyncio.run(disabled.do_command({"develop": {"path": still}}))["develop"]
+    assert out2["undistorted"] is False and out2["calibration"]["path"] == path
+    assert open(out["exports"]["png8"], "rb").read() == open(out2["exports"]["png8"], "rb").read()
+
+
+def test_develop_size_mismatch_is_a_hard_error(tmp_path):
+    path, _ = _synthetic_calibration(tmp_path)
+    cc = _with_calibration(_component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out")), path)
+    small = _write_still(tmp_path)          # 8x8, not the 200x100 calibration frame
+    with pytest.raises(CalibrationMismatch, match="does not match the calibration"):
+        asyncio.run(cc.do_command({"develop": {"path": small}}))
+
+
+def test_develop_metadata_mismatch_warns_or_errors_under_strict(tmp_path):
+    path, _ = _synthetic_calibration(tmp_path)
+    cc = _with_calibration(_component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out")), path)
+    cc._output_formats = []
+    still = _patterned_still(tmp_path)
+
+    out = asyncio.run(cc.do_command({"develop": {
+        "path": still, "zoom_position": 3, "focus_position": 1234, "lens": "FE 24-70mm F2.8 GM",
+    }}))["develop"]
+    assert out["undistorted"] is True and out["calibration_match_checked"] is True
+    assert len(out["calibration_warnings"]) == 2
+    assert any("zoom_position 3" in w for w in out["calibration_warnings"])
+    assert any("lens" in w for w in out["calibration_warnings"])
+
+    matching = asyncio.run(cc.do_command({"develop": {
+        "path": still, "zoom_position": 0, "focus_position": 1234, "lens": "fe pz 16-35mm f4 g",
+    }}))["develop"]
+    assert matching["calibration_warnings"] == [] and matching["calibration_match_checked"] is True
+
+    cc._strict_calibration_match = True
+    with pytest.raises(CalibrationMismatch, match="strict_calibration_match.*zoom_position 3"):
+        asyncio.run(cc.do_command({"develop": {"path": still, "zoom_position": 3}}))
+
+
+class _SonyLikeSource(_FakeSource):
+    """sony-remote shape: `capture` reports focus_position, `get_status` the
+    mounted lens."""
+
+    def __init__(self, saved_path, focus_position=1234, lens="FE PZ 16-35mm F4 G"):
+        super().__init__(saved_path)
+        self.focus_position = focus_position
+        self.lens = lens
+
+    async def do_command(self, command, *, timeout=None):
+        if "capture" in command:
+            self.commands.append(command)
+            return {"capture": {"saved_to": self.saved_path, "path": self.saved_path,
+                                "focus_position": self.focus_position}}
+        if "get_status" in command:
+            self.commands.append(command)
+            return {"connected": True, "lens": self.lens, "model": "ILCE-7RM5"}
+        return await super().do_command(command, timeout=timeout)
+
+
+def test_capture_feeds_source_metadata_into_the_match_check(tmp_path):
+    path, _ = _synthetic_calibration(tmp_path)
+    still = _patterned_still(tmp_path)
+    source = _SonyLikeSource(still, focus_position=1300)
+    cc = _with_calibration(_component(source, output_dir=str(tmp_path / "out")), path)
+    cc._output_formats = ["jpeg"]
+
+    out = asyncio.run(cc.do_command({"capture": {}}))["capture"]
+    assert out["undistorted"] is True and out["calibration_match_checked"] is True
+    assert len(out["calibration_warnings"]) == 1 and "focus_position 1300" in out["calibration_warnings"][0]
+    assert any("get_status" in c for c in source.commands)
+
+    # A matching camera: clean.
+    source.focus_position = 1234
+    out = asyncio.run(cc.do_command({"capture": {}}))["capture"]
+    assert out["calibration_warnings"] == []
+
+    # A ptp-style source without get_status still develops; lens goes unchecked.
+    plain_source = _FakeSource(still)
+    cc2 = _with_calibration(_component(plain_source, output_dir=str(tmp_path / "out2")), path)
+    cc2._output_formats = ["jpeg"]
+    out = asyncio.run(cc2.do_command({"capture": {}}))["capture"]
+    assert out["undistorted"] is True and out["calibration_warnings"] == []
+    assert out["calibration_match_checked"] is False
+
+
+def test_preview_only_capture_and_deferred_preview_are_not_undistorted(tmp_path):
+    """Half-size decodes are not the calibration frame; they are left alone
+    (and must not trip the size check)."""
+    path, _ = _synthetic_calibration(tmp_path)
+    still = _patterned_still(tmp_path)
+    source = _SonyLikeSource(still)
+    cc = _with_calibration(_component(source, output_dir=str(tmp_path / "out")), path)
+
+    out = asyncio.run(cc.do_command({"capture": {"output_formats": []}}))["capture"]
+    assert out["undistorted"] is False and out["calibration"]["path"] == path
+    assert not any("get_status" in c for c in source.commands)
+
+    async def run():
+        ticket = (await cc.do_command({"capture": {"defer": True}}))["capture"]
+        return (await cc.do_command({"capture_result": {"id": ticket["capture_id"], "wait_sec": 10}}))["capture_result"]
+
+    result = asyncio.run(run())
+    assert result["status"] == "done" and "undistorted" not in result
+
+
+def test_batch_develop_reports_per_file(tmp_path):
+    path, _ = _synthetic_calibration(tmp_path)
+    cc = _with_calibration(_component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out")), path)
+    cc._output_formats = []
+    a = _patterned_still(tmp_path, "a.PNG")
+    b = _patterned_still(tmp_path, "b.PNG")
+    out = asyncio.run(cc.do_command({"develop": {"paths": [a, b]}}))["develop"]
+    assert out["count"] == 2
+    assert all(r["undistorted"] is True for r in out["developed"])

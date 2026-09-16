@@ -1,0 +1,4188 @@
+{
+  "tool": "image-processing shoot_calibration_board 0.1.0",
+  "created_at": "2026-09-16T21:25:22+00:00",
+  "address": "nines-photographer.g02wbvukyo.viam.cloud",
+  "arm": "arm",
+  "camera": "sony",
+  "pattern": [
+    11,
+    8
+  ],
+  "dry_run": false,
+  "shots": [
+    {
+      "index": 0,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": -14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -11.899999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -7.975504784052195,
+        61.96701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -8.013671415426494,
+        61.93558165778534,
+        -0.4775907324293866
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4483884572982788,
+        0.09439756721258163,
+        0.9192449450492859,
+        0.5769568681716919
+      ],
+      "board_span_norm": 0.47446851866854717,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00276.ARW",
+        "saved_to": "/home/viam/images/DSC00276.ARW",
+        "name": "DSC00276.ARW",
+        "size": 65146880.0,
+        "focus_position": 11.0,
+        "capture_count": 1804.0,
+        "duration_s": 1.055,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00276.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 1,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": -14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": -5.949999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": 5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -2.0255047840521954,
+        61.96701059061506,
+        5.122409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -2.048937436136762,
+        61.92884709126371,
+        5.143974265834806
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3503115475177765,
+        0.05562540516257286,
+        0.772722601890564,
+        0.5446909070014954
+      ],
+      "board_span_norm": 0.4438732510250617,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00277.ARW",
+        "saved_to": "/home/viam/images/DSC00277.ARW",
+        "name": "DSC00277.ARW",
+        "size": 65175552.0,
+        "focus_position": 11.0,
+        "capture_count": 1805.0,
+        "duration_s": 1.072,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00277.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 2,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": -14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": -5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        61.96701059061506,
+        -6.077590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924342817351948,
+        61.92884709126371,
+        -6.0991130420112665
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3079381287097931,
+        0.08676470816135406,
+        0.731887936592102,
+        0.5580301880836487
+      ],
+      "board_span_norm": 0.4389715991943305,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00278.ARW",
+        "saved_to": "/home/viam/images/DSC00278.ARW",
+        "name": "DSC00278.ARW",
+        "size": 65081344.0,
+        "focus_position": 11.0,
+        "capture_count": 1806.0,
+        "duration_s": 0.787,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00278.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 3,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": -14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 5.949999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        9.874495215947803,
+        61.96701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        9.897423074364024,
+        61.92884709126371,
+        -0.47782114459216873
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.18784862756729126,
+        0.10485025495290756,
+        0.6213877201080322,
+        0.5638695955276489
+      ],
+      "board_span_norm": 0.4414929124936319,
+      "coverage_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00279.ARW",
+        "saved_to": "/home/viam/images/DSC00279.ARW",
+        "name": "DSC00279.ARW",
+        "size": 64851968.0,
+        "focus_position": 11.0,
+        "capture_count": 1807.0,
+        "duration_s": 1.039,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00279.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 4,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": -14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 11.899999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": 5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        15.824495215947803,
+        61.96701059061506,
+        5.122409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        15.862661847322101,
+        61.93545188419112,
+        5.140296635853577
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.05078125,
+        0.10559278726577759,
+        0.5508213639259338,
+        0.6441176533699036
+      ],
+      "board_span_norm": 0.5121246848358915,
+      "coverage_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00280.ARW",
+        "saved_to": "/home/viam/images/DSC00280.ARW",
+        "name": "DSC00280.ARW",
+        "size": 64602112.0,
+        "focus_position": 11.0,
+        "capture_count": 1808.0,
+        "duration_s": 1.084,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00280.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 5,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        20.924495215947804,
+        67.10001059061506,
+        -8.477590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        20.910308247744926,
+        67.08553746178579,
+        -8.439424427150067
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.016997063532471657,
+        0.13567864894866943,
+        0.4918261468410492,
+        0.6397058963775635
+      ],
+      "board_span_norm": 0.4839516118386046,
+      "coverage_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00281.ARW",
+        "saved_to": "/home/viam/images/DSC00281.ARW",
+        "name": "DSC00281.ARW",
+        "size": 64413696.0,
+        "focus_position": 11.0,
+        "capture_count": 1809.0,
+        "duration_s": 1.082,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00281.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 6,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.424495215947804,
+        67.10001059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.462661980381453,
+        67.09994233074535,
+        -0.5134007205566758
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.16280081868171692,
+        0.22485777735710144,
+        0.5919439196586609,
+        0.6803451180458069
+      ],
+      "board_span_norm": 0.4373736848364989,
+      "coverage_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00282.ARW",
+        "saved_to": "/home/viam/images/DSC00282.ARW",
+        "name": "DSC00282.ARW",
+        "size": 64966656.0,
+        "focus_position": 11.0,
+        "capture_count": 1810.0,
+        "duration_s": 0.741,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00282.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 7,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        67.10001059061506,
+        7.522409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.962661886143012,
+        67.10001063263705,
+        7.486488386980936
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.27405601739883423,
+        0.18715429306030273,
+        0.70015949010849,
+        0.6816076040267944
+      ],
+      "board_span_norm": 0.44812875164829785,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00283.ARW",
+        "saved_to": "/home/viam/images/DSC00283.ARW",
+        "name": "DSC00283.ARW",
+        "size": 65372160.0,
+        "focus_position": 11.0,
+        "capture_count": 1811.0,
+        "duration_s": 1.152,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00283.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 8,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.575504784052196,
+        67.10001059061506,
+        -8.477590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.555092004182408,
+        67.10001063263705,
+        -8.439424427150067
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.40327218174934387,
+        0.20916427671909332,
+        0.8561092615127563,
+        0.7241425514221191
+      ],
+      "board_span_norm": 0.4727222031214418,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00284.ARW",
+        "saved_to": "/home/viam/images/DSC00284.ARW",
+        "name": "DSC00284.ARW",
+        "size": 65462272.0,
+        "focus_position": 11.0,
+        "capture_count": 1812.0,
+        "duration_s": 0.776,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00284.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 9,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -11.899999999999999,
+        "tilt_deg": -3.2668999999999997,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -7.975504784052195,
+        68.50011059061507,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -8.013671415426494,
+        68.48955114757361,
+        -0.47785967112795585
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.44935742020606995,
+        0.25205883383750916,
+        0.8902086615562439,
+        0.7115697264671326
+      ],
+      "board_span_norm": 0.44664439153994845,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00285.ARW",
+        "saved_to": "/home/viam/images/DSC00285.ARW",
+        "name": "DSC00285.ARW",
+        "size": 65433600.0,
+        "focus_position": 11.0,
+        "capture_count": 1813.0,
+        "duration_s": 1.03,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00285.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 10,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": -11.899999999999999,
+        "tilt_deg": 3.2668999999999997,
+        "roll_deg": 5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -7.975504784052195,
+        75.03391059061505,
+        5.122409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -8.013671415426494,
+        75.04415584495469,
+        5.140168569806639
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4594428837299347,
+        0.3412069082260132,
+        0.9009066224098206,
+        0.7999305129051208
+      ],
+      "board_span_norm": 0.4468165408164224,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00286.ARW",
+        "saved_to": "/home/viam/images/DSC00286.ARW",
+        "name": "DSC00286.ARW",
+        "size": 65335296.0,
+        "focus_position": 11.0,
+        "capture_count": 1814.0,
+        "duration_s": 1.063,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00286.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 11,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.575504784052196,
+        76.43401059061506,
+        -8.477590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.585140994549056,
+        76.43011734076616,
+        -8.439424427150067
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3853585124015808,
+        0.39731547236442566,
+        0.818976640701294,
+        0.9252922534942627
+      ],
+      "board_span_norm": 0.464534183549119,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00287.ARW",
+        "saved_to": "/home/viam/images/DSC00287.ARW",
+        "name": "DSC00287.ARW",
+        "size": 65564672.0,
+        "focus_position": 11.0,
+        "capture_count": 1815.0,
+        "duration_s": 0.895,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00287.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 12,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        76.43401059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.886328545752596,
+        76.43399005802556,
+        -0.5133004555140942
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3022221624851227,
+        0.41380879282951355,
+        0.7035244107246399,
+        0.8322686553001404
+      ],
+      "board_span_norm": 0.4066298290840611,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00288.ARW",
+        "saved_to": "/home/viam/images/DSC00288.ARW",
+        "name": "DSC00288.ARW",
+        "size": 65388544.0,
+        "focus_position": 11.0,
+        "capture_count": 1816.0,
+        "duration_s": 1.086,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00288.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 13,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.424495215947804,
+        76.43401059061506,
+        7.522409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.386328639991037,
+        76.43401054859306,
+        7.486488386980936
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.1803741753101349,
+        0.3989357352256775,
+        0.6196840405464172,
+        0.943852424621582
+      ],
+      "board_span_norm": 0.4741328436665823,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00289.ARW",
+        "saved_to": "/home/viam/images/DSC00289.ARW",
+        "name": "DSC00289.ARW",
+        "size": 65118208.0,
+        "focus_position": 11.0,
+        "capture_count": 1817.0,
+        "duration_s": 0.802,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00289.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 14,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 11.899999999999999,
+        "tilt_deg": 3.2668999999999997,
+        "roll_deg": -5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        15.824495215947803,
+        75.03391059061505,
+        -6.077590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        15.862661847322101,
+        75.0444290525215,
+        -6.095336801173896
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.10377391427755356,
+        0.35260456800460815,
+        0.5409311652183533,
+        0.8194298148155212
+      ],
+      "board_span_norm": 0.44644586431641714,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00290.ARW",
+        "saved_to": "/home/viam/images/DSC00290.ARW",
+        "name": "DSC00290.ARW",
+        "size": 64839680.0,
+        "focus_position": 11.0,
+        "capture_count": 1818.0,
+        "duration_s": 1.084,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00290.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 15,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 8.329999999999998,
+        "tilt_deg": 6.859999999999999,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.254495215947802,
+        78.62701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        12.292661987034421,
+        78.65843923672614,
+        -0.4775923332549733
+      ],
+      "attempts": 3,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.17457817494869232,
+        0.45417219400405884,
+        0.6001801490783691,
+        0.9333366751670837
+      ],
+      "board_span_norm": 0.4426822734921935,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00291.ARW",
+        "saved_to": "/home/viam/images/DSC00291.ARW",
+        "name": "DSC00291.ARW",
+        "size": 65052672.0,
+        "focus_position": 11.0,
+        "capture_count": 1819.0,
+        "duration_s": 0.783,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00291.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 16,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 4.164999999999999,
+        "tilt_deg": 6.859999999999999,
+        "roll_deg": 3.9199999999999995
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        8.089495215947803,
+        78.62701059061506,
+        3.442409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        8.11266988480395,
+        78.66518063343695,
+        3.4642166651868727
+      ],
+      "attempts": 3,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.2543486952781677,
+        0.44271647930145264,
+        0.6657459139823914,
+        0.9314211010932922
+      ],
+      "board_span_norm": 0.4365116659349495,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00292.ARW",
+        "saved_to": "/home/viam/images/DSC00292.ARW",
+        "name": "DSC00292.ARW",
+        "size": 65208320.0,
+        "focus_position": 11.0,
+        "capture_count": 1820.0,
+        "duration_s": 1.042,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00292.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 17,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 9.799999999999999,
+        "roll_deg": -5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        81.56701059061506,
+        -6.077590732429386
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924617305579218,
+        81.60517408996641,
+        -6.099170244845565
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.2688264548778534,
+        0.49070313572883606,
+        0.6857189536094666,
+        0.9655243754386902
+      ],
+      "board_span_norm": 0.43543939033139123,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00293.ARW",
+        "saved_to": "/home/viam/images/DSC00293.ARW",
+        "name": "DSC00293.ARW",
+        "size": 65241088.0,
+        "focus_position": 11.0,
+        "capture_count": 1821.0,
+        "duration_s": 0.82,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00293.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 18,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -5.949999999999999,
+        "tilt_deg": 9.799999999999999,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -2.0255047840521954,
+        81.56701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -2.0484326424684154,
+        81.60517408996641,
+        -0.47782114459216873
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3735586106777191,
+        0.5122578740119934,
+        0.8011726140975952,
+        0.9711463451385498
+      ],
+      "board_span_norm": 0.43742234878035624,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00294.ARW",
+        "saved_to": "/home/viam/images/DSC00294.ARW",
+        "name": "DSC00294.ARW",
+        "size": 65261568.0,
+        "focus_position": 11.0,
+        "capture_count": 1822.0,
+        "duration_s": 1.044,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00294.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 19,
+      "holdout": false,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": -11.899999999999999,
+        "tilt_deg": 9.799999999999999,
+        "roll_deg": 5.6
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -7.975504784052195,
+        81.56701059061506,
+        5.122409267570613
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -8.013671415426494,
+        81.598569297039,
+        5.140296635853577
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.469051331281662,
+        0.47498491406440735,
+        0.9353269338607788,
+        0.9609737396240234
+      ],
+      "board_span_norm": 0.4723957550777823,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00295.ARW",
+        "saved_to": "/home/viam/images/DSC00295.ARW",
+        "name": "DSC00295.ARW",
+        "size": 65155072.0,
+        "focus_position": 11.0,
+        "capture_count": 1823.0,
+        "duration_s": 1.045,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00295.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 20,
+      "holdout": true,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        71.76701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.886328545752596,
+        71.79844312117545,
+        -0.45963016303745624
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3062419593334198,
+        0.32278093695640564,
+        0.6984159350395203,
+        0.7356268167495728
+      ],
+      "board_span_norm": 0.3986139969509055,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00296.ARW",
+        "saved_to": "/home/viam/images/DSC00296.ARW",
+        "name": "DSC00296.ARW",
+        "size": 65425408.0,
+        "focus_position": 11.0,
+        "capture_count": 1824.0,
+        "duration_s": 1.034,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00296.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 21,
+      "holdout": true,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.575504784052196,
+        71.76701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        -4.537338208095429,
+        71.76715402458763,
+        -0.4775097306546985
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4096969664096832,
+        0.3224816620349884,
+        0.8177555799484253,
+        0.7596218585968018
+      ],
+      "board_span_norm": 0.41717369222382666,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00297.ARW",
+        "saved_to": "/home/viam/images/DSC00297.ARW",
+        "name": "DSC00297.ARW",
+        "size": 65499136.0,
+        "focus_position": 11.0,
+        "capture_count": 1825.0,
+        "duration_s": 1.1,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00297.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 22,
+      "holdout": true,
+      "distance_mm": 0.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": -7.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": -7.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.924495215947804,
+        64.76701059061506,
+        -0.4775907324293866
+      ],
+      "joints_actual_deg": [
+        89.7816755076587,
+        -25.81366177930935,
+        -49.102687565896055,
+        3.886328545752596,
+        64.79858522199042,
+        -0.47759035890341633
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.29603880643844604,
+        0.17061462998390198,
+        0.6981384754180908,
+        0.5978719592094421
+      ],
+      "board_span_norm": 0.40996256309674134,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00298.ARW",
+        "saved_to": "/home/viam/images/DSC00298.ARW",
+        "name": "DSC00298.ARW",
+        "size": 65236992.0,
+        "focus_position": 11.0,
+        "capture_count": 1826.0,
+        "duration_s": 1.027,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00298.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 23,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": -14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": -17.0,
+        "tilt_deg": -14.0,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.504372590973443,
+        66.85992531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.466205682368294,
+        66.89135518368232,
+        -8.254127371383145
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.5608803629875183,
+        0.11429646611213684,
+        0.9550262093544006,
+        0.5162125825881958
+      ],
+      "board_span_norm": 0.3965399249123169,
+      "coverage_cells": [
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00299.ARW",
+        "saved_to": "/home/viam/images/DSC00299.ARW",
+        "name": "DSC00299.ARW",
+        "size": 64978944.0,
+        "focus_position": 11.0,
+        "capture_count": 1827.0,
+        "duration_s": 0.794,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00299.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 24,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": -14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": -14.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.004372590973442,
+        66.85992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.0425393554070914,
+        66.8600660870945,
+        -0.30809033006754366
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4589536786079407,
+        0.08832774311304092,
+        0.7690581679344177,
+        0.42026466131210327
+      ],
+      "board_span_norm": 0.3169455443814855,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          0
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00300.ARW",
+        "saved_to": "/home/viam/images/DSC00300.ARW",
+        "name": "DSC00300.ARW",
+        "size": 64565248.0,
+        "focus_position": 11.0,
+        "capture_count": 1828.0,
+        "duration_s": 1.052,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00300.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 25,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": -14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": -14.0,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.495627409026558,
+        66.85992531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.45746073883135,
+        66.85992265312193,
+        7.691989996086402
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3117418587207794,
+        0.07305870205163956,
+        0.625180721282959,
+        0.44785550236701965
+      ],
+      "board_span_norm": 0.3334172568618961,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00301.ARW",
+        "saved_to": "/home/viam/images/DSC00301.ARW",
+        "name": "DSC00301.ARW",
+        "size": 64286720.0,
+        "focus_position": 11.0,
+        "capture_count": 1829.0,
+        "duration_s": 0.765,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00301.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 26,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": -14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 5.949999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": -5.6
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        11.445627409026557,
+        71.05992531943714,
+        -5.872087735941745
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        11.468614177824369,
+        71.0217618200858,
+        -5.893550388090093
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.29803332686424255,
+        0.1576150804758072,
+        0.5856394171714783,
+        0.48620837926864624
+      ],
+      "board_span_norm": 0.3007430500500526,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00302.ARW",
+        "saved_to": "/home/viam/images/DSC00302.ARW",
+        "name": "DSC00302.ARW",
+        "size": 64000000.0,
+        "focus_position": 11.0,
+        "capture_count": 1830.0,
+        "duration_s": 0.765,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00302.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 27,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": -14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 11.899999999999999,
+        "tilt_deg": -9.799999999999999,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        17.395627409026556,
+        71.05992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        17.4337948941745,
+        71.0283666130132,
+        -0.27223445160676835
+      ],
+      "attempts": 2,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.18527410924434662,
+        0.18851354718208313,
+        0.5051687359809875,
+        0.5153400897979736
+      ],
+      "board_span_norm": 0.3220318109297015,
+      "coverage_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00303.ARW",
+        "saved_to": "/home/viam/images/DSC00303.ARW",
+        "name": "DSC00303.ARW",
+        "size": 63995904.0,
+        "focus_position": 11.0,
+        "capture_count": 1831.0,
+        "duration_s": 1.04,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00303.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 28,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.495627409026557,
+        76.19292531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.471479463692862,
+        76.16828886912289,
+        7.689745425170407
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.09981517493724823,
+        0.3081260621547699,
+        0.45724427700042725,
+        0.6984753012657166
+      ],
+      "board_span_norm": 0.36781655212513026,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00304.ARW",
+        "saved_to": "/home/viam/images/DSC00304.ARW",
+        "name": "DSC00304.ARW",
+        "size": 64032768.0,
+        "focus_position": 11.0,
+        "capture_count": 1832.0,
+        "duration_s": 1.092,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00304.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 29,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.995627409026557,
+        76.19292531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        14.015893955192897,
+        76.1928638897566,
+        -8.23392111049731
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.2610722780227661,
+        0.24078990519046783,
+        0.5539787411689758,
+        0.5693147778511047
+      ],
+      "board_span_norm": 0.3042497689058611,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00305.ARW",
+        "saved_to": "/home/viam/images/DSC00305.ARW",
+        "name": "DSC00305.ARW",
+        "size": 63893504.0,
+        "focus_position": 11.0,
+        "capture_count": 1833.0,
+        "duration_s": 1.052,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00305.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 30,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": -4.667,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.495627409026558,
+        76.19292531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.533794079221766,
+        76.19292536145913,
+        -0.3077529027142891
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3631409704685211,
+        0.2854048013687134,
+        0.6350027322769165,
+        0.575114905834198
+      ],
+      "board_span_norm": 0.27744580735398,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00306.ARW",
+        "saved_to": "/home/viam/images/DSC00306.ARW",
+        "name": "DSC00306.ARW",
+        "size": 64036864.0,
+        "focus_position": 11.0,
+        "capture_count": 1834.0,
+        "duration_s": 1.114,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00306.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 31,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": -4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.004372590973442,
+        76.19292531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -2.966206015016675,
+        76.19292536145913,
+        7.691991703633695
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4430650770664215,
+        0.23303094506263733,
+        0.741914689540863,
+        0.5741419792175293
+      ],
+      "board_span_norm": 0.31239046745886406,
+      "coverage_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00307.ARW",
+        "saved_to": "/home/viam/images/DSC00307.ARW",
+        "name": "DSC00307.ARW",
+        "size": 64319488.0,
+        "focus_position": 11.0,
+        "capture_count": 1835.0,
+        "duration_s": 0.786,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00307.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 32,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": -17.0,
+        "tilt_deg": -4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.504372590973443,
+        76.19292531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.483959905342095,
+        76.19292536145913,
+        -8.23392111049731
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.5475656390190125,
+        0.2991999089717865,
+        0.8997840881347656,
+        0.6780663728713989
+      ],
+      "board_span_norm": 0.3605826455233975,
+      "coverage_cells": [
+        [
+          2,
+          0
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          0
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00308.ARW",
+        "saved_to": "/home/viam/images/DSC00308.ARW",
+        "name": "DSC00308.ARW",
+        "size": 64933888.0,
+        "focus_position": 11.0,
+        "capture_count": 1836.0,
+        "duration_s": 1.105,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00308.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 33,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.504372590973443,
+        85.52692531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.504289109632992,
+        85.48875818033312,
+        -0.3046436191771995
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.5542877316474915,
+        0.4476158916950226,
+        0.875983715057373,
+        0.7810700535774231
+      ],
+      "board_span_norm": 0.3253394264105476,
+      "coverage_cells": [
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00309.ARW",
+        "saved_to": "/home/viam/images/DSC00309.ARW",
+        "name": "DSC00309.ARW",
+        "size": 64770048.0,
+        "focus_position": 11.0,
+        "capture_count": 1837.0,
+        "duration_s": 1.08,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00309.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 34,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.004372590973442,
+        85.52692531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.0425393554070914,
+        85.5267545226859,
+        7.691844000792893
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.46157318353652954,
+        0.4008139967918396,
+        0.7659593224525452,
+        0.7329822778701782
+      ],
+      "board_span_norm": 0.3131500676597563,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00310.ARW",
+        "saved_to": "/home/viam/images/DSC00310.ARW",
+        "name": "DSC00310.ARW",
+        "size": 64241664.0,
+        "focus_position": 11.0,
+        "capture_count": 1838.0,
+        "duration_s": 0.769,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00310.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 35,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 4.667,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 4.667,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.495627409026558,
+        85.52692531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.475214108031506,
+        85.52692527741516,
+        -8.23392111049731
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3482806980609894,
+        0.4264903664588928,
+        0.6351940631866455,
+        0.7553265690803528
+      ],
+      "board_span_norm": 0.30036487521330346,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00311.ARW",
+        "saved_to": "/home/viam/images/DSC00311.ARW",
+        "name": "DSC00311.ARW",
+        "size": 64053248.0,
+        "focus_position": 11.0,
+        "capture_count": 1839.0,
+        "duration_s": 0.773,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00311.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 36,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": 4.667,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.995627409026557,
+        85.52692531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.957460833069792,
+        85.52692527741516,
+        -0.3077522890644809
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.26088330149650574,
+        0.4506186544895172,
+        0.5447173118591309,
+        0.7612823247909546
+      ],
+      "board_span_norm": 0.2923062412605714,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00312.ARW",
+        "saved_to": "/home/viam/images/DSC00312.ARW",
+        "name": "DSC00312.ARW",
+        "size": 63897600.0,
+        "focus_position": 11.0,
+        "capture_count": 1840.0,
+        "duration_s": 1.199,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00312.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 37,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 17.0,
+        "tilt_deg": 4.667,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.495627409026557,
+        85.52692531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.45746050042141,
+        85.52692527741516,
+        7.691991703633695
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.13629603385925293,
+        0.4677691161632538,
+        0.47222617268562317,
+        0.8735053539276123
+      ],
+      "board_span_norm": 0.35873801058171123,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00313.ARW",
+        "saved_to": "/home/viam/images/DSC00313.ARW",
+        "name": "DSC00313.ARW",
+        "size": 64032768.0,
+        "focus_position": 11.0,
+        "capture_count": 1841.0,
+        "duration_s": 0.766,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00313.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 38,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": 17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.495627409026557,
+        94.85992531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        22.495535389949644,
+        94.83761375773393,
+        -8.23392111049731
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.06180348992347717,
+        0.5499571561813354,
+        0.4336177408695221,
+        0.9158101081848145
+      ],
+      "board_span_norm": 0.37000012555632367,
+      "coverage_cells": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00314.ARW",
+        "saved_to": "/home/viam/images/DSC00314.ARW",
+        "name": "DSC00314.ARW",
+        "size": 64229376.0,
+        "focus_position": 11.0,
+        "capture_count": 1842.0,
+        "duration_s": 0.832,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00314.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 39,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.995627409026557,
+        94.85992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        14.033794173460208,
+        94.85982553291481,
+        -0.30783830675934076
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.2427051067352295,
+        0.6054679751396179,
+        0.5481575727462769,
+        0.9498431086540222
+      ],
+      "board_span_norm": 0.3178703552437046,
+      "coverage_cells": [
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00315.ARW",
+        "saved_to": "/home/viam/images/DSC00315.ARW",
+        "name": "DSC00315.ARW",
+        "size": 64012288.0,
+        "focus_position": 11.0,
+        "capture_count": 1843.0,
+        "duration_s": 0.772,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00315.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 40,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 8.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.495627409026558,
+        94.85992531943714,
+        7.727912264058254
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.533794079221766,
+        94.85992798575236,
+        7.691991703633695
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3824768662452698,
+        0.578548014163971,
+        0.6846014857292175,
+        0.9475869536399841
+      ],
+      "board_span_norm": 0.32407269401330274,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00316.ARW",
+        "saved_to": "/home/viam/images/DSC00316.ARW",
+        "name": "DSC00316.ARW",
+        "size": 64086016.0,
+        "focus_position": 11.0,
+        "capture_count": 1844.0,
+        "duration_s": 0.735,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00316.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 41,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": -8.0
+      },
+      "commanded": {
+        "pan_deg": -8.5,
+        "tilt_deg": 14.0,
+        "roll_deg": -8.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -3.004372590973442,
+        94.85992531943714,
+        -8.272087735941746
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -2.983959597660242,
+        94.85992798575236,
+        -8.23392111049731
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.4257614016532898,
+        0.5976540446281433,
+        0.725468635559082,
+        0.9857727885246277
+      ],
+      "board_span_norm": 0.3292939118866442,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00317.ARW",
+        "saved_to": "/home/viam/images/DSC00317.ARW",
+        "name": "DSC00317.ARW",
+        "size": 64389120.0,
+        "focus_position": 11.0,
+        "capture_count": 1845.0,
+        "duration_s": 0.846,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00317.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 42,
+      "holdout": false,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": -17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": -17.0,
+        "tilt_deg": 14.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.504372590973443,
+        94.85992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        -11.466205682368294,
+        94.85992798575236,
+        -0.3077522890644809
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.558361828327179,
+        0.6041305661201477,
+        0.9072394967079163,
+        0.983727216720581
+      ],
+      "board_span_norm": 0.3585580958035117,
+      "coverage_cells": [
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          3,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00318.ARW",
+        "saved_to": "/home/viam/images/DSC00318.ARW",
+        "name": "DSC00318.ARW",
+        "size": 64757760.0,
+        "focus_position": 11.0,
+        "capture_count": 1846.0,
+        "duration_s": 1.053,
+        "settings": {
+          "white_balance": "flash",
+          "shutter_type": "mechanical",
+          "iso": 100.0,
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00318.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 43,
+      "holdout": true,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 8.5,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 8.5,
+        "tilt_deg": 0.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.995627409026557,
+        80.85992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        13.957460833069792,
+        80.88090766056742,
+        -0.2721412035163418
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.26022636890411377,
+        0.37192171812057495,
+        0.5435901880264282,
+        0.67609703540802
+      ],
+      "board_span_norm": 0.2898913957928434,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00319.ARW",
+        "saved_to": "/home/viam/images/DSC00319.ARW",
+        "name": "DSC00319.ARW",
+        "size": 63897600.0,
+        "focus_position": 11.0,
+        "capture_count": 1847.0,
+        "duration_s": 0.779,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00319.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    },
+    {
+      "index": 44,
+      "holdout": true,
+      "distance_mm": -150.0,
+      "planned": {
+        "pan_deg": 0.0,
+        "tilt_deg": 7.0,
+        "roll_deg": 0.0
+      },
+      "commanded": {
+        "pan_deg": 0.0,
+        "tilt_deg": 7.0,
+        "roll_deg": 0.0
+      },
+      "joints_commanded_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.495627409026558,
+        87.85992531943714,
+        -0.2720877359417453
+      ],
+      "joints_actual_deg": [
+        91.48722155473509,
+        -11.448872369802093,
+        -25.647075173000033,
+        5.533794079221766,
+        87.82844631071016,
+        -0.2720879760655833
+      ],
+      "attempts": 1,
+      "board_found": true,
+      "board_bbox_norm": [
+        0.3642696142196655,
+        0.487772673368454,
+        0.6415691375732422,
+        0.7805051207542419
+      ],
+      "board_span_norm": 0.2821120747919088,
+      "coverage_cells": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "capture": {
+        "path": "/home/viam/images/DSC00320.ARW",
+        "saved_to": "/home/viam/images/DSC00320.ARW",
+        "name": "DSC00320.ARW",
+        "size": 63979520.0,
+        "focus_position": 11.0,
+        "capture_count": 1848.0,
+        "duration_s": 0.78,
+        "settings": {
+          "white_balance": "flash",
+          "iso": 100.0,
+          "shutter_type": "mechanical",
+          "file_format": "raw",
+          "shutter_speed": "1/160",
+          "aperture": "f/8"
+        },
+        "paths": [
+          "/home/viam/images/DSC00320.ARW"
+        ]
+      },
+      "copied_to": null,
+      "skipped": null
+    }
+  ],
+  "camera_status": {
+    "model": "ILCE-7RM5",
+    "serial": "D085E01583D1",
+    "lens": 0,
+    "connected": true,
+    "capture_dir": "/home/viam/images"
+  },
+  "nominal_joints_deg": [
+    89.7816755076587,
+    -25.81366177930935,
+    -49.102687565896055,
+    3.924495215947804,
+    71.76701059061506,
+    -0.4775907324293866
+  ],
+  "nominal_pose": {
+    "x": 8.004258507057841,
+    "y": 565.4676435604812,
+    "z": 390.95197862702037,
+    "o_x": 0.06878409724271681,
+    "o_y": 0.9938089135269685,
+    "o_z": 0.08725016539153663,
+    "theta": -178.92183684844068
+  },
+  "liveview_size": [
+    1024,
+    680
+  ],
+  "plan": [
+    {
+      "index": 0,
+      "distance_mm": 0.0,
+      "pan_deg": -17.0,
+      "tilt_deg": -14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 1,
+      "distance_mm": 0.0,
+      "pan_deg": -8.5,
+      "tilt_deg": -14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 2,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": -14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 3,
+      "distance_mm": 0.0,
+      "pan_deg": 8.5,
+      "tilt_deg": -14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 4,
+      "distance_mm": 0.0,
+      "pan_deg": 17.0,
+      "tilt_deg": -14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 5,
+      "distance_mm": 0.0,
+      "pan_deg": 17.0,
+      "tilt_deg": -4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 6,
+      "distance_mm": 0.0,
+      "pan_deg": 8.5,
+      "tilt_deg": -4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 7,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": -4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 8,
+      "distance_mm": 0.0,
+      "pan_deg": -8.5,
+      "tilt_deg": -4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 9,
+      "distance_mm": 0.0,
+      "pan_deg": -17.0,
+      "tilt_deg": -4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 10,
+      "distance_mm": 0.0,
+      "pan_deg": -17.0,
+      "tilt_deg": 4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 11,
+      "distance_mm": 0.0,
+      "pan_deg": -8.5,
+      "tilt_deg": 4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 12,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 13,
+      "distance_mm": 0.0,
+      "pan_deg": 8.5,
+      "tilt_deg": 4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 14,
+      "distance_mm": 0.0,
+      "pan_deg": 17.0,
+      "tilt_deg": 4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 15,
+      "distance_mm": 0.0,
+      "pan_deg": 17.0,
+      "tilt_deg": 14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 16,
+      "distance_mm": 0.0,
+      "pan_deg": 8.5,
+      "tilt_deg": 14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 17,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 18,
+      "distance_mm": 0.0,
+      "pan_deg": -8.5,
+      "tilt_deg": 14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 19,
+      "distance_mm": 0.0,
+      "pan_deg": -17.0,
+      "tilt_deg": 14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 20,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 0.0,
+      "roll_deg": 0.0,
+      "holdout": true
+    },
+    {
+      "index": 21,
+      "distance_mm": 0.0,
+      "pan_deg": -8.5,
+      "tilt_deg": 0.0,
+      "roll_deg": 0.0,
+      "holdout": true
+    },
+    {
+      "index": 22,
+      "distance_mm": 0.0,
+      "pan_deg": 0.0,
+      "tilt_deg": -7.0,
+      "roll_deg": 0.0,
+      "holdout": true
+    },
+    {
+      "index": 23,
+      "distance_mm": -150.0,
+      "pan_deg": -17.0,
+      "tilt_deg": -14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 24,
+      "distance_mm": -150.0,
+      "pan_deg": -8.5,
+      "tilt_deg": -14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 25,
+      "distance_mm": -150.0,
+      "pan_deg": 0.0,
+      "tilt_deg": -14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 26,
+      "distance_mm": -150.0,
+      "pan_deg": 8.5,
+      "tilt_deg": -14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 27,
+      "distance_mm": -150.0,
+      "pan_deg": 17.0,
+      "tilt_deg": -14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 28,
+      "distance_mm": -150.0,
+      "pan_deg": 17.0,
+      "tilt_deg": -4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 29,
+      "distance_mm": -150.0,
+      "pan_deg": 8.5,
+      "tilt_deg": -4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 30,
+      "distance_mm": -150.0,
+      "pan_deg": 0.0,
+      "tilt_deg": -4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 31,
+      "distance_mm": -150.0,
+      "pan_deg": -8.5,
+      "tilt_deg": -4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 32,
+      "distance_mm": -150.0,
+      "pan_deg": -17.0,
+      "tilt_deg": -4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 33,
+      "distance_mm": -150.0,
+      "pan_deg": -17.0,
+      "tilt_deg": 4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 34,
+      "distance_mm": -150.0,
+      "pan_deg": -8.5,
+      "tilt_deg": 4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 35,
+      "distance_mm": -150.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 4.667,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 36,
+      "distance_mm": -150.0,
+      "pan_deg": 8.5,
+      "tilt_deg": 4.667,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 37,
+      "distance_mm": -150.0,
+      "pan_deg": 17.0,
+      "tilt_deg": 4.667,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 38,
+      "distance_mm": -150.0,
+      "pan_deg": 17.0,
+      "tilt_deg": 14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 39,
+      "distance_mm": -150.0,
+      "pan_deg": 8.5,
+      "tilt_deg": 14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 40,
+      "distance_mm": -150.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 14.0,
+      "roll_deg": 8.0,
+      "holdout": false
+    },
+    {
+      "index": 41,
+      "distance_mm": -150.0,
+      "pan_deg": -8.5,
+      "tilt_deg": 14.0,
+      "roll_deg": -8.0,
+      "holdout": false
+    },
+    {
+      "index": 42,
+      "distance_mm": -150.0,
+      "pan_deg": -17.0,
+      "tilt_deg": 14.0,
+      "roll_deg": 0.0,
+      "holdout": false
+    },
+    {
+      "index": 43,
+      "distance_mm": -150.0,
+      "pan_deg": 8.5,
+      "tilt_deg": 0.0,
+      "roll_deg": 0.0,
+      "holdout": true
+    },
+    {
+      "index": 44,
+      "distance_mm": -150.0,
+      "pan_deg": 0.0,
+      "tilt_deg": 7.0,
+      "roll_deg": 0.0,
+      "holdout": true
+    }
+  ]
+}

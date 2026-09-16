@@ -65,11 +65,13 @@ The library is `src/models/distortion.py`; the CLI is
 
 ### 1. Shoot the target
 
-**Target.** Checkerboard with **10×7 inner corners** (11×8 squares), squares
-~50–60 mm (about 600×450 mm overall). Matte print — strobes and gloss don't
-mix — mounted dead flat (foam board, Dibond, glass). Measure a printed square
-with a ruler after printing (printers scale) and pass the true value to
-`--square-mm`. Even×odd corners keep the board's orientation unambiguous.
+**Target.** A checkerboard with an odd×even (or even×odd) inner-corner count,
+so orientation is unambiguous, on a matte print — strobes and gloss don't
+mix — mounted dead flat (foam board, Dibond, glass). The board on the Nines
+rig is a calib.io print with **11×8 inner corners** (12×9 squares) of
+**30 mm**: pass `--pattern 11x8 --square-mm 30`. For a home-made print,
+measure a printed square with a ruler afterwards (printers scale) and pass
+the true value to `--square-mm`.
 
 **Camera.** Identical to production: zoom at the 16 mm setpoint via
 `set_zoom_position`, the production focus position, f/8, strobes at production
@@ -96,12 +98,54 @@ distance for the straight-line report.
 Shoot ARW into a dated folder (`calib/2026-09-10-16mm-f8/`) and keep it — the
 calibration JSON records a hash of exactly these files.
 
+**Let the arm do it.** `scripts/shoot_calibration_board.py` drives the
+arm-mounted camera through the whole set against a *stationary* board, so the
+only pose recorded by hand is the nominal one. Mount the board flat where the
+product normally sits, jog the arm until the board is centred with margin at
+the production zoom and focus, then:
+
+```sh
+export VIAM_API_KEY=... VIAM_API_KEY_ID=...
+venv/bin/python scripts/shoot_calibration_board.py \
+  --address <machine>.viam.cloud --pattern 11x8 --square-mm 30 \
+  --count 40 --holdouts 5 --distances-mm 0 -150 \
+  --pan-max 17 --tilt-max 14 --roll-max 8 \
+  --focus-position 11 \
+  --out-dir calib/2026-09-16-16mm-f8 --copy-to calib/2026-09-16-16mm-f8 \
+  --dry-run          # rehearse first; drop the flag to shoot
+```
+
+It generates pan/tilt/roll wrist deltas around the nominal (rotating the
+camera a few tens of degrees puts the board in the frame corners; translating
+it there would need ~0.8 m of travel), translates along the viewing axis for
+each entry in `--distances-mm` (positive = toward the board), and before every shot checks a live-view frame
+for the *whole* board, pulling the pose back toward the nominal when it
+isn't. `--dry-run` moves and checks but never fires, and prints the same 4×3
+coverage grid the CLI grades, so a plan can be rehearsed at low arm speed.
+The pan/tilt maxima are set by the wrist geometry as much as the lens:
+joint 4 with the wrist bent is not a pure pan about the optical axis, and on
+the rig at 16 mm the dry run settled on 17°/14° (the run prints a suggestion
+when many views had to be pulled in). Roll is capped by joint 6's
+motion-service limit at the nominal pose, hence 8°. The 2026-09-16 set
+(46 frames, `calibration/a7rv-selp1635g-16mm-f8.json`) passed every check
+below on the first run.
+The 5 holdouts are low-tilt views; the run ends by printing the
+`calibrate_distortion.py` command with `--holdout-files` filled in, and
+writes `shoot_manifest.json` (joints, live-view board box and the camera's
+capture reply per frame) next to the ARWs. `--copy-to` copies each ARW out of
+the camera module's `capture_dir` as it lands, when the script runs on the
+rig host, so the module's retention cannot eat the set. Moves are joint-space
+(no motion-service obstacle checking): keep the deltas wrist-only, start from
+a nominal you drove to by hand, and use the dry run. `--help` lists the
+joint mapping (`--pan-joint 4 --tilt-joint 5 --roll-joint 6`), joint limits
+and timing knobs.
+
 ### 2. Run the CLI
 
 ```sh
 venv/bin/python scripts/calibrate_distortion.py \
   --input 'calib/2026-09-10-16mm-f8/*.ARW' \
-  --pattern 10x7 --square-mm 55.0 \
+  --pattern 11x8 --square-mm 30 \
   --out calibration/a7rv-selp1635g-16mm-f8.json \
   --zoom-position 0 --focus-position 1234 \
   --holdout-files DSC00160.ARW DSC00161.ARW DSC00162.ARW \

@@ -346,7 +346,7 @@ import os
 
 from PIL import Image
 
-from models.color_correction import ColorCorrection
+from models.color_correction import ColorCorrection, SourceFormatMismatch
 
 
 class _FakeSource:
@@ -402,6 +402,8 @@ def _component(source, output_dir=None):
     cc._upload_file_timeout_s = 180.0
     cc._pending_captures = {}
     cc._capture_seq = 0
+    cc._source_status = {}
+    cc._output_dir_collision_warned = False
     # No distortion calibration unless a test installs one (_with_calibration).
     cc._undistorter = None
     cc._undistorter_key = None
@@ -1572,3 +1574,304 @@ def test_batch_develop_reports_per_file(tmp_path):
     out = asyncio.run(cc.do_command({"develop": {"paths": [a, b]}}))["develop"]
     assert out["count"] == 2
     assert all(r["undistorted"] is True for r in out["developed"])
+
+
+# ---------------------------------------------------------------------------
+# Hardening after the DSC00432.jpg incident: a RAW body handed back a developed
+# JPEG, which was decoded and delivered as the master. The source's returned
+# path is now validated against its file_format, used as returned (never
+# rebuilt from output_dir), and a missing file names who likely removed it.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLogger:
+    """Collects (level, message) so a test can assert on what was logged."""
+
+    def __init__(self):
+        self.records = []
+
+    def __getattr__(self, level):
+        if level not in ("debug", "info", "warning", "warn", "error", "exception"):
+            raise AttributeError(level)
+
+        def log(msg, *args, **kwargs):
+            self.records.append((level, str(msg)))
+
+        return log
+
+    def messages(self, level):
+        return [m for lvl, m in self.records if lvl == level]
+
+
+class _RawBodySource(_FakeSource):
+    """sony-remote shape: `capture` carries `settings.file_format`, `trigger`
+    already saves to the host, `download` is a no-op describe, and
+    `get_settings` / `get_status` answer flat. `saved_path` is whatever file
+    the body hands back - in the incident, a developed JPEG."""
+
+    def __init__(self, saved_path, file_format="raw", settings_on_capture=True,
+                 model="ILCE-7RM5", capture_dir="/tmp/sony-remote"):
+        super().__init__(saved_path)
+        self.file_format = file_format
+        self.settings_on_capture = settings_on_capture
+        self.model = model
+        self.capture_dir = capture_dir
+
+    async def do_command(self, command, *, timeout=None):
+        self.commands.append(command)
+        if "capture" in command:
+            cap = {"path": self.saved_path, "saved_to": self.saved_path,
+                   "name": os.path.basename(self.saved_path)}
+            if self.settings_on_capture:
+                cap["settings"] = {"iso": 100, "file_format": self.file_format}
+            return {"capture": cap}
+        if "trigger" in command:
+            return {"trigger": {"path": self.saved_path, "saved_to": self.saved_path,
+                                "name": os.path.basename(self.saved_path)}}
+        if "download" in command:
+            return {"download": {"path": self.saved_path, "saved_to": self.saved_path}}
+        if "get_settings" in command:
+            return {"iso": 100, "file_format": self.file_format}
+        if "get_status" in command:
+            return {"connected": True, "model": self.model, "lens": "FE PZ 16-35mm F4 G",
+                    "capture_dir": self.capture_dir}
+        raise ValueError("no recognized command")
+
+
+def _write_jpeg(tmp_path, name="DSC00432.jpg"):
+    p = str(tmp_path / name)
+    Image.fromarray(np.full((8, 8, 3), 120, np.uint8)).save(p, format="JPEG")
+    return p
+
+
+@pytest.mark.parametrize("file_format", ["raw", "raw+jpeg", "RAW+HEIF"])
+def test_capture_refuses_a_jpeg_from_a_raw_body(tmp_path, file_format):
+    """The incident: file_format says RAW, the returned still is a .jpg. It is
+    refused before decode, with the reason as the capture's error, and nothing
+    is exported."""
+    jpg = _write_jpeg(tmp_path)
+    source = _RawBodySource(jpg, file_format=file_format)
+    out_dir = tmp_path / "out"
+    cc = _component(source, output_dir=str(out_dir))
+
+    with pytest.raises(SourceFormatMismatch,
+                       match=r"returned DSC00432\.jpg but file_format is raw"):
+        asyncio.run(cc.do_command({"capture": {}}))
+    assert not out_dir.exists() or not any(out_dir.iterdir())
+
+
+def test_capture_file_format_falls_back_to_get_settings(tmp_path):
+    """A source whose capture response has no `settings` block is asked
+    `get_settings`; the check still fires."""
+    jpg = _write_jpeg(tmp_path)
+    source = _RawBodySource(jpg, settings_on_capture=False)
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    with pytest.raises(SourceFormatMismatch, match="file_format is raw"):
+        asyncio.run(cc.do_command({"capture": {}}))
+    assert any("get_settings" in c for c in source.commands)
+
+
+def test_capture_accepts_a_jpeg_when_the_body_shoots_jpeg(tmp_path):
+    """No false positive: a body set to jpeg legitimately returns a .jpg, and
+    the format it reported rides along in the response."""
+    jpg = _write_jpeg(tmp_path)
+    cc = _component(_RawBodySource(jpg, file_format="jpeg"), output_dir=str(tmp_path / "out"))
+    cc._output_formats = ["jpeg"]
+
+    out = asyncio.run(cc.do_command({"capture": {}}))["capture"]
+    assert out["source_path"] == jpg
+    assert out["source_file_format"] == "jpeg"
+    assert out["exports"]
+
+
+def test_capture_without_a_reported_format_is_not_checked(tmp_path):
+    """The ptp model exposes neither `settings` nor `get_settings`; its PNG
+    still develops as before."""
+    png = _write_still(tmp_path)
+    cc = _component(_FakeSource(png), output_dir=str(tmp_path / "out"))
+    cc._output_formats = ["jpeg"]
+    out = asyncio.run(cc.do_command({"capture": {}}))["capture"]
+    assert out["source_path"] == png
+    assert "source_file_format" not in out
+
+
+def test_deferred_capture_refuses_a_jpeg_from_a_raw_body(tmp_path):
+    """Same check on the pipelined path: the background task fails, and the
+    reason surfaces on `capture_result` so the webapp retakes the pose."""
+    jpg = _write_jpeg(tmp_path)
+    source = _RawBodySource(jpg)
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    async def run():
+        ticket = (await cc.do_command({"capture": {"defer": True}}))["capture"]
+        assert ticket["status"] == "pending"
+        with pytest.raises(RuntimeError,
+                           match=r"returned DSC00432\.jpg but file_format is raw"):
+            await cc.do_command(
+                {"capture_result": {"id": ticket["capture_id"], "wait_sec": 30}}
+            )
+
+    asyncio.run(run())
+    # The deferred `download` carries no settings, so the format came from get_settings.
+    assert any("get_settings" in c for c in source.commands)
+
+
+def test_deferred_capture_reports_the_source_format_when_it_matches(tmp_path):
+    png = _write_still(tmp_path)
+    cc = _component(_RawBodySource(png, file_format="jpeg"), output_dir=str(tmp_path / "out"))
+
+    async def run():
+        ticket = (await cc.do_command({"capture": {"defer": True}}))["capture"]
+        return (await cc.do_command(
+            {"capture_result": {"id": ticket["capture_id"], "wait_sec": 30}}
+        ))["capture_result"]
+
+    result = asyncio.run(run())
+    assert result["status"] == "done"
+    assert result["source_path"] == png
+    assert result["source_file_format"] == "jpeg"
+
+
+def test_calibrate_use_capture_refuses_a_jpeg_from_a_raw_body(tmp_path):
+    jpg = _write_jpeg(tmp_path)
+    cc = _component(_RawBodySource(jpg), output_dir=str(tmp_path / "out"))
+    with pytest.raises(SourceFormatMismatch, match="file_format is raw"):
+        asyncio.run(cc._acquire_calibration_source({"use_capture": True}, None))
+
+
+def test_missing_file_error_names_the_wrapped_camera(tmp_path):
+    """The old message blamed the PTP camera's download_dir whatever the source
+    was. It now names the wrapped camera and the two things that remove files
+    behind this component's back."""
+    source = _RawBodySource(None, model="ILCE-7RM5")
+    source.name = "sony"
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+    asyncio.run(cc._refresh_source_status(None))
+    gone = str(tmp_path / "DSC00432.ARW")
+
+    for command in ({"develop": {"path": gone}}, {"preview": {"path": gone}}):
+        with pytest.raises(FileNotFoundError) as info:
+            asyncio.run(cc.do_command(command))
+        msg = str(info.value)
+        assert gone in msg
+        assert "`sony` (ILCE-7RM5)" in msg
+        assert "delete_after_upload" in msg and "retention" in msg
+        assert "PTP" not in msg and "download_dir" not in msg
+
+
+def test_missing_file_error_without_get_status_still_names_the_component(tmp_path):
+    source = _FakeSource(None)
+    source.name = "ptp"
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+    with pytest.raises(FileNotFoundError, match=r"wrapped camera `ptp`"):
+        asyncio.run(cc.do_command({"develop": {"path": str(tmp_path / "IMG_0001.CR3")}}))
+
+
+def test_upload_reports_a_missing_file_with_the_retention_hint(tmp_path, monkeypatch):
+    present = tmp_path / "a.CR3"
+    present.write_bytes(b"raw")
+    gone = str(tmp_path / "b.CR3")
+    cc = _uploader_component(tmp_path, monkeypatch)
+
+    out = asyncio.run(cc._upload({"paths": [str(present), gone]}))
+    assert out["uploaded"] == [str(present)]
+    assert len(out["failed"]) == 1 and out["failed"][0]["path"] == gone
+    assert "retention" in out["failed"][0]["error"]
+    assert "delete_after_upload" in out["failed"][0]["error"]
+
+
+def test_startup_probe_warns_when_output_dir_is_the_source_capture_dir(tmp_path):
+    """Exports written into the source's capture directory are what a
+    directory-diffing capture hands back in place of the RAW."""
+    shared = tmp_path / "stills"
+    shared.mkdir()
+    cc = _component(_RawBodySource(None, capture_dir=str(shared)), output_dir=str(shared))
+    cc.logger = _FakeLogger()
+
+    asyncio.run(cc._probe_source_status())
+    warnings = cc.logger.messages("warning")
+    assert len(warnings) == 1
+    assert "capture directory" in warnings[0] and str(shared) in warnings[0]
+    assert cc._source_status["model"] == "ILCE-7RM5"
+
+    # Once is enough, however many captures follow.
+    asyncio.run(cc._probe_source_status())
+    assert len(cc.logger.messages("warning")) == 1
+
+
+def test_startup_probe_is_quiet_for_a_separate_output_dir(tmp_path):
+    cc = _component(_RawBodySource(None, capture_dir=str(tmp_path / "stills")),
+                    output_dir=str(tmp_path / "exports"))
+    cc.logger = _FakeLogger()
+    asyncio.run(cc._probe_source_status())
+    assert cc.logger.messages("warning") == []
+
+    # A source without get_status (ptp): nothing to compare, no noise.
+    cc2 = _component(_FakeSource(None), output_dir=str(tmp_path / "exports"))
+    cc2.logger = _FakeLogger()
+    asyncio.run(cc2._probe_source_status())
+    assert cc2.logger.messages("warning") == []
+    assert cc2._source_status == {}
+
+
+def test_capture_warns_when_the_returned_still_lives_in_output_dir(tmp_path):
+    """The runtime version of the same check, for a source whose get_status
+    does not say where it writes: the returned path itself shows it."""
+    png = _write_still(tmp_path)          # lives in tmp_path
+    cc = _component(_FakeSource(png), output_dir=str(tmp_path))
+    cc._output_formats = []
+    cc.logger = _FakeLogger()
+    asyncio.run(cc.do_command({"capture": {}}))
+    warnings = cc.logger.messages("warning")
+    assert len(warnings) == 1 and "capture directory" in warnings[0]
+
+
+def test_develop_logs_the_source_path_and_extension(tmp_path):
+    png = _write_still(tmp_path)
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path / "out"))
+    cc._output_formats = []
+    cc.logger = _FakeLogger()
+    asyncio.run(cc.do_command({"develop": {"path": png}}))
+    lines = [m for m in cc.logger.messages("info") if m.startswith("develop: developing ")]
+    assert len(lines) == 1
+    assert png in lines[0] and "extension .png" in lines[0] and "not RAW" in lines[0]
+
+
+def test_capture_logs_the_source_path_and_extension(tmp_path):
+    png = _write_still(tmp_path)
+    cc = _component(_FakeSource(png), output_dir=str(tmp_path / "out"))
+    cc._output_formats = []
+    cc.logger = _FakeLogger()
+    asyncio.run(cc.do_command({"capture": {}}))
+    assert any(m.startswith("capture: developing ") and png in m and "extension .png" in m
+               for m in cc.logger.messages("info"))
+
+
+def test_delete_allows_the_source_capture_dir_alongside_output_dir(tmp_path):
+    """The webapp discards a dark RAW by the path the source returned. With
+    output_dir a separate directory (as it should be), that RAW lives in the
+    source's capture_dir, which is inside the delete boundary once known."""
+    stills = tmp_path / "stills"
+    stills.mkdir()
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    raw = stills / "DSC00432.ARW"
+    raw.write_bytes(b"raw")
+    elsewhere = tmp_path / "elsewhere.ARW"
+    elsewhere.write_bytes(b"raw")
+
+    cc = _component(_RawBodySource(None, capture_dir=str(stills)), output_dir=str(exports))
+    # Before the source has been asked, only output_dir is deletable.
+    out = asyncio.run(cc.do_command({"delete": {"paths": [str(raw)]}}))["delete"]
+    assert out["deleted"] == [] and out["failed"][0]["path"] == str(raw)
+    assert raw.exists()
+
+    asyncio.run(cc._refresh_source_status(None))
+    out = asyncio.run(cc.do_command(
+        {"delete": {"paths": [str(raw), str(elsewhere)]}}
+    ))["delete"]
+    assert out["deleted"] == [str(raw)]
+    assert not raw.exists()
+    assert [f["path"] for f in out["failed"]] == [str(elsewhere)]
+    assert elsewhere.exists()

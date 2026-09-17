@@ -25,9 +25,18 @@ Two ways to get corrected images out of this component:
               preview (the full image stays on disk).
 
    The source still arrives either inline as ``image_base64`` (small JPEGs from
-   CCAPI) or as a downloaded file path in ``saved_to`` - the PTP RAW handoff.
-   Wire the PTP component as this model's ``camera`` dependency and give PTP a
-   ``download_dir`` so its captures land on disk where this model can read them.
+   CCAPI) or as a downloaded file path in ``saved_to`` - the RAW handoff from
+   the PTP model (``download_dir``) or sony-remote (``capture_dir``). Wire that
+   component as this model's ``camera`` dependency, on the same machine, so its
+   captures land on disk where this model can read them. Every path the source
+   hands back is used as returned - absolute, wherever the source keeps its
+   stills - and is never re-derived from this model's ``output_dir``, which
+   should be a directory of its own (a startup warning fires when it is the
+   source's capture directory: exports mixed in with the stills are what a
+   directory-diffing capture can hand back in place of the RAW). When the
+   source reports its ``file_format`` (sony-remote's ``settings``), a returned
+   still whose extension contradicts a RAW format is refused rather than
+   developed, and the error is the capture's response so the caller retakes.
 
        {"capture": {"defer": true}}
        {"capture_result": {"id": "<capture_id>", "wait_sec": 60}}
@@ -211,6 +220,7 @@ from models.image_io import (
     DEFAULT_DEMOSAIC,
     DEMOSAIC_ALGORITHMS,
     EXPORT_FORMATS,
+    RAW_EXTS,
     SHARPEN_OPTIONS,
     TONE_OPTIONS,
     compute_raw_wb_multipliers,
@@ -244,6 +254,30 @@ def _base64_to_rgb(image_base64: str) -> np.ndarray:
     raw = base64.b64decode(image_base64)
     pil = Image.open(BytesIO(raw)).convert("RGB")
     return np.array(pil)
+
+
+class SourceFormatMismatch(ValueError):
+    """The source camera handed back a file whose extension contradicts its own
+    ``file_format`` setting - a developed ``DSC00432.jpg`` from a body set to
+    shoot RAW. Decoding it would push an 8-bit JPEG through the 16-bit pipeline
+    and deliver it as if it were the RAW, so the capture is refused instead and
+    the caller (the webapp) retakes the shot."""
+
+
+def _file_format_of(meta: Any) -> Optional[str]:
+    """``settings.file_format`` from a source response that carries one
+    (sony-remote's ``capture`` does), lowercased; None when absent."""
+    if isinstance(meta, Mapping):
+        settings = meta.get("settings")
+        if isinstance(settings, Mapping) and settings.get("file_format"):
+            return str(settings["file_format"]).lower()
+    return None
+
+
+def _format_expects_raw(file_format: Optional[str]) -> bool:
+    """True for the RAW-producing formats (``raw``, ``raw+jpeg``, ``raw+heif``):
+    the primary file such a capture returns must be the RAW."""
+    return bool(file_format) and "raw" in str(file_format)
 
 
 class ColorCorrection(Camera, EasyResource):
@@ -437,8 +471,16 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._capture_seq: int = getattr(self, "_capture_seq", 0)
 
+        # What the wrapped camera says about itself (sony-remote's get_status:
+        # model, capture_dir, lens; the ptp model has no such command). Probed
+        # in the background at startup so the output_dir / capture_dir clash
+        # is flagged before the first shot, and refreshed on every lens check.
+        self._source_status: Dict[str, Any] = getattr(self, "_source_status", {})
+        self._output_dir_collision_warned: bool = False
+
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+        self._schedule_source_probe()
 
     def _correct_viam_image(self, image: ViamImage) -> ViamImage:
         """Apply the CCM to a single ViamImage, preserving its mime type.
@@ -559,12 +601,15 @@ class ColorCorrection(Camera, EasyResource):
         exposure_stops: float,
         half_size: bool = False,
         sensor_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        file_format: Optional[str] = None,
     ) -> Tuple[np.ndarray, Optional[str]]:
         """
         Turn a source camera's ``capture`` DoCommand response into a
         **linear-light** float RGB array (sRGB primaries) plus the source path.
         ``sensor_transform`` (the undistorter hook) only applies to a file on
         disk: an inline JPEG is neither full size nor in the sensor frame.
+        ``file_format`` is what the source says it shoots (``_source_file_format``);
+        a returned file that contradicts a RAW format is refused before decode.
 
         Two shapes are supported, in priority order:
 
@@ -587,17 +632,27 @@ class ColorCorrection(Camera, EasyResource):
 
         path = capture.get("saved_to") or capture.get("path")
         if path:
-            linear = load_linear_rgb(
-                str(path), white_balance=white_balance,
-                exposure_stops=exposure_stops, half_size=half_size,
-                demosaic=self._demosaic, sensor_transform=sensor_transform,
-            )
-            return linear, str(path)
+            # The path is used exactly as the source returned it - never
+            # rebuilt from output_dir + basename, which only works while the
+            # two directories happen to coincide.
+            path = str(path)
+            self._check_source_format(path, file_format)
+            self._log_develop_source(path, "capture")
+            try:
+                linear = load_linear_rgb(
+                    path, white_balance=white_balance,
+                    exposure_stops=exposure_stops, half_size=half_size,
+                    demosaic=self._demosaic, sensor_transform=sensor_transform,
+                )
+            except FileNotFoundError:
+                raise self._missing_file_error(path) from None
+            return linear, path
 
         raise ValueError(
-            "source camera `capture` returned neither an `image_base64` field "
-            "nor a `saved_to` path; if the source is the PTP camera, configure "
-            "its `download_dir` so captures are written to disk"
+            f"source camera {self._source_label()} `capture` returned neither an "
+            f"`image_base64` field nor a `saved_to` path; it has to write its "
+            f"stills to disk on this machine (the ptp model's `download_dir`, "
+            f"sony-remote's `capture_dir`) for them to be developed"
         )
 
     def _corrector_for(self, raw_ccm: Any) -> ColorCorrector:
@@ -649,6 +704,10 @@ class ColorCorrection(Camera, EasyResource):
             capture = source_resp.get("capture", source_resp)
             if isinstance(capture, Mapping):
                 p = capture.get("saved_to") or capture.get("path")
+                if p:
+                    self._check_source_format(
+                        str(p), await self._source_file_format(capture, timeout)
+                    )
                 if p and is_raw(str(p)):
                     return str(p), None
                 if p:
@@ -896,6 +955,19 @@ class ColorCorrection(Camera, EasyResource):
             f"{time.perf_counter() - start:.2f}s"
         )
 
+        # What the source shoots, so a still that contradicts it (a developed
+        # JPEG from a RAW body) is refused in the decode below instead of
+        # being delivered as the master. Also the first sight of where the
+        # source keeps its stills - the place output_dir must not be.
+        file_format: Optional[str] = None
+        if isinstance(capture, Mapping):
+            file_format = await self._source_file_format(capture, timeout)
+            returned = capture.get("saved_to") or capture.get("path")
+            if returned:
+                self._warn_if_output_dir_is_capture_dir(
+                    os.path.dirname(str(returned)), "the path its `capture` returned"
+                )
+
         # What the source reported about this shot, for the calibration match
         # check: sony-remote's capture carries focus_position (and, once it
         # logs it, zoom_position); the mounted lens comes from get_status.
@@ -917,6 +989,7 @@ class ColorCorrection(Camera, EasyResource):
         linear, source_path = await asyncio.to_thread(
             self._linear_from_capture_response,
             capture, white_balance, exposure_stops, preview_only, transform,
+            file_format,
         )
         self.logger.debug(
             f"[timing] decode to linear RGB (incl. white balance"
@@ -929,6 +1002,8 @@ class ColorCorrection(Camera, EasyResource):
             out_dir_override, True, tone, sharpen,
             corrector=corrector, undistort_info=undistort_info,
         )
+        if file_format:
+            result["source_file_format"] = file_format
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
         )
@@ -1017,19 +1092,36 @@ class ColorCorrection(Camera, EasyResource):
         saved = meta.get("saved_to")
         if not saved:
             raise ValueError(
-                f"source camera did not save {camera_path!r} to disk; configure "
-                f"its `download_dir` so deferred captures can be developed later"
+                f"source camera {self._source_label()} did not save "
+                f"{camera_path!r} to disk; it has to write stills to a local "
+                f"directory (the ptp model's `download_dir`) so deferred "
+                f"captures can be developed later"
             )
-        linear = await asyncio.to_thread(
-            load_linear_rgb, str(saved),
-            white_balance=white_balance, exposure_stops=exposure_stops,
-            half_size=True, demosaic=self._demosaic,
+        # The absolute path the source returned is the handoff - it is what
+        # `develop` and `delete` get later, wherever the source keeps stills.
+        saved = str(saved)
+        # A body set to RAW that hands back a developed JPEG is a bad shot,
+        # not a preview: refuse it here so `capture_result` fails with the
+        # reason and the webapp retakes the pose.
+        file_format = await self._source_file_format(meta, None)
+        self._check_source_format(saved, file_format)
+        self._warn_if_output_dir_is_capture_dir(
+            os.path.dirname(saved), "the path its `download` returned"
         )
+        self._log_develop_source(saved, f"deferred capture {capture_id}")
+        try:
+            linear = await asyncio.to_thread(
+                load_linear_rgb, saved,
+                white_balance=white_balance, exposure_stops=exposure_stops,
+                half_size=True, demosaic=self._demosaic,
+            )
+        except FileNotFoundError:
+            raise self._missing_file_error(saved) from None
         # Measured pre-CCM, with the exposure trim divided back out, so a
         # caller checking for flash misfires (a dark frame the capture itself
         # can't report) reads the light on the sensor, not the develop.
         sensor_mean, sensor_highlights = await asyncio.to_thread(
-            sensor_light_stats, linear, str(saved), exposure_stops
+            sensor_light_stats, linear, saved, exposure_stops
         )
         corrected = await asyncio.to_thread(corrector.apply_to_linear, linear)
         preview = await asyncio.to_thread(
@@ -1039,10 +1131,10 @@ class ColorCorrection(Camera, EasyResource):
             f"[timing] deferred capture {capture_id} background "
             f"(download + decode + preview): {time.perf_counter() - start:.2f}s"
         )
-        return {
+        result: Dict[str, ValueTypes] = {
             "capture_id": capture_id,
             "status": "done",
-            "source_path": str(saved),
+            "source_path": saved,
             "image_base64": preview,
             "mime_type": CameraMimeType.JPEG.value,
             "ccm_applied": not corrector.is_identity,
@@ -1050,6 +1142,9 @@ class ColorCorrection(Camera, EasyResource):
             "sensor_mean_luminance": sensor_mean,
             "sensor_highlight_fraction": sensor_highlights,
         }
+        if file_format:
+            result["source_file_format"] = file_format
+        return result
 
     async def _capture_result(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
@@ -1155,16 +1250,20 @@ class ColorCorrection(Camera, EasyResource):
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
             t_file = time.perf_counter()
+            self._log_develop_source(path, "develop")
             # One plan per file: its info dict is filled in by the hook as the
             # file decodes and lands in that file's result.
             transform, undistort_info = self._undistort_plan(opts)
             # Decode + export are seconds of pure CPU per file; keep them off
             # the event loop so other requests stay responsive mid-batch.
-            linear = await asyncio.to_thread(
-                load_linear_rgb,
-                path, white_balance=white_balance, exposure_stops=exposure_stops,
-                demosaic=self._demosaic, sensor_transform=transform,
-            )
+            try:
+                linear = await asyncio.to_thread(
+                    load_linear_rgb,
+                    path, white_balance=white_balance, exposure_stops=exposure_stops,
+                    demosaic=self._demosaic, sensor_transform=transform,
+                )
+            except FileNotFoundError:
+                raise self._missing_file_error(path) from None
             results.append(
                 await asyncio.to_thread(
                     self._develop_one,
@@ -1215,6 +1314,8 @@ class ColorCorrection(Camera, EasyResource):
         if not path:
             raise ValueError("`preview` needs a `path`")
         path = str(path)
+        if not os.path.exists(path):
+            raise self._missing_file_error(path)
 
         crop = self._parse_crop(opts.get("crop"))
         max_dim = int(opts.get("max_dim", 1024))
@@ -1556,15 +1657,8 @@ class ColorCorrection(Camera, EasyResource):
         the ptp (Canon) model has no such command. Only asked when a
         calibration is in play, and a failure just leaves the lens unchecked.
         """
-        try:
-            resp = await self.camera.do_command({"get_status": {}}, timeout=timeout)
-        except Exception as exc:  # noqa: BLE001 - optional metadata
-            self.logger.debug(
-                f"source lens unavailable for the calibration match check: {exc}"
-            )
-            return None
-        status = resp.get("get_status", resp) if isinstance(resp, Mapping) else {}
-        lens = status.get("lens") if isinstance(status, Mapping) else None
+        status = await self._refresh_source_status(timeout)
+        lens = status.get("lens")
         return str(lens) if lens else None
 
     def _undistort_plan(
@@ -1706,6 +1800,127 @@ class ColorCorrection(Camera, EasyResource):
         if (x, y, w, h) == (0.0, 0.0, 1.0, 1.0):
             return None
         return (x, y, w, h)
+
+    # ------------------------------------------------------------------
+    # The wrapped camera: identity, capture directory, file format
+    # ------------------------------------------------------------------
+
+    def _schedule_source_probe(self) -> None:
+        """Kick off the startup ``get_status`` probe without blocking
+        ``reconfigure``. With no running loop (a component built by hand in a
+        test) there is nothing to schedule on."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        # Held on self: the loop only keeps a weak reference to a task, so an
+        # unreferenced probe could be collected before it runs.
+        self._source_probe_task = loop.create_task(self._probe_source_status())
+
+    async def _probe_source_status(self) -> None:
+        """Startup: learn the wrapped camera's model and capture directory, and
+        warn when this component's ``output_dir`` is that same directory."""
+        status = await self._refresh_source_status(timeout=10.0)
+        capture_dir = status.get("capture_dir")
+        if capture_dir:
+            self._warn_if_output_dir_is_capture_dir(str(capture_dir), "its `get_status`")
+
+    async def _refresh_source_status(self, timeout: Optional[float]) -> Dict[str, Any]:
+        """Best effort ``get_status`` on the source (sony-remote answers it, the
+        ptp model does not). Caches the last good answer; a failure leaves the
+        cache alone and returns it."""
+        try:
+            resp = await self.camera.do_command({"get_status": {}}, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - optional metadata
+            self.logger.debug(f"source camera get_status unavailable: {exc}")
+            return self._source_status
+        status = resp.get("get_status", resp) if isinstance(resp, Mapping) else {}
+        if isinstance(status, Mapping):
+            self._source_status = dict(status)
+        return self._source_status
+
+    def _source_label(self) -> str:
+        """The wrapped camera as an operator knows it: the component name, plus
+        the model its ``get_status`` reported once that has been read."""
+        name = getattr(self.camera, "name", None)
+        label = f"`{name}`" if name else "the source camera"
+        model = self._source_status.get("model")
+        return f"{label} ({model})" if model else label
+
+    def _missing_file_error(self, path: str) -> FileNotFoundError:
+        """The error for a source file that is no longer on disk, naming the
+        two things that remove files behind this component's back."""
+        return FileNotFoundError(
+            f"{path} is not on disk. It may have been deleted by another "
+            f"component's `delete_after_upload`, or pruned by the retention of "
+            f"the wrapped camera {self._source_label()} (`retention_max_files` "
+            f"removes the oldest stills in its capture directory); if it was "
+            f"captured just now, check that the camera and this component "
+            f"run on the same machine"
+        )
+
+    async def _source_file_format(
+        self, meta: Any, timeout: Optional[float]
+    ) -> Optional[str]:
+        """What the source shoots: ``settings.file_format`` from its response
+        when it carries one (sony-remote's ``capture``), else a best-effort
+        ``get_settings``. None when the source exposes neither (the ptp model),
+        which skips the extension check rather than failing the capture."""
+        fmt = _file_format_of(meta)
+        if fmt:
+            return fmt
+        try:
+            resp = await self.camera.do_command({"get_settings": {}}, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - optional metadata
+            self.logger.debug(
+                f"source camera get_settings unavailable; file_format not checked: {exc}"
+            )
+            return None
+        settings = resp.get("get_settings", resp) if isinstance(resp, Mapping) else {}
+        fmt = settings.get("file_format") if isinstance(settings, Mapping) else None
+        return str(fmt).lower() if fmt else None
+
+    @staticmethod
+    def _check_source_format(path: str, file_format: Optional[str]) -> None:
+        """Refuse a returned still whose extension contradicts a RAW
+        ``file_format`` - the developed JPEG that once came back in place of
+        the .ARW. Unknown format: nothing to check against."""
+        if not _format_expects_raw(file_format) or is_raw(path):
+            return
+        ext = os.path.splitext(path)[1]
+        raise SourceFormatMismatch(
+            f"source camera returned {os.path.basename(path)} but file_format is "
+            f"{file_format}: expected a RAW ({', '.join(RAW_EXTS)}), got "
+            f"{ext or 'a file without an extension'}; refusing to develop it - "
+            f"retake the shot"
+        )
+
+    def _log_develop_source(self, path: str, what: str) -> None:
+        """One info line per develop naming the source file and its extension,
+        so a wrong-format still is visible in the machine log at a glance."""
+        ext = os.path.splitext(path)[1].lower()
+        self.logger.info(
+            f"{what}: developing {path} (extension {ext or 'none'}, "
+            f"{'RAW' if is_raw(path) else 'not RAW'})"
+        )
+
+    def _warn_if_output_dir_is_capture_dir(self, capture_dir: str, how: str) -> None:
+        """Warn (once) when ``output_dir`` is the directory the wrapped camera
+        writes its stills to. Exports mixed in with the stills are what its
+        retention prunes and what a directory-diffing capture can hand back in
+        place of the RAW."""
+        if not self._output_dir or self._output_dir_collision_warned or not capture_dir:
+            return
+        if os.path.realpath(self._output_dir) != os.path.realpath(capture_dir):
+            return
+        self._output_dir_collision_warned = True
+        self.logger.warning(
+            f"`output_dir` {self._output_dir} is the wrapped camera "
+            f"{self._source_label()}'s capture directory (per {how}): exports "
+            f"will land among its stills, where its retention can prune them and "
+            f"a capture that finds new files by diffing the directory can return "
+            f"an export instead of the RAW; give `output_dir` a directory of its own"
+        )
 
     def _close_data_client(self) -> None:
         """Close the cached cloud channel, if one was ever dialed. Idempotent."""
@@ -1866,6 +2081,12 @@ class ColorCorrection(Camera, EasyResource):
                 )
                 self.logger.error(f"failed to upload {path}: {msg}")
                 failed.append({"path": path, "error": msg})
+            except FileNotFoundError:
+                # Gone before we got to it: say who is likely to have taken it
+                # rather than echoing a bare "No such file".
+                msg = str(self._missing_file_error(path))
+                self.logger.error(f"failed to upload {path}: {msg}")
+                failed.append({"path": path, "error": msg})
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
                 self.logger.error(f"failed to upload {path}: {exc}")
                 failed.append({"path": path, "error": str(exc)})
@@ -1900,9 +2121,13 @@ class ColorCorrection(Camera, EasyResource):
         no other exit path and would otherwise accumulate in the download dir
         forever; the webapp sends their paths here at submit time.
 
-        Guarded: only files inside the configured ``output_dir`` may be
-        deleted, so a caller can't reach arbitrary paths on the host. Requires
-        ``output_dir`` to be set (without it there is no boundary to enforce).
+        Guarded: only files inside the configured ``output_dir`` - or inside
+        the wrapped camera's capture directory, when its ``get_status`` reports
+        one - may be deleted, so a caller can't reach arbitrary paths on the
+        host. The second root is what lets the webapp discard a RAW the source
+        wrote to its own directory when ``output_dir`` is (as it should be) a
+        different one. Requires ``output_dir`` to be set (without it there is
+        no boundary to enforce).
 
         ``opts``:
           ``paths``  list of file paths to delete (required)
@@ -1918,7 +2143,11 @@ class ColorCorrection(Camera, EasyResource):
                 "`delete` requires `output_dir` to be configured: it only "
                 "removes files inside that directory"
             )
-        root = os.path.realpath(self._output_dir)
+        roots = [os.path.realpath(self._output_dir)]
+        capture_dir = self._source_status.get("capture_dir")
+        if capture_dir:
+            roots.append(os.path.realpath(str(capture_dir)))
+        allowed = " or ".join(dict.fromkeys(roots))
 
         deleted: List[str] = []
         missing: List[str] = []
@@ -1928,10 +2157,12 @@ class ColorCorrection(Camera, EasyResource):
             # realpath also resolves symlinks, so a link inside output_dir
             # pointing elsewhere can't smuggle a delete outside the boundary.
             real = os.path.realpath(path)
-            if os.path.commonpath([real, root]) != root:
-                self.logger.warning(f"refusing to delete outside output_dir: {path}")
+            if not any(os.path.commonpath([real, root]) == root for root in roots):
+                self.logger.warning(
+                    f"refusing to delete outside output_dir / capture_dir: {path}"
+                )
                 failed.append(
-                    {"path": path, "error": f"outside output_dir {self._output_dir}"}
+                    {"path": path, "error": f"outside output_dir {allowed}"}
                 )
                 continue
             try:

@@ -58,7 +58,7 @@ installs those automatically on Debian/Ubuntu.
 |------------------|--------------|-----------|-----------------------------------------------------------------------------------------|
 | `camera`         | string       | Required  | Source camera to wrap; declared as a dependency. Required even for `develop`.           |
 | `ccm`            | 3×3 array    | Optional  | Color correction matrix from `calibrate_color`. Omit to pass images through unchanged.  |
-| `output_dir`     | string       | Optional  | Where `capture`/`develop` write exports. Default: next to the source file.              |
+| `output_dir`     | string       | Optional  | Where `capture`/`develop` write exports. Default: next to the source file. Give it a directory of its own — **not** the source camera's `capture_dir` / `download_dir`: exports mixed in with the stills get pruned by the camera's retention, and a camera that finds its new still by diffing the directory can hand back an export instead of the RAW. A warning is logged at startup (and on the first capture) when the two coincide. |
 | `output_formats` | string[]     | Optional  | Any of `tiff16`/`tiff8`/`jpeg`/`png16`/`png8`. Default: all four.                       |
 | `jpeg_quality`   | int          | Optional  | JPEG export quality. Default `95`.                                                      |
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
@@ -160,6 +160,19 @@ returned in `calibration_warnings` (or fails the capture under
 `strict_calibration_match`); a source without those commands (the ptp model)
 is developed with the match logged as not checked. A frame whose size differs
 from the calibration's `image_size` is always an error.
+
+The still the source returns is used by the absolute path it reports
+(`saved_to` / `path`), wherever the source keeps its files — it is never
+re-derived from `output_dir`. When the source also reports what it shoots
+(sony-remote's `settings.file_format` on the capture response, or its
+`get_settings`), a returned file that contradicts a RAW format — a developed
+`DSC00432.jpg` from a body set to `raw` — is **refused before decode**: the
+capture fails with `source camera returned DSC00432.jpg but file_format is
+raw ...` (on the deferred path, `capture_result` fails with it) so the caller
+can retake instead of shipping an 8-bit JPEG as the master. The format the
+source reported is echoed as `source_file_format`. A source that exposes
+neither (the ptp model) is not checked. Every develop logs the source path and
+its extension at info level.
 
 > **Sharpness:** RAW captures are soft before sharpening — every developer
 > (Capture One, Lightroom) applies a default capture sharpen, so an unsharpened
@@ -272,18 +285,29 @@ directory grows by every frame ever shot.
 { "delete": { "paths": ["/photos/IMG_0041.CR3"] } }
 ```
 
-Guarded: requires `output_dir` to be configured, and only files inside it can
-be deleted (symlinks are resolved before the check). Returns `{"deleted":
-[...], "count": N, "missing": [...], "failed": [{"path", "error"}]}` —
-already-missing files land in `missing`, so retrying a cleanup is harmless.
+Guarded: requires `output_dir` to be configured, and only files inside it — or
+inside the wrapped camera's capture directory, when its `get_status` reports a
+`capture_dir` (sony-remote does) — can be deleted (symlinks are resolved before
+the check). The second root is what lets a RAW be discarded by the path the
+source returned while `output_dir` is a separate directory. Returns
+`{"deleted": [...], "count": N, "missing": [...], "failed": [{"path",
+"error"}]}` — already-missing files land in `missing`, so retrying a cleanup
+is harmless.
+
+A `develop`, `preview`, or `upload` of a file that is no longer on disk fails
+naming the wrapped camera (component name and reported model) and the two
+things that remove files behind this component's back: another component's
+`delete_after_upload`, and the camera's own retention
+(`retention_max_files`).
 
 ## Typical workflows
 
-**Live capture (with the `ptp` model):**
+**Live capture (with the `ptp` or `sony-remote` model):**
 
-1. Configure the `ptp` component with a `download_dir`, and configure
-   `color-correction` with `camera` pointing at it. Both must run on the same
-   machine (shared filesystem).
+1. Configure the source component to write stills to disk (`ptp`'s
+   `download_dir`, `sony-remote`'s `capture_dir`), and configure
+   `color-correction` with `camera` pointing at it and an `output_dir` of its
+   own. Both must run on the same machine (shared filesystem).
 2. Frame the ColorChecker and run `calibrate_color` (`use_capture: true`) once;
    check the returned `delta_e.after.mean` is low (a few units).
 3. Copy the returned `ccm` into the `ccm` config attribute and save.

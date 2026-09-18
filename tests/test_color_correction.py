@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from models.calibration import (
+    ChartOutOfFrame,
     _oriented_chart_grid,
     _OUT_OF_GAMUT,
     CCM_FIT_WEIGHTS,
@@ -325,6 +326,47 @@ def test_oriented_grid_survives_white_balance_cast():
     rx, ry = detection["centers"][18]
     # rot90(k=1) maps (x, y) -> (y, W-1-x) where W is the original width
     assert abs(rx - uy) < 1.5 and abs(ry - (upright.shape[1] - 1 - ux)) < 1.5
+
+
+def test_oriented_grid_rejects_chart_cut_off_by_frame_edge():
+    """A detected quad past the frame edge (the lens zoomed in too far) must
+    fail with a reframing message, not a bare pixel-coordinate error later.
+    Reproduces the Nines-Photographer run whose centre landed at y=-329."""
+    img = _synthetic_chart()
+    h, w = img.shape[:2]
+    box = np.array([(0, -0.3 * h), (w, -0.3 * h), (w, 0.7 * h), (0, 0.7 * h)], dtype=np.float32)
+    with pytest.raises(ChartOutOfFrame, match="top edge.*zoom out"):
+        _oriented_chart_grid(img, box)
+    # Cut off on two sides names both.
+    box = np.array([(-0.2 * w, 0), (w, 0), (w, 1.2 * h), (-0.2 * w, 1.2 * h)], dtype=np.float32)
+    with pytest.raises(ChartOutOfFrame, match="left and bottom edge"):
+        _oriented_chart_grid(img, box)
+
+
+def test_oriented_grid_tolerates_corners_on_the_frame_edge():
+    """The detector's quad may sit a hair past the border of a frame-filling
+    chart; that is not "cut off"."""
+    img = _synthetic_chart()
+    h, w = img.shape[:2]
+    slop = 0.005 * min(w, h)
+    box = np.array([(-slop, -slop), (w + slop, -slop), (w + slop, h + slop), (-slop, h + slop)], dtype=np.float32)
+    detection = _oriented_chart_grid(img, box)
+    assert detection is not None
+    assert detection["orientation_score"] > 2.0
+
+
+def test_oriented_grid_scorer_does_not_wrap_around_the_frame():
+    """Inside the tolerance, a centre whose sampling window crosses the edge
+    must clamp rather than wrap to the far side of the image."""
+    img = _synthetic_chart()
+    h, w = img.shape[:2]
+    slop = 0.009 * min(w, h)
+    box = np.array([(0, -slop), (w, -slop), (w, h - slop), (0, h - slop)], dtype=np.float32)
+    detection = _oriented_chart_grid(img, box)
+    assert detection is not None
+    centers = [(int(x), int(y)) for x, y in detection["centers"]]
+    measured = PatchSampler.sample_at_centers(img, centers)
+    assert np.allclose(measured, srgb_to_linear(REFERENCE_SRGB), atol=0.02)
 
 
 def test_oriented_grid_rejects_non_chart():

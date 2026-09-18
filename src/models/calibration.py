@@ -25,6 +25,17 @@ import numpy as np
 
 from models.image_io import linear_to_srgb, srgb_to_linear
 
+
+class ChartOutOfFrame(ValueError):
+    """The detector found a ColorChecker, but part of it lies past the frame edge.
+
+    Distinct from "no chart found" because the remedy is different: the
+    operator has to zoom out or move the chart, not re-present it. Raised
+    before any patch is sampled - a centre off the frame would otherwise
+    surface much later as a bare pixel-coordinate error, or wrap around to
+    the far side of the image and score as a plausible orientation.
+    """
+
 # OpenCV's ColorChecker detector (cv2.mcc) lives in opencv-contrib; import lazily
 # so the module still loads (and the streaming/develop paths work) on a host
 # without it - calibration raises a clean, actionable error at point of use.
@@ -290,6 +301,35 @@ def _orientation_score(measured_srgb: np.ndarray) -> float:
 _MIN_ORIENTATION_SCORE = 0.75
 
 
+# How far past the frame edge a detected chart corner may sit before the chart
+# counts as cut off, as a fraction of the shorter image side. The detector's
+# quad hugs the chart's outer border, so a chart that exactly fills the frame
+# lands on the edge itself; anything meaningfully beyond it is missing pixels.
+_FRAME_EDGE_TOLERANCE = 0.01
+
+
+def _require_chart_in_frame(corners: np.ndarray, w: int, h: int) -> None:
+    """Raise ChartOutOfFrame if the detected quad extends past the image."""
+    tol = _FRAME_EDGE_TOLERANCE * min(w, h)
+    xs, ys = corners[:, 0], corners[:, 1]
+    if xs.min() < -tol or ys.min() < -tol or xs.max() > w + tol or ys.max() > h + tol:
+        sides = []
+        if xs.min() < -tol:
+            sides.append("left")
+        if xs.max() > w + tol:
+            sides.append("right")
+        if ys.min() < -tol:
+            sides.append("top")
+        if ys.max() > h + tol:
+            sides.append("bottom")
+        raise ChartOutOfFrame(
+            f"the ColorChecker is cut off by the {' and '.join(sides)} edge of the "
+            f"frame (detected chart spans x {xs.min():.0f}..{xs.max():.0f}, "
+            f"y {ys.min():.0f}..{ys.max():.0f} in a {w}x{h} image); zoom out or "
+            f"move the chart so the whole chart is visible, then recalibrate"
+        )
+
+
 def _oriented_chart_grid(
     img_rgb: np.ndarray, box: np.ndarray, *, rows: int = 4, cols: int = 6
 ) -> Optional[Dict[str, Any]]:
@@ -308,6 +348,7 @@ def _oriented_chart_grid(
     """
     corners = _order_corners(box)
     h, w = img_rgb.shape[:2]
+    _require_chart_in_frame(corners, w, h)
     img_f = img_rgb.astype(np.float32) / 255.0
 
     def make_grid(c0, c1, c2, c3):
@@ -326,8 +367,14 @@ def _oriented_chart_grid(
         out = np.zeros((len(centers), 3), dtype=np.float32)
         for i, (x, y) in enumerate(centers):
             xi, yi = int(round(float(x))), int(round(float(y)))
+            # Clamp both ends: a negative far index would wrap the slice to
+            # the opposite side of the image and score a slab of the frame
+            # as if it were a patch.
             x0, y0 = max(0, xi - radius), max(0, yi - radius)
-            patch = img_f[y0:yi + radius, x0:xi + radius].reshape(-1, 3)
+            x1, y1 = min(w, xi + radius), min(h, yi + radius)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            patch = img_f[y0:y1, x0:x1].reshape(-1, 3)
             if patch.size:
                 out[i] = np.median(patch, axis=0)
         return out

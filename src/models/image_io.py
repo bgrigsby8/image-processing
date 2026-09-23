@@ -593,15 +593,34 @@ def compute_raw_wb_multipliers(
 # and "medium" are the earlier hand-tuned lifts kept for continuity. Endpoints
 # are pinned so black stays black, white white. ``none`` (default) is the
 # identity - pure colorimetric output.
-TONE_OPTIONS: Tuple[str, ...] = ("none", "medium", "bright", "c1")
+#
+# "c1-match" is a refit of the Capture One look (2026-09-23, A7R V + FE PZ 16-35
+# at 16mm): the same ARW developed by this pipeline (CCM + measured WB,
+# exposure_stops 0 - the as-shot exposure C1 also sees) and by Capture One's
+# default Sony rendering (16-bit Adobe RGB export), ColorChecker Classic in
+# frame. Knots are the six neutral patches, float-sampled from both renders and
+# taken to sRGB; the shape between knots was checked against ~350k aligned
+# neutral frame pixels (within 2 codes). Unlike the other curves it is applied
+# PER CHANNEL, which is how C1 applies its film curve: on the 24 patches that
+# lands 6.8 dE from the C1 export (neutrals 1.0) versus 8.3 luminance-only, at
+# the cost of the hue guarantee below. It reproduces C1's rendering of the
+# as-shot exposure - a calibration exposure trim on top of it renders brighter
+# than C1 would.
+TONE_OPTIONS: Tuple[str, ...] = ("none", "medium", "bright", "c1", "c1-match")
 _TONE_CURVES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
     "c1":     ([0, 53, 92, 129, 168, 206, 245, 255],
                [0, 43, 103, 159, 199, 223, 239, 255]),
+    "c1-match": ([0, 43.6, 73.9, 103.0, 134.2, 164.2, 197.6, 255],
+                 [0, 51.3, 107.9, 163.5, 204.9, 229.3, 244.3, 255]),
     "bright": ([0, 52, 85, 122, 160, 200, 243, 255],
                [0, 48, 105, 160, 200, 224, 240, 255]),
     "medium": ([0, 52, 85, 122, 160, 200, 243, 255],
                [0, 50,  95, 141, 180, 212, 242, 255]),
 }
+# Curves applied to each RGB channel independently (Capture One's behaviour)
+# rather than to luminance only. This scales saturated colours' channels
+# unequally, so hue is not preserved - it is part of the look being matched.
+_TONE_PER_CHANNEL: frozenset = frozenset({"c1-match"})
 _TONE_LUT_SIZE = 4096
 _TONE_LUT_CACHE: Dict[str, np.ndarray] = {}
 
@@ -659,14 +678,18 @@ def apply_tone_curve(srgb01: np.ndarray, tone: Optional[str]) -> np.ndarray:
     """Apply a delivery tone curve to gamma-encoded sRGB in [0,1], to *luminance
     only*: each pixel's RGB is scaled by ``f(luma)/luma``, so the curve changes
     lightness/contrast while leaving hue and saturation untouched (a per-channel
-    curve would twist hue). ``None``/``"none"`` is the identity (colour-accurate,
-    colorimetric output)."""
+    curve would twist hue). The curves in ``_TONE_PER_CHANNEL`` are the
+    exception and are applied to each channel, deliberately reproducing that
+    twist. ``None``/``"none"`` is the identity (colour-accurate, colorimetric
+    output)."""
     if not tone or tone == "none":
         return srgb01
     if tone not in _TONE_CURVES:
         raise ValueError(f"unknown tone {tone!r}; valid: {', '.join(TONE_OPTIONS)}")
     lut = _tone_lut(tone)
     grid = np.linspace(0.0, 1.0, lut.size, dtype=np.float32)
+    if tone in _TONE_PER_CHANNEL:
+        return np.interp(np.clip(srgb01, 0.0, 1.0), grid, lut).astype(np.float32)
     luma = np.clip(srgb01 @ _LUMA, 0.0, 1.0)
     new_luma = np.interp(luma, grid, lut).astype(np.float32)
     # Scale RGB by the luminance gain; where luma ~ 0 there's no colour to keep,

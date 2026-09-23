@@ -63,7 +63,7 @@ installs those automatically on Debian/Ubuntu.
 | `jpeg_quality`   | int          | Optional  | JPEG export quality. Default `95`.                                                      |
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
 | `exposure_stops` | number       | Optional  | Default exposure compensation (stops) applied at the raw stage. Paste the value `calibrate_color` reports to render captures at the calibrated reference brightness. Default `0`. A per-call `exposure_stops` overrides it. |
-| `tone`           | string       | Optional  | Delivery "look" applied on export: `none` (default — colour-accurate / colorimetric output), `medium`, or `bright` (a Capture One-style midtone lift). Only lightness/contrast changes — the CCM keeps hue accurate. Applied to every export and the preview; recorded in the sidecar. A per-call `tone` overrides it. |
+| `tone`           | string       | Optional  | Delivery "look" applied on export: `none` (default — colour-accurate / colorimetric output), `medium`, `bright`, or `c1` (Capture One-style midtone lifts, applied to luminance only so the CCM keeps hue accurate), or `c1-match` (a per-channel curve fitted against a Capture One default export of the same A7R V RAW — closest to what a photographer sees in C1, at the cost of C1's hue twist on saturated colours; see below). Applied to every export and the preview; recorded in the sidecar. A per-call `tone` overrides it. |
 | `sharpen`        | string       | Optional  | Capture sharpening (luminance unsharp mask): `none` (default), `light`, `medium`, `strong`. RAW is soft before sharpening, so an unsharpened export looks blurry next to a Capture One / Lightroom render. Applied to every export and the preview; recorded in the sidecar. A per-call `sharpen` overrides it. |
 | `demosaic`       | string       | Optional  | RAW demosaic algorithm: `DHT` (default — sharper than libraw's stock AHD), or `AHD`/`AAHD`/`DCB`/`VNG`/`PPG`. (AMAZE/LMMSE need GPL demosaic packs not bundled in the libraw wheels.) A per-call `demosaic` overrides it. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
@@ -146,7 +146,7 @@ pipeline, and writes the exports + sidecar. Returns a small base64 JPEG
 
 Options (all optional): `capture_options` (forwarded to the source's `capture`),
 `white_balance`, `exposure_stops` (exposure compensation applied at the raw
-stage), `tone` (delivery look: `none`/`medium`/`bright`), `sharpen` (capture
+stage), `tone` (delivery look: `none`/`medium`/`bright`/`c1`/`c1-match`), `sharpen` (capture
 sharpening: `none`/`light`/`medium`/`strong`), `demosaic` (RAW demosaic
 algorithm), `output_formats`, `output_dir`, `undistort` (apply the configured
 distortion calibration; a per-call `false` gives an uncorrected frame to
@@ -172,6 +172,17 @@ from the calibration's `image_size` is always an error.
 > midtones (mid-grey ~200). Set `tone: bright` to reproduce that lift (or `medium`
 > for roughly half). The CCM is untouched, so hue stays accurate — only
 > lightness/contrast changes.
+>
+> `tone: c1-match` goes further: it is fitted (2026-09-23, A7R V) so that this
+> pipeline's render of a RAW at the **as-shot exposure** (`exposure_stops: 0`)
+> lands on Capture One's default export of the same RAW — the six ColorChecker
+> neutrals within 1.3 dE, all 24 patches at 6.8 dE mean (the residual is C1's
+> colour profile lifting dark blues and purples, which no tone curve reaches).
+> It is applied per channel, as C1 does, so saturated colours pick up C1's hue
+> and saturation shift. Two things follow: it is only a C1 match when the
+> develop is not also exposure-trimmed — a calibration `exposure_stops` on top
+> renders that much brighter than C1 would — and it is a look, not an accurate
+> rendering; `none` remains the colorimetric reference.
 
 Returns:
 

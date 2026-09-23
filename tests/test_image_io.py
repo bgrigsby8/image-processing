@@ -441,10 +441,29 @@ def test_tone_curves_pass_through_their_anchors():
     # On a neutral patch the luminance-only curve must reproduce the measured
     # ColorChecker mapping at the anchor points (that's what makes "c1" match
     # Capture One); R=G=B in => R=G=B out at the anchor value.
-    for tone in ("c1", "bright", "medium"):
+    for tone in ("c1", "c1-match", "bright", "medium"):
         xs, ys = _TONE_CURVES[tone]
         got = apply_tone_curve(_gray(np.asarray(xs, np.float32) / 255.0), tone) * 255.0
         assert np.allclose(got[..., 0], ys, atol=0.5), (tone, got[..., 0], ys)
+        # neutral in, neutral out - for the per-channel curve too
+        assert np.allclose(got[..., 0], got[..., 1]) and np.allclose(got[..., 1], got[..., 2])
+
+
+def test_c1_match_is_per_channel_and_listed():
+    # c1-match reproduces Capture One's per-channel film curve, so a saturated
+    # colour's channels are curved independently: the result equals the curve
+    # applied to each channel, not a luminance-scaled copy of the input.
+    assert "c1-match" in TONE_OPTIONS
+    color = np.array([[0.6, 0.3, 0.15]], np.float32)
+    out = apply_tone_curve(color, "c1-match")[0]
+    per_channel = np.array([apply_tone_curve(_gray(c), "c1-match")[0, 0] for c in color[0]])
+    assert np.allclose(out, per_channel, atol=1e-5), (out, per_channel)
+    ratio_in = color[0] / color[0].max()
+    assert not np.allclose(ratio_in, out / out.max(), atol=0.02)  # hue is *not* preserved, by design
+    # The fitted knots: mid-grey (ColorChecker neutral 6.5 as this pipeline
+    # renders it at the as-shot exposure) lands where Capture One puts it.
+    mid = float(apply_tone_curve(_gray(134.2 / 255.0), "c1-match")[0, 0]) * 255.0
+    assert abs(mid - 204.9) < 0.5
 
 
 def test_tone_curve_preserves_hue():
@@ -459,7 +478,7 @@ def test_tone_curve_preserves_hue():
 
 def test_tone_curves_are_monotonic_and_lift_midtones():
     ramp = _gray(np.linspace(0.0, 1.0, 4000, dtype=np.float32))
-    for tone in ("c1", "bright", "medium"):
+    for tone in ("c1", "c1-match", "bright", "medium"):
         out = apply_tone_curve(ramp, tone)[..., 0]
         # Monotone (Fritsch-Carlson) => no tonal inversion / overshoot.
         assert (np.diff(out) >= -1e-6).all()

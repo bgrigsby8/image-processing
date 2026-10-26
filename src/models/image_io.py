@@ -262,9 +262,10 @@ def load_linear_rgb(
     """
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"image file not found at {path!r}; if this came from the PTP "
-            f"camera, configure its `download_dir` so captures are persisted to "
-            f"disk, and make sure both components run on the same machine"
+            f"image file not found at {path!r}; it may have been deleted since "
+            f"it was captured (a retention policy, or a `delete_after_upload`), "
+            f"or the camera that wrote it and this process may not share a "
+            f"filesystem"
         )
 
     if is_raw(path):

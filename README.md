@@ -238,3 +238,53 @@ unchanged by design), and the webapp crops the retained developed frame anyway.
   signal);
 - a straight-edge spot check on a developed frame drifts above 1 px of bow in
   the centre crop.
+
+## Focus sweep
+
+`scripts/focus_sweep.py` finds the sharpest focus position for a fixed
+shooting distance. It steps the `sony` camera's focus across a range, shoots
+the checkerboard at each step and ranks the frames by ISO 12233 slanted-edge
+MTF50, measured on every square edge of the board. The library is
+`src/models/sharpness.py`.
+
+**Set-up.** The checkerboard sits flat at the product plane, with the whole
+board in frame where the product's centre would be. **Turn it ~5° on its
+mount** so the square edges are slanted. Edges within 2° of the pixel axes
+can't be measured, so an unrotated board loses most of them. Use production
+zoom, aperture, strobes, shutter and ISO, and stop the webapp first: nothing
+else may drive the camera during the run.
+
+```sh
+venv/bin/python scripts/focus_sweep.py \
+    --address <machine>.viam.cloud --pattern 11x8 \
+    --start 45000 --stop 65535 --coarse-step 2000 \
+    --compare 59142 --out-dir focus/2026-10-27-outfits --dry-run
+```
+
+The run has four phases:
+
+1. **Coarse:** the whole range at `--coarse-step`.
+2. **Fine:** `--fine-step` steps around the coarse peak.
+3. **Repeat:** returns to the best position from each side, which shows
+   whether focus survives the movie-mode to stills-mode switch.
+4. **Compare:** one frame at each `--compare` position.
+
+Focus is put back where it started at the end.
+
+The same sweep is available as a `focus_sweep` DoCommand on
+`color-correction`, which runs on the rig host next to the RAWs; poll
+`focus_sweep_status` for the result (see the model's README). The CLI's
+analysis needs the RAWs, so run the CLI on the rig host or pass
+`--copy-to`. If the files can't be reached, the captures are still recorded;
+copy them next to `focus_sweep.json` and run `--analyze <out-dir>`.
+
+The report gives:
+
+- the best position, from a parabola fit;
+- the range within 85 % of peak MTF50, which is how much focus error doesn't
+  show;
+- the scatter of the repeat frames;
+- each compare position as a percentage of peak.
+
+MTF50 is in cycles/pixel and LW/PH, measured on linear green with no tone
+curve or sharpening. Compare values within one sweep, not across set-ups.

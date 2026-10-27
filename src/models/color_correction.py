@@ -135,6 +135,28 @@ Two ways to get corrected images out of this component:
               or per-``upload`` option), which removes each file only after
               its upload succeeds.
 
+Focus (see sharpness.py and focus_sweep.py):
+
+       {"measure_sharpness": {"path": "/photos/board.ARW", "pattern": "11x8"}}
+           -> ISO 12233 slanted-edge MTF50 of a checkerboard frame on disk:
+              median over every square edge, in cycles/pixel and LW/PH.
+       {"focus_sweep": {"pattern": "11x8", "start": 45000, "stop": 65535,
+                        "compare": [59142]}}
+           -> start a focus sweep on the source camera in the background:
+              coarse and fine passes of set_focus_position + capture + MTF50,
+              repeat visits to the best position from each side, then the
+              ``compare`` positions; focus is restored at the end. Returns
+              {"id", "status": "running", "plan", "manifest_path"} at once.
+       {"focus_sweep_status": {"wait_sec": 30}}
+           -> progress rows, and once done the ``peak`` (best_position,
+              usable_range), ``repeat`` scatter and a text ``report``.
+       {"focus_sweep_cancel": {}}
+           -> stop it (focus is still restored).
+              While a sweep runs, this component refuses ``capture``,
+              ``calibrate_color`` and forwarded camera commands other than
+              ``get_*``, so nothing else moves the lens or fires the shutter
+              through it.
+
 Calibration:
 
        {"calibrate_color": {}}
@@ -216,6 +238,17 @@ from models.distortion import (
     Undistorter,
     file_sha256,
 )
+from models.focus_sweep import (
+    MANIFEST as FOCUS_SWEEP_MANIFEST,
+    Sweeper,
+    coarse_positions,
+    coerce_pattern,
+    frame_rows,
+    options_from_command,
+    peak_of,
+)
+from models.focus_sweep import _jsonable as _focus_jsonable
+from models.sharpness import analyze_raw
 from models.image_io import (
     DEFAULT_DEMOSAIC,
     DEMOSAIC_ALGORITHMS,
@@ -471,6 +504,11 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._capture_seq: int = getattr(self, "_capture_seq", 0)
 
+        # The running (or last) `focus_sweep` job: {id, task, sweeper,
+        # started_at}. Preserved across reconfigure like pending captures -
+        # a sweep outlives a config change, and its result stays collectable.
+        self._focus_sweep: Optional[Dict[str, Any]] = getattr(self, "_focus_sweep", None)
+
         # What the wrapped camera says about itself (sony-remote's get_status:
         # model, capture_dir, lens; the ptp model has no such command). Probed
         # in the background at startup so the output_dir / capture_dir clash
@@ -551,6 +589,7 @@ class ColorCorrection(Camera, EasyResource):
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
         resp: Dict[str, ValueTypes] = {}
+        self._refuse_during_focus_sweep(command)
 
         if "calibrate_color" in command:
             resp["calibrate_color"] = await self._calibrate_color(
@@ -578,6 +617,24 @@ class ColorCorrection(Camera, EasyResource):
 
         if "delete" in command:
             resp["delete"] = self._delete_local(command.get("delete") or {})
+
+        if "measure_sharpness" in command:
+            resp["measure_sharpness"] = await self._measure_sharpness(
+                command.get("measure_sharpness") or {}
+            )
+
+        if "focus_sweep" in command:
+            resp["focus_sweep"] = self._start_focus_sweep(command.get("focus_sweep") or {})
+
+        if "focus_sweep_status" in command:
+            resp["focus_sweep_status"] = await self._focus_sweep_status(
+                command.get("focus_sweep_status") or {}
+            )
+
+        if "focus_sweep_cancel" in command:
+            resp["focus_sweep_cancel"] = await self._focus_sweep_cancel(
+                command.get("focus_sweep_cancel") or {}
+            )
 
         if not resp:
             # Not one of ours: forward verbatim to the source camera so
@@ -2254,10 +2311,193 @@ class ColorCorrection(Camera, EasyResource):
             return base
         return name + base[len(capture_stem):]
 
+    # ------------------------------------------------------------------
+    # Focus: sharpness measurement and the focus sweep (sharpness.py,
+    # focus_sweep.py)
+    # ------------------------------------------------------------------
+
+    # Commands that cannot disturb a running sweep: they neither fire the
+    # shutter nor move the lens. (`focus_sweep` itself refuses a second
+    # sweep with its own, clearer error.)
+    _SWEEP_SAFE_COMMANDS = (
+        "focus_sweep", "focus_sweep_status", "focus_sweep_cancel", "measure_sharpness",
+        "develop", "preview", "upload", "delete", "capture_result",
+    )
+
+    def _focus_sweep_running(self) -> bool:
+        job = getattr(self, "_focus_sweep", None)
+        return job is not None and not job["task"].done()
+
+    def _refuse_during_focus_sweep(self, command: Mapping[str, Any]) -> None:
+        """While a sweep drives the camera, refuse anything else that would:
+        a capture would be shot at a sweep focus position, and a focus or
+        zoom move would corrupt the sweep. Read-only ``get_*`` commands
+        forwarded to the source are let through. Only guards commands that
+        come through this component - one sent straight to the source
+        camera can't be stopped here."""
+        if not self._focus_sweep_running():
+            return
+        names = [
+            str(command.get("command")) if key == "command" else str(key)
+            for key in command
+        ]
+        blocked = [
+            n for n in names
+            if n not in self._SWEEP_SAFE_COMMANDS and not n.startswith("get_")
+        ]
+        if blocked:
+            raise RuntimeError(
+                f"focus sweep {self._focus_sweep['id']} is driving the camera "
+                f"(phase: {self._focus_sweep['sweeper'].phase}); {blocked} refused "
+                f"until it finishes - poll `focus_sweep_status`, or stop it "
+                f"with `focus_sweep_cancel`"
+            )
+
+    async def _measure_sharpness(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Slanted-edge MTF50 of a checkerboard frame already on disk.
+
+        ``opts``:
+          ``path``     RAW (or image) file to measure (required)
+          ``pattern``  board inner corners, ``"11x8"`` or ``[11, 8]`` (required)
+          ``edges``    true to include every edge's result, not just the summary
+        """
+        path = opts.get("path")
+        if not path:
+            raise ValueError("`measure_sharpness` needs a `path`")
+        path = str(path)
+        if not os.path.exists(path):
+            raise self._missing_file_error(path)
+        pattern = coerce_pattern(opts.get("pattern"))
+        result, _ = await asyncio.to_thread(
+            analyze_raw, path, pattern, demosaic=self._demosaic
+        )
+        out: Dict[str, Any] = result.summary()
+        if opts.get("edges"):
+            out["edges"] = [
+                {"kind": e.kind, "center": list(e.center), "angle_deg": e.angle_deg,
+                 "mtf50": e.mtf50, "error": e.error}
+                for e in result.edges
+            ]
+        return json.loads(json.dumps(out, default=_focus_jsonable))
+
+    def _start_focus_sweep(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Start a focus sweep on the source camera in the background and return
+        at once; poll ``focus_sweep_status`` for progress and the result. See
+        focus_sweep.py for the phases. Options are the CLI's settings
+        (``pattern`` required; ``start``, ``stop``, ``coarse_step``,
+        ``fine_step``, ``repeat``, ``compare``, ``approach_margin``,
+        ``tolerance``, ``leave_at_best``, ``out_dir``, ``copy_to``, timeouts).
+        The manifest goes to ``out_dir``, by default
+        ``<output_dir>/focus_sweeps/<timestamp>``.
+        """
+        if self._focus_sweep_running():
+            raise RuntimeError(
+                f"focus sweep {self._focus_sweep['id']} is already running; "
+                f"poll `focus_sweep_status` or stop it with `focus_sweep_cancel`"
+            )
+        args = options_from_command(opts)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        if args.out_dir is None:
+            base = self._output_dir or os.environ.get("VIAM_MODULE_DATA") or os.getcwd()
+            args.out_dir = os.path.join(base, "focus_sweeps", stamp)
+        sweep_id = f"sweep-{stamp}"
+        sweeper = Sweeper(
+            args, cam=self.camera,
+            log=lambda msg: self.logger.info(f"[{sweep_id}] {msg.strip()}"),
+        )
+
+        async def _run() -> int:
+            try:
+                return await sweeper.execute()
+            except Exception as exc:  # noqa: BLE001 - kept for the status call
+                self.logger.error(f"[{sweep_id}] focus sweep failed: {exc}")
+                raise
+
+        self._focus_sweep = {
+            "id": sweep_id,
+            "task": asyncio.create_task(_run()),
+            "sweeper": sweeper,
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        return {
+            "id": sweep_id,
+            "status": "running",
+            "out_dir": args.out_dir,
+            "manifest_path": os.path.join(args.out_dir, FOCUS_SWEEP_MANIFEST),
+            "plan": {
+                "coarse": coarse_positions(args.start, args.stop, args.coarse_step),
+                "fine_step": args.fine_step,
+                "fine_half_span": 2 * args.coarse_step,
+                "repeat_each_side": args.repeat,
+                "compare": list(args.compare),
+            },
+        }
+
+    async def _focus_sweep_status(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Progress and, once finished, the result of the current (or last)
+        focus sweep. ``wait_sec`` blocks up to that long for it to finish.
+        ``status``: running | done | cancelled | failed (or none, when no
+        sweep has run since the module started).
+        """
+        job = getattr(self, "_focus_sweep", None)
+        if job is None:
+            return {"status": "none"}
+        if opts.get("id") and opts["id"] != job["id"]:
+            raise ValueError(f"unknown focus sweep id {opts['id']!r}; the last one is {job['id']!r}")
+        task, sweeper = job["task"], job["sweeper"]
+        wait_sec = float(opts.get("wait_sec", 0) or 0)
+        if wait_sec > 0 and not task.done():
+            await asyncio.wait({task}, timeout=wait_sec)
+
+        out: Dict[str, Any] = {
+            "id": job["id"],
+            "started_at": job["started_at"],
+            "phase": sweeper.phase,
+            "frames": len(sweeper.records),
+            "manifest_path": os.path.join(sweeper.args.out_dir, FOCUS_SWEEP_MANIFEST),
+            "rows": frame_rows(sweeper.records),
+        }
+        if not task.done():
+            out["status"] = "running"
+            peak = peak_of([r for r in sweeper.records if r.get("phase") in ("coarse", "fine")])
+            if peak is not None:
+                out["best_so_far"] = round(peak.best_position)
+        elif task.cancelled() or sweeper.manifest.get("interrupted"):
+            out["status"] = "cancelled"
+        elif task.exception() is not None:
+            out["status"] = "failed"
+            out["error"] = f"{type(task.exception()).__name__}: {task.exception()}"
+        else:
+            out["status"] = "done"
+        if task.done():
+            out["peak"] = sweeper.manifest.get("peak")
+            out["repeat"] = sweeper.manifest.get("repeat")
+            out["report"] = sweeper.report_text
+        return json.loads(json.dumps(out, default=_focus_jsonable))
+
+    async def _focus_sweep_cancel(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """Stop the running sweep. It still restores focus and writes its
+        manifest; ``wait_sec`` (default 60) waits for that clean-up."""
+        if not self._focus_sweep_running():
+            return {"status": "not_running"}
+        job = self._focus_sweep
+        job["task"].cancel()
+        await asyncio.wait({job["task"]}, timeout=float(opts.get("wait_sec", 60)))
+        return await self._focus_sweep_status({})
+
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
     ) -> Sequence[Geometry]:
         return await self.camera.get_geometries(extra=extra, timeout=timeout)
 
     async def close(self):
+        job = getattr(self, "_focus_sweep", None)
+        if job is not None and not job["task"].done():
+            # Cancelling runs the sweep's own clean-up (focus restored,
+            # manifest written); give it a moment to finish that.
+            job["task"].cancel()
+            await asyncio.wait({job["task"]}, timeout=30)
         self._close_data_client()

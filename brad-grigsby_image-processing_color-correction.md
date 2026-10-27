@@ -311,6 +311,63 @@ things that remove files behind this component's back: another component's
 `delete_after_upload`, and the camera's own retention
 (`retention_max_files`).
 
+### Focus: measure sharpness and sweep for best focus
+
+Sharpness is ISO 12233 slanted-edge MTF50, measured on every square edge of
+a checkerboard. Turn the board ~5° so the edges are slanted.
+
+`measure_sharpness` scores a frame already on disk:
+
+```json
+{ "measure_sharpness": { "path": "/home/viam/images/DSC00300.ARW", "pattern": "11x8" } }
+```
+
+It returns `mtf50` (median over usable edges, cycles/pixel), `mtf50_lw_ph`,
+`mtf50_iqr`, separate vertical and horizontal medians, and
+`edges_used`/`edges_total`. Pass `"edges": true` for every edge's result.
+
+`focus_sweep` finds the sharpest focus position. It drives the wrapped
+camera (`set_focus_position` + `capture`) in the background and returns at
+once:
+
+```json
+{ "focus_sweep": { "pattern": "11x8", "start": 45000, "stop": 65535,
+                   "coarse_step": 2000, "fine_step": 400, "repeat": 3,
+                   "compare": [59142] } }
+```
+
+The sweep runs four phases:
+
+1. **Coarse:** the whole range.
+2. **Fine:** a finer pass around the coarse peak.
+3. **Repeat:** returns to the best position from each side, which shows
+   whether focus survives the movie-mode to stills-mode switch.
+4. **Compare:** one frame at each `compare` position.
+
+Focus is put back where it started at the end, unless you pass
+`"leave_at_best": true`. Other options: `approach_margin`, `tolerance`,
+`out_dir` (default `<output_dir>/focus_sweeps/<timestamp>`), `copy_to`,
+`focus_timeout_s`, `capture_timeout_s`. Unknown options are refused.
+
+Poll for progress and the result:
+
+```json
+{ "focus_sweep_status": { "wait_sec": 30 } }
+```
+
+`status` is `running`, `done`, `cancelled` or `failed`. The response always
+has `rows` (one per frame: target, read-back, MTF50, path) and shows
+`best_so_far` while running. Once finished it adds `peak` (`best_position`,
+`peak_mtf50`, and `usable_range`, the positions within 85 % of peak), the
+`repeat` scatter, and a text `report`. The full record is written to
+`manifest_path`.
+
+`{ "focus_sweep_cancel": {} }` stops a sweep. Focus is still restored.
+
+While a sweep runs, this component refuses `capture`, `calibrate_color` and
+any forwarded camera command except `get_*`. Commands sent straight to the
+camera component are not blocked, so pause the webapp first.
+
 ## Typical workflows
 
 **Live capture (with the `ptp` or `sony-remote` model):**

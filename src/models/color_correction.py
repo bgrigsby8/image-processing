@@ -2470,6 +2470,9 @@ class ColorCorrection(Camera, EasyResource):
         elif task.exception() is not None:
             out["status"] = "failed"
             out["error"] = f"{type(task.exception()).__name__}: {task.exception()}"
+        elif sweeper.manifest.get("aborted"):
+            out["status"] = "failed"
+            out["error"] = sweeper.manifest["aborted"]
         else:
             out["status"] = "done"
         if task.done():

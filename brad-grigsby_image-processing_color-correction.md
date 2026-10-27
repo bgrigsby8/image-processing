@@ -345,7 +345,16 @@ The sweep runs four phases:
 4. **Compare:** one frame at each `compare` position.
 
 Focus is put back where it started at the end, unless you pass
-`"leave_at_best": true`. Other options: `approach_margin`, `tolerance`,
+`"leave_at_best": true`.
+
+Each capture waits `settle_s` (default 3) after the focus move. A capture
+straight after the camera switches from movie mode back to stills can produce
+no file. A failed capture is retried `capture_retries` times (default 1). If a
+frame still fails, it is recorded with its error and the sweep moves on. After
+`max_failures` failed frames in a row (default 3), the sweep stops with status
+`failed`.
+
+Other options: `approach_margin`, `tolerance`,
 `out_dir` (default `<output_dir>/focus_sweeps/<timestamp>`), `copy_to`,
 `focus_timeout_s`, `capture_timeout_s`. Unknown options are refused.
 

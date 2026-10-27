@@ -76,10 +76,18 @@ MAX_CA_RESIDUAL_PX = 0.3
 
 COVERAGE_COLS, COVERAGE_ROWS = 4, 3
 
-# Sub-pixel refinement: cornerSubPix's winSize is a half-width, so 5 gives an
-# 11x11 window - a few px of CA shift converges to the channel's own corner
-# from the G start without wandering to a neighbour.
-SUBPIX_HALF_WINDOW = 5
+# Sub-pixel refinement: cornerSubPix's winSize is a half-width. The window has
+# to be sized to the board as imaged, not fixed: on the rig's 61 MP frames a
+# checkerboard square is ~100 px and a black/white edge takes ~11 px to
+# transition (16 mm at f/8, DHT demosaic), so an 11x11 window sees only the
+# soft middle of the edges and *degrades* the SB detector's corners from
+# ~0.35 px to ~3 px of planar residual. A window of ~1/5 of the square spacing
+# (clamped) covers the edges around the corner without reaching a neighbour,
+# and a few px of CA shift still converges from the G start.
+SUBPIX_WINDOW_FRACTION = 0.2
+SUBPIX_MIN_HALF_WINDOW = 5
+SUBPIX_MAX_HALF_WINDOW = 40
+SUBPIX_HALF_WINDOW = SUBPIX_MIN_HALF_WINDOW   # the small-image fallback detector
 _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-4)
 
 
@@ -172,16 +180,36 @@ def detect_checkerboard(
     return ((pts + 0.5) / detect_scale - 0.5).astype(np.float32)
 
 
+def corner_spacing_px(corners: np.ndarray, pattern: Tuple[int, int]) -> float:
+    """Median distance between neighbouring corners along a board row - the
+    square size in image pixels, which sizes the sub-pixel window."""
+    cols, rows = pattern
+    grid = np.asarray(corners, dtype=np.float64).reshape(rows, cols, 2)
+    return float(np.median(np.linalg.norm(np.diff(grid, axis=1), axis=2)))
+
+
+def subpix_half_window(spacing_px: float) -> int:
+    """Half-width of the ``cornerSubPix`` window for a board imaged at
+    ``spacing_px`` pixels per square (see ``SUBPIX_WINDOW_FRACTION``)."""
+    return int(np.clip(round(spacing_px * SUBPIX_WINDOW_FRACTION),
+                       SUBPIX_MIN_HALF_WINDOW, SUBPIX_MAX_HALF_WINDOW))
+
+
 def refine_corners(
     channel: np.ndarray,
     corners: np.ndarray,
     half_window: int = SUBPIX_HALF_WINDOW,
 ) -> np.ndarray:
     """``cornerSubPix`` on a single float32 (or uint8) channel, starting from
-    ``corners`` ``(N, 2)``. Returns the refined ``(N, 2)`` float32 array."""
+    ``corners`` ``(N, 2)``. Returns a new refined ``(N, 2)`` float32 array;
+    the input is never modified."""
     if channel.dtype not in (np.float32, np.uint8):
         channel = channel.astype(np.float32)
-    pts = np.ascontiguousarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    # cornerSubPix refines *in place*, and ascontiguousarray hands back the
+    # caller's own buffer when it is already float32 and contiguous - which
+    # silently turned the G, R and B corner sets into one shared array (and
+    # the CA fit into an exact zero). Always work on a copy.
+    pts = np.array(corners, dtype=np.float32, copy=True).reshape(-1, 1, 2)
     refined = cv2.cornerSubPix(
         channel, pts, (half_window, half_window), (-1, -1), _SUBPIX_CRITERIA
     )
@@ -237,10 +265,11 @@ def process_frame(
         if coarse is None:
             result.error = "checkerboard not found (whole board must be visible)"
             return result
-        result.corners_g = refine_corners(g, coarse)
+        half = subpix_half_window(corner_spacing_px(coarse, pattern))
+        result.corners_g = refine_corners(g, coarse, half)
         if want_ca:
-            result.corners_r = refine_corners(stretch_for_detection(linear[..., 0]), result.corners_g)
-            result.corners_b = refine_corners(stretch_for_detection(linear[..., 2]), result.corners_g)
+            result.corners_r = refine_corners(stretch_for_detection(linear[..., 0]), result.corners_g, half)
+            result.corners_b = refine_corners(stretch_for_detection(linear[..., 2]), result.corners_g, half)
     finally:
         result.seconds = time.perf_counter() - start
     return result
@@ -355,6 +384,12 @@ def _line_residual_max(pts: np.ndarray) -> float:
     direction = vt[0]
     normal = np.array([-direction[1], direction[0]])
     return float(np.abs((p - centre) @ normal).max())
+
+
+def _fmt_px(value: Optional[float]) -> str:
+    """``0.42`` or ``n/a`` - the straight-line variants are None when no board
+    line has 3+ corners in the region they measure."""
+    return "n/a" if value is None else f"{value:.2f}"
 
 
 def line_bow(
@@ -547,9 +582,9 @@ def evaluate_acceptance(quality: Dict[str, Any], lateral_ca: Optional[Dict[str, 
     else:
         checks.append(Check(
             "straight-line (center 50%)", after <= MAX_CENTER_BOW_AFTER_PX,
-            f"bow {before:.2f} px -> {after:.2f} px in {sl.get('frame')} "
+            f"bow {_fmt_px(before)} px -> {_fmt_px(after)} px in {sl.get('frame')} "
             f"(limit {MAX_CENTER_BOW_AFTER_PX}); full frame "
-            f"{sl.get('max_bow_px_before', float('nan')):.2f} -> {sl.get('max_bow_px_after', float('nan')):.2f} px",
+            f"{_fmt_px(sl.get('max_bow_px_before'))} -> {_fmt_px(sl.get('max_bow_px_after'))} px",
         ))
     if lateral_ca:
         for ch in ("R", "B"):
@@ -855,19 +890,31 @@ def run(opts: RunOptions, log=print) -> Dict[str, Any]:
         sl_frame = next((f for f in frames if f.name == wanted), None)
         if sl_frame is None:
             log(f"  --straight-edge-frame {wanted} has no detected board; using the flattest holdout instead")
-    if sl_frame is None and holdout:
-        tilts = [board_tilt_deg(h[1]) for h in hold]
-        sl_frame = holdout[int(np.argmin(tilts))]
     if sl_frame is None:
-        # No holdout: use the flattest training board.
-        tilts = [board_tilt_deg(r) for r in result.rvecs]
-        sl_frame = used[int(np.argmin(tilts))]
+        # Flattest board, holdouts before training frames - but prefer one
+        # that actually crosses the centre crop, since that is the number the
+        # acceptance check is judged on. On the rig the flattest holdout can
+        # be a board parked in a frame corner, which measures the wrong place
+        # and reports n/a for the crop.
+        ranked = (
+            sorted(zip([board_tilt_deg(h[1]) for h in hold], holdout), key=lambda t: t[0])
+            + sorted(zip([board_tilt_deg(r) for r in result.rvecs], used), key=lambda t: t[0])
+        )
+        candidates = [f for _, f in ranked]
+        sl_frame = next(
+            (f for f in candidates
+             if straight_line_report(f.corners_g, opts.pattern, calib, f.name)
+             ["center_crop"]["max_bow_px_before"] is not None),
+            candidates[0],
+        )
     quality["straight_line_test"] = straight_line_report(sl_frame.corners_g, opts.pattern, calib, sl_frame.name)
     sl = quality["straight_line_test"]
+    # A board that never enters the centre crop (or has <3 corners on any one
+    # line there) yields None for that variant - report it, don't crash.
     log(f"  straight-line test on {sl['frame']}: full frame bow "
-        f"{sl['max_bow_px_before']:.2f} -> {sl['max_bow_px_after']:.2f} px; "
-        f"center 50% crop {sl['center_crop']['max_bow_px_before']:.2f} -> "
-        f"{sl['center_crop']['max_bow_px_after']:.2f} px")
+        f"{_fmt_px(sl['max_bow_px_before'])} -> {_fmt_px(sl['max_bow_px_after'])} px; "
+        f"center 50% crop {_fmt_px(sl['center_crop']['max_bow_px_before'])} -> "
+        f"{_fmt_px(sl['center_crop']['max_bow_px_after'])} px")
     quality["invalid_output_fraction"] = invalid_output_fraction(calib)
     if quality["invalid_output_fraction"] > 0:
         log(f"  note: {quality['invalid_output_fraction'] * 100:.2f}% of output pixels sample "

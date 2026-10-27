@@ -111,7 +111,8 @@ def _args(tmp_path, **over):
         address="x", api_key=None, api_key_id=None, camera="sony", pattern=(11, 8),
         start=53000, stop=65535, coarse_step=2000, fine_step=400, repeat=2,
         compare=[59142], approach_margin=3000, tolerance=None, dry_run=False,
-        leave_at_best=False, focus_timeout_s=10, capture_timeout_s=10, analyze=None,
+        leave_at_best=False, settle_s=0.0, capture_retries=1, max_failures=3,
+        focus_timeout_s=10, capture_timeout_s=10, analyze=None,
         out_dir=str(tmp_path / "out"), copy_to=None,
     )
     vars(a).update(over)
@@ -173,3 +174,66 @@ def test_analyze_offline_remeasures_manifest(tmp_path, monkeypatch):
         again = json.load(f)
     assert again["peak"]["best_position"] == pytest.approx(BEST, abs=400)
     assert "analyzed_at" in again
+
+
+class CaptureTimeoutError(RuntimeError):
+    """Stands in for sony-remote's error, as it arrives over gRPC."""
+
+
+def _failing(cam, should_fail):
+    """Wrap the fake camera so `capture` raises when ``should_fail()``."""
+    orig = cam.do_command
+
+    async def do_command(cmd, timeout=None):
+        if "capture" in cmd and should_fail():
+            raise CaptureTimeoutError("no file appeared in /home/viam/images")
+        return await orig(cmd, timeout)
+
+    cam.do_command = do_command
+    return cam
+
+
+def test_failed_capture_is_retried(tmp_path, monkeypatch):
+    """A capture straight after a focus move can produce no file; the retry
+    after the settle wait gets it."""
+    monkeypatch.setattr(fs, "analyze_raw", _stub_analyze)
+    left = [1]
+
+    def once():
+        left[0] -= 1
+        return left[0] >= 0
+
+    cam = _failing(FakeCamera(str(tmp_path)), once)
+    sweeper = fs.Sweeper(_args(tmp_path, fine_step=0, repeat=0, compare=[]), cam=cam)
+    assert asyncio.run(sweeper.execute()) == 0
+    assert not any(r.get("error") for r in sweeper.records)
+    assert sweeper.manifest["peak"]["best_position"] == pytest.approx(BEST, abs=400)
+
+
+def test_one_bad_frame_does_not_end_the_sweep(tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "analyze_raw", _stub_analyze)
+    cam = FakeCamera(str(tmp_path))
+    _failing(cam, lambda: cam.position == 57000)
+    sweeper = fs.Sweeper(_args(tmp_path, fine_step=0, repeat=0, compare=[]), cam=cam)
+    asyncio.run(sweeper.execute())
+    bad = [r for r in sweeper.records if r.get("error")]
+    assert [r["target"] for r in bad] == [57000]
+    assert "CaptureTimeoutError" in bad[0]["error"]
+    assert len(sweeper.records) == 8                      # the rest still shot
+    assert sweeper.manifest["peak"] is not None
+    assert "no file appeared" in fs.format_table(sweeper.records)
+
+
+def test_sweep_aborts_after_repeated_failures_and_restores_focus(tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "analyze_raw", _stub_analyze)
+    cam = _failing(FakeCamera(str(tmp_path)), lambda: True)
+    sweeper = fs.Sweeper(_args(tmp_path), cam=cam)
+    asyncio.run(sweeper.execute())
+    assert len(sweeper.records) == 3
+    assert "3 frames in a row failed" in sweeper.manifest["aborted"]
+    assert cam.moves[-1] == 59142
+
+
+def test_command_options_take_settle_and_retry_settings():
+    args = fs.options_from_command({"pattern": [11, 8], "settle_s": 5, "capture_retries": 2.0})
+    assert args.settle_s == 5.0 and args.capture_retries == 2 and args.max_failures == 3

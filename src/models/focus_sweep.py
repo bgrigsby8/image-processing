@@ -55,6 +55,10 @@ from models.sharpness import FocusPeak, analyze_raw, fit_focus_peak
 
 TOOL_VERSION = "0.1.0"
 FOLLOW_FOCUS_MAX = 0xFFFF
+
+
+class SweepAborted(RuntimeError):
+    """Too many frames in a row failed to shoot; the rig needs a look."""
 MANIFEST = "focus_sweep.json"
 _NOT_FOUND = "checkerboard not found"
 
@@ -130,7 +134,8 @@ def format_table(records: Sequence[Dict[str, Any]], height: Optional[int] = None
             f"{r.get('phase', ''):<8}{r.get('target', ''):>7}{'' if read is None else read:>7}  "
             f"{'' if v is None else f'{v:.3f}':>6}  {'' if lw is None else f'{lw:.0f}':>6}  "
             f"{s.get('edges_used', 0):>3}/{s.get('edges_total', 0):<3} {bar}"
-            + (f"  ({s['error']})" if s.get("error") and v is None else "")
+            + (f"  ({(r.get('error') or s['error'])[:160]})"
+               if (r.get("error") or s.get("error")) and v is None else "")
         )
     return "\n".join(lines)
 
@@ -191,6 +196,7 @@ class Sweeper:
         self.corners_hint: Optional[np.ndarray] = None
         self.can_analyze = True
         self.phase = "starting"
+        self.consecutive_failures = 0
         self.report_text: Optional[str] = None
         self.robot = None
         self.cam = cam
@@ -248,6 +254,26 @@ class Sweeper:
                 "duration_s", "settings")
         return {k: cap.get(k) for k in keep if k in cap}
 
+    async def capture_after_focus(self) -> Dict[str, Any]:
+        """Capture once the body has settled after a focus move.
+
+        A movie-mode focus move ends with the body switching back to stills,
+        and a shutter release straight after that switch can produce no file
+        (seen on the A7R V: the capture times out, while one a few seconds
+        later works). So wait ``settle_s`` first, and retry a failed capture
+        ``capture_retries`` times after the same wait.
+        """
+        a = self.args
+        for attempt in range(a.capture_retries + 1):
+            await asyncio.sleep(a.settle_s)
+            try:
+                return await self.capture()
+            except Exception as exc:  # noqa: BLE001 - retried, then re-raised
+                if attempt >= a.capture_retries:
+                    raise
+                self.log(f"    capture failed ({str(exc)[:200]}); retrying after {a.settle_s:g}s")
+        raise AssertionError("unreachable")
+
     # -- one frame ------------------------------------------------------------
 
     async def shoot(self, phase: str, target: int, *, approach: Optional[str] = None,
@@ -256,17 +282,31 @@ class Sweeper:
         rec: Dict[str, Any] = {"phase": phase, "target": int(target), "time": _now()}
         if approach:
             rec["approach"] = approach
-        if pre_position is not None:
-            rec["pre_position"] = int(pre_position)
-            await self.set_focus(pre_position)
         t0 = time.perf_counter()
-        focus = await self.set_focus(target)
-        rec["set_focus"] = focus
-        rec["readback"] = focus.get("position")
-        if focus.get("ok") is False:
-            self.log(f"    focus missed {target}: read back {focus.get('position')} "
-                  f"({focus.get('stop_reason', 'no reason given')}); shooting anyway")
-        rec["capture"] = await self.capture()
+        try:
+            if pre_position is not None:
+                rec["pre_position"] = int(pre_position)
+                await self.set_focus(pre_position)
+            focus = await self.set_focus(target)
+            rec["set_focus"] = focus
+            rec["readback"] = focus.get("position")
+            if focus.get("ok") is False:
+                self.log(f"    focus missed {target}: read back {focus.get('position')} "
+                         f"({focus.get('stop_reason', 'no reason given')}); shooting anyway")
+            rec["capture"] = await self.capture_after_focus()
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not end the sweep
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+            rec["shoot_s"] = round(time.perf_counter() - t0, 1)
+            self.records.append(rec)
+            self.consecutive_failures += 1
+            self.log(f"  [{phase:<7}] target {target:>5}  FAILED: {rec['error'][:300]}")
+            self.write_manifest()
+            if self.consecutive_failures >= self.args.max_failures:
+                raise SweepAborted(
+                    f"{self.consecutive_failures} frames in a row failed; last: {rec['error']}"
+                ) from exc
+            return rec
+        self.consecutive_failures = 0
         path = rec["capture"].get("saved_to") or rec["capture"].get("path")
         if a.copy_to and path and os.path.exists(path):
             dst = os.path.join(a.copy_to, os.path.basename(path))
@@ -346,9 +386,9 @@ class Sweeper:
         self.manifest["start_focus"] = start_focus
         self.log(f"camera: {status.get('model')} connected={status.get('connected')}; "
               f"focus now {start_focus.get('position')} ({start_focus.get('units')})")
-        if start_focus.get("units") not in (None, "follow_focus"):
-            self.log(f"WARNING: focus units are {start_focus.get('units')!r}, not follow_focus; "
-                  f"positions below are in those units")
+        if start_focus.get("units") == "emulated_nudges":
+            self.log("WARNING: the camera is emulating focus in nudge counts, not movie-mode "
+                     "follow-focus positions; the positions below mean nudges")
 
         coarse = coarse_positions(a.start, a.stop, a.coarse_step)
         self.log(f"plan: coarse {len(coarse)} frames {coarse[0]}..{coarse[-1]} step {a.coarse_step}; "
@@ -391,6 +431,9 @@ class Sweeper:
         except (KeyboardInterrupt, asyncio.CancelledError):
             self.log("\ninterrupted")
             self.manifest["interrupted"] = True
+        except SweepAborted as exc:
+            self.log(f"\nsweep aborted: {exc}")
+            self.manifest["aborted"] = str(exc)
         finally:
             self.phase = "restoring"
             back_to = None if a.leave_at_best else start_focus.get("position")
@@ -484,6 +527,8 @@ def analyze_offline(args: argparse.Namespace) -> int:
     async def _go() -> None:
         # The retry pass covers frames measured before any board was found.
         for rec in sweeper.records:
+            if rec.get("error"):        # never captured: nothing to measure
+                continue
             await sweeper.analyze(rec, force=True)
             s = rec.get("sharpness") or {}
             print(f"  {rec.get('phase'):<7} {rec.get('target'):>5}: "
@@ -533,6 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = p.add_argument_group("run")
     run.add_argument("--dry-run", action="store_true", help="connect, read focus, print the plan; move nothing")
     run.add_argument("--leave-at-best", action="store_true", help="do not restore the starting focus")
+    run.add_argument("--settle-s", type=float, default=3.0,
+                     help="wait after each focus move before capturing (default: 3)")
+    run.add_argument("--capture-retries", type=int, default=1,
+                     help="retries of a failed capture, each after --settle-s (default: 1)")
+    run.add_argument("--max-failures", type=int, default=3,
+                     help="stop the sweep after this many failed frames in a row (default: 3)")
     run.add_argument("--focus-timeout-s", type=float, default=120.0)
     run.add_argument("--capture-timeout-s", type=float, default=60.0)
     run.add_argument("--analyze", metavar="DIR", default=None,
@@ -565,8 +616,8 @@ def coerce_pattern(value: Any) -> Tuple[int, int]:
 # ones that only make sense from outside the machine).
 COMMAND_OPTIONS = (
     "pattern", "start", "stop", "coarse_step", "fine_step", "repeat", "compare",
-    "approach_margin", "tolerance", "leave_at_best", "focus_timeout_s",
-    "capture_timeout_s", "out_dir", "copy_to",
+    "approach_margin", "tolerance", "leave_at_best", "settle_s", "capture_retries",
+    "max_failures", "focus_timeout_s", "capture_timeout_s", "out_dir", "copy_to",
 )
 
 
@@ -583,8 +634,10 @@ def options_from_command(opts: Mapping[str, Any]) -> argparse.Namespace:
         if opts.get(key) is not None:
             setattr(args, key, opts[key])
     args.pattern = coerce_pattern(args.pattern)
-    for key in ("start", "stop", "coarse_step", "fine_step", "repeat", "approach_margin"):
+    for key in ("start", "stop", "coarse_step", "fine_step", "repeat", "approach_margin",
+                "capture_retries", "max_failures"):
         setattr(args, key, int(getattr(args, key)))
+    args.settle_s = float(args.settle_s)
     if args.tolerance is not None:
         args.tolerance = int(args.tolerance)
     args.compare = [int(v) for v in (args.compare or [])]
@@ -612,7 +665,7 @@ def frame_rows(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "mtf50_lw_ph": s.get("mtf50_lw_ph"),
             "edges_used": s.get("edges_used"),
             "edges_total": s.get("edges_total"),
-            "error": s.get("error"),
+            "error": r.get("error") or s.get("error"),
             "path": cap.get("saved_to") or cap.get("path"),
         })
     return rows

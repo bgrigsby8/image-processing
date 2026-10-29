@@ -286,6 +286,12 @@ The report gives:
 - the scatter of the repeat frames;
 - each compare position as a percentage of peak.
 
+The target can be the checkerboard (`--pattern 11x8`) or the ColorChecker
+used for color calibration (`--pattern colorchecker`), turned ~5°. The
+checkerboard is the better target; see the model's README for the
+ColorChecker's limits. Every `calibrate_color` also reports the chart's
+sharpness.
+
 Each frame also records `FocusPosition2`, the focus position the camera
 itself wrote into the RAW (the `raw` column). Normal captures through
 `color-correction` are checked against it too; see "Focus check on every

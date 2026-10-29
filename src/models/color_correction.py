@@ -138,8 +138,10 @@ Two ways to get corrected images out of this component:
 Focus (see sharpness.py and focus_sweep.py):
 
        {"measure_sharpness": {"path": "/photos/board.ARW", "pattern": "11x8"}}
-           -> ISO 12233 slanted-edge MTF50 of a checkerboard frame on disk:
-              median over every square edge, in cycles/pixel and LW/PH.
+           -> ISO 12233 slanted-edge MTF50 of a checkerboard (or, with
+              ``"pattern": "colorchecker"``, a ColorChecker Classic) frame on
+              disk: median over every square edge, in cycles/pixel and LW/PH.
+              ``calibrate_color`` reports the same on its chart frame.
        {"focus_sweep": {"pattern": "11x8", "start": 45000, "stop": 65535,
                         "compare": [59142]}}
            -> start a focus sweep on the source camera in the background:
@@ -260,7 +262,7 @@ from models.raw_focus import (
     check_focus,
     read_raw_focus,
 )
-from models.sharpness import analyze_raw
+from models.sharpness import COLORCHECKER, analyze_raw, measure_linear
 from models.image_io import (
     DEFAULT_DEMOSAIC,
     DEMOSAIC_ALGORITHMS,
@@ -835,6 +837,8 @@ class ColorCorrection(Camera, EasyResource):
           ``patch_centers``  24 [x, y] coords to override auto-detection.
           ``radius``         patch sampling half-width in px (default: ~15% of
                              the detected patch size, or 10 with manual centers).
+          ``measure_sharpness`` false to skip the focus measurement (default
+                             true; RAW sources only).
 
         Returns ``ccm`` (pure-colour, ~unity-gain), ``white_balance``
         ([r,g,b,g2] or null), ``exposure_stops`` (the brightness offset the chart
@@ -848,7 +852,10 @@ class ColorCorrection(Camera, EasyResource):
         reflects pure colour accuracy). RAW sources also return
         ``sensor_mean_luminance`` - the chart frame's light level in the same
         sensor units capture_result reports, for use as the scene's calibrated
-        reference when checking later captures for underexposure.
+        reference when checking later captures for underexposure - and
+        ``sharpness``: slanted-edge MTF50 on the patch edges (sharpness.py's
+        ColorChecker mode) with the RAW's own focus byte, so every
+        calibration also records how well the chart plane was in focus.
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
@@ -899,6 +906,7 @@ class ColorCorrection(Camera, EasyResource):
         # captures will use, so the matrix and the WB stay consistent.
         reference_linear = srgb_to_linear(REFERENCE_SRGB)
         sensor_mean: Optional[float] = None
+        sharpness: Optional[Dict[str, Any]] = None
         if raw_path:
             linear = load_linear_rgb(
                 raw_path,
@@ -914,6 +922,8 @@ class ColorCorrection(Camera, EasyResource):
             # well below it (a flash firing at the wrong power looks lit to a
             # misfire check, but not to this comparison).
             sensor_mean, _ = sensor_light_stats(linear, raw_path, 0.0)
+            if opts.get("measure_sharpness", True):
+                sharpness = self._chart_sharpness(linear, centers, raw_path)
         else:
             measured_linear = PatchSampler.sample_at_centers(
                 detect_img, [(int(x), int(y)) for x, y in centers], radius
@@ -966,6 +976,8 @@ class ColorCorrection(Camera, EasyResource):
             f"neutral 6.5 as-shot {neutral_brightness['neutral_6_5']['measured']:.0f}"
             f"/{neutral_brightness['neutral_6_5']['reference']:.0f})"
             + (f"; white balance [{', '.join(f'{v:.3f}' for v in wb)}]" if wb else "")
+            + (f"; chart MTF50 {sharpness['mtf50']:.3f} cy/px"
+               if sharpness and sharpness.get("mtf50") is not None else "")
             + "; copy `ccm`"
             + (" and `white_balance`" if wb else "")
             + " into the component config to persist"
@@ -979,9 +991,35 @@ class ColorCorrection(Camera, EasyResource):
         }
         if sensor_mean is not None:
             result["sensor_mean_luminance"] = sensor_mean
+        if sharpness is not None:
+            result["sharpness"] = sharpness
         if wb_note:
             result["white_balance_note"] = wb_note
         return result
+
+    def _chart_sharpness(
+        self, linear: np.ndarray, centers: np.ndarray, raw_path: str
+    ) -> Dict[str, Any]:
+        """Focus quality of a calibration frame: MTF50 on the ColorChecker's
+        patch edges, measured where calibrate_color already found them, plus
+        the lens focus byte from the RAW. Never fails the calibration - a
+        problem is reported in ``error``."""
+        try:
+            result, _ = measure_linear(
+                linear, COLORCHECKER, corners=np.asarray(centers, dtype=np.float32),
+                path=raw_path,
+            )
+            out: Dict[str, Any] = result.summary()
+        except Exception as exc:  # noqa: BLE001 - calibration must not fail on this
+            out = {"error": f"{type(exc).__name__}: {exc}"}
+        try:
+            raw_focus = read_raw_focus(raw_path)
+        except OSError:
+            raw_focus = None
+        if raw_focus is not None:
+            out["focus_position2"] = raw_focus.focus_position2
+            out["focal_length_mm"] = raw_focus.focal_length_mm
+        return json.loads(json.dumps(out, default=_focus_jsonable))
 
     async def _capture_corrected(
         self, opts: Mapping[str, Any], timeout: Optional[float]
@@ -2448,7 +2486,8 @@ class ColorCorrection(Camera, EasyResource):
 
         ``opts``:
           ``path``     RAW (or image) file to measure (required)
-          ``pattern``  board inner corners, ``"11x8"`` or ``[11, 8]`` (required)
+          ``pattern``  checkerboard inner corners, ``"11x8"`` or ``[11, 8]``,
+                       or ``"colorchecker"`` (required)
           ``edges``    true to include every edge's result, not just the summary
         """
         path = opts.get("path")

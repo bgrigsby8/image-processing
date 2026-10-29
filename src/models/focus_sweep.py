@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 Find the sharpest focus position for a fixed shooting distance: step the
-still camera's focus across a range, shoot the checkerboard at each step and
-rank the frames by slanted-edge MTF50 (``sharpness.py``).
+still camera's focus across a range, shoot a checkerboard (or a ColorChecker
+Classic, ``--pattern colorchecker``) at each step and rank the frames by
+slanted-edge MTF50 (``sharpness.py``).
 
     venv/bin/python scripts/focus_sweep.py \\
         --address <machine>.viam.cloud --pattern 11x8 \\
         --start 45000 --stop 65535 --coarse-step 2000 \\
         --compare 59142 --out-dir focus/2026-10-27-outfits
 
-Set-up: the board flat at the product plane (where the outfit stands), whole
-board in frame near where the product's centre would be, turned ~5 degrees on
-its mount so every square edge is slanted. Production zoom, aperture, strobes,
+Set-up: the board (or chart) flat at the product plane (where the outfit
+stands), whole of it in frame near where the product's centre would be,
+turned ~5 degrees on its mount so every square edge is slanted. Production zoom, aperture, strobes,
 shutter and ISO. Nothing else may drive the camera during the run - stop the
 webapp's sweeps first.
 
@@ -52,7 +53,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from models.raw_focus import read_raw_focus
-from models.sharpness import FocusPeak, analyze_raw, fit_focus_peak
+from models.sharpness import (
+    BOARD_NOT_FOUND,
+    CHART_NOT_FOUND,
+    COLORCHECKER,
+    FocusPeak,
+    Pattern,
+    analyze_raw,
+    fit_focus_peak,
+)
 
 TOOL_VERSION = "0.1.0"
 FOLLOW_FOCUS_MAX = 0xFFFF
@@ -61,19 +70,24 @@ FOLLOW_FOCUS_MAX = 0xFFFF
 class SweepAborted(RuntimeError):
     """Too many frames in a row failed to shoot; the rig needs a look."""
 MANIFEST = "focus_sweep.json"
-_NOT_FOUND = "checkerboard not found"
+_NOT_FOUND = (BOARD_NOT_FOUND, CHART_NOT_FOUND)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def parse_pattern(text: str) -> Tuple[int, int]:
-    """``"11x8"`` -> (11, 8) inner corners per row, per column."""
+def parse_pattern(text: str) -> Pattern:
+    """``"11x8"`` -> (11, 8) inner corners per row, per column;
+    ``"colorchecker"`` -> ``COLORCHECKER``."""
+    if text.strip().lower() == COLORCHECKER:
+        return COLORCHECKER
     try:
         cols, rows = (int(v) for v in text.lower().split("x"))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"--pattern must look like 11x8, got {text!r}") from exc
+        raise argparse.ArgumentTypeError(
+            f"--pattern must look like 11x8 or be colorchecker, got {text!r}"
+        ) from exc
     if cols < 3 or rows < 3:
         raise argparse.ArgumentTypeError(f"--pattern needs at least 3x3 inner corners, got {text!r}")
     return cols, rows
@@ -214,7 +228,7 @@ class Sweeper:
             "created_at": _now(),
             "address": args.address,
             "camera": args.camera,
-            "pattern": list(args.pattern),
+            "pattern": pattern_json(args.pattern),
             "settings": {k: getattr(args, k) for k in (
                 "start", "stop", "coarse_step", "fine_step", "repeat",
                 "approach_margin", "tolerance", "compare")},
@@ -527,8 +541,9 @@ def analyze_offline(args: argparse.Namespace) -> int:
     with open(path) as f:
         manifest = json.load(f)
     args.out_dir = args.analyze
-    args.pattern = tuple(manifest.get("pattern") or args.pattern or ())
-    if len(args.pattern) != 2:
+    try:
+        args.pattern = coerce_pattern(manifest.get("pattern") or args.pattern)
+    except ValueError:
         print("the manifest has no pattern; pass --pattern", file=sys.stderr)
         return 2
     sweeper = Sweeper(args, manifest)
@@ -568,7 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="still camera with set_focus_position / capture DoCommands (default: sony)")
 
     plan = p.add_argument_group("plan")
-    plan.add_argument("--pattern", type=parse_pattern, default=None, help="inner corners COLSxROWS, e.g. 11x8")
+    plan.add_argument("--pattern", type=parse_pattern, default=None,
+                      help="checkerboard inner corners COLSxROWS (e.g. 11x8), or colorchecker")
     plan.add_argument("--start", type=int, default=45000, help="first coarse position (default: 45000)")
     plan.add_argument("--stop", type=int, default=FOLLOW_FOCUS_MAX, help="last coarse position (default: 65535)")
     plan.add_argument("--coarse-step", type=int, default=2000, help="default: 2000")
@@ -606,10 +622,20 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def coerce_pattern(value: Any) -> Tuple[int, int]:
-    """A board pattern given as ``"11x8"`` or ``[11, 8]`` (inner corners)."""
+def pattern_json(pattern: Pattern) -> Any:
+    """A pattern as it is written to the manifest: ``[11, 8]`` or ``"colorchecker"``."""
+    return pattern if isinstance(pattern, str) else list(pattern)
+
+
+def coerce_pattern(value: Any) -> Pattern:
+    """A target given as ``"11x8"`` or ``[11, 8]`` (checkerboard inner
+    corners), or ``"colorchecker"``."""
     if value is None:
-        raise ValueError("need `pattern` (inner corners, e.g. \"11x8\" or [11, 8])")
+        raise ValueError(
+            "need `pattern`: checkerboard inner corners (\"11x8\" or [11, 8]) or \"colorchecker\""
+        )
+    if value == COLORCHECKER:
+        return COLORCHECKER
     if isinstance(value, str):
         try:
             return parse_pattern(value)
@@ -633,7 +659,7 @@ COMMAND_OPTIONS = (
 def options_from_command(opts: Mapping[str, Any]) -> argparse.Namespace:
     """A ``focus_sweep`` DoCommand's options as the CLI's settings: CLI
     defaults, overridden by what the command sets. ``pattern`` is required,
-    as ``"11x8"`` or ``[11, 8]``. Unknown keys are refused so a typo can't
+    as ``"11x8"``, ``[11, 8]`` or ``"colorchecker"``. Unknown keys are refused so a typo can't
     silently run the default plan."""
     unknown = sorted(set(opts) - set(COMMAND_OPTIONS))
     if unknown:

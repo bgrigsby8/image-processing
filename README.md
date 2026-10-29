@@ -286,5 +286,10 @@ The report gives:
 - the scatter of the repeat frames;
 - each compare position as a percentage of peak.
 
+Each frame also records `FocusPosition2`, the focus position the camera
+itself wrote into the RAW (the `raw` column). Normal captures through
+`color-correction` are checked against it too; see "Focus check on every
+shot" in the model's README.
+
 MTF50 is in cycles/pixel and LW/PH, measured on linear green with no tone
 curve or sharpening. Compare values within one sweep, not across set-ups.

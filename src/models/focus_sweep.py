@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from models.raw_focus import read_raw_focus
 from models.sharpness import FocusPeak, analyze_raw, fit_focus_peak
 
 TOOL_VERSION = "0.1.0"
@@ -124,14 +125,16 @@ def format_table(records: Sequence[Dict[str, Any]], height: Optional[int] = None
     """One line per frame with an MTF50 bar, scaled to the sweep's best."""
     vals = [(r.get("sharpness") or {}).get("mtf50") for r in records]
     best = max((v for v in vals if v is not None), default=None)
-    lines = [f"{'phase':<8}{'target':>7}{'read':>7}  {'MTF50':>6}  {'LW/PH':>6}  edges"]
+    lines = [f"{'phase':<8}{'target':>7}{'read':>7}{'raw':>5}  {'MTF50':>6}  {'LW/PH':>6}  edges"]
     for r, v in zip(records, vals):
         s = r.get("sharpness") or {}
         read = r.get("readback")
         bar = "#" * int(round(40 * v / best)) if (v is not None and best) else ""
         lw = s.get("mtf50_lw_ph")
+        raw = r.get("focus_position2")
         lines.append(
-            f"{r.get('phase', ''):<8}{r.get('target', ''):>7}{'' if read is None else read:>7}  "
+            f"{r.get('phase', ''):<8}{r.get('target', ''):>7}{'' if read is None else read:>7}"
+            f"{'' if raw is None else raw:>5}  "
             f"{'' if v is None else f'{v:.3f}':>6}  {'' if lw is None else f'{lw:.0f}':>6}  "
             f"{s.get('edges_used', 0):>3}/{s.get('edges_total', 0):<3} {bar}"
             + (f"  ({(r.get('error') or s['error'])[:160]})"
@@ -343,6 +346,12 @@ class Sweeper:
             self.can_analyze = False
             rec["sharpness"] = {"error": "RAW not reachable from this host"}
             return
+        # The lens's own focus byte, written by the camera into the RAW
+        # (raw_focus.py): where focus really was, whatever the read-back said.
+        raw_focus = await asyncio.to_thread(read_raw_focus, path)
+        if raw_focus is not None:
+            rec["focus_position2"] = raw_focus.focus_position2
+            rec["focal_length_mm"] = raw_focus.focal_length_mm
         result, corners = await asyncio.to_thread(
             analyze_raw, path, self.args.pattern, corners_hint=self.corners_hint
         )
@@ -660,6 +669,7 @@ def frame_rows(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "phase": r.get("phase"),
             "target": r.get("target"),
             "readback": r.get("readback"),
+            "focus_position2": r.get("focus_position2"),
             "approach": r.get("approach"),
             "mtf50": s.get("mtf50"),
             "mtf50_lw_ph": s.get("mtf50_lw_ph"),

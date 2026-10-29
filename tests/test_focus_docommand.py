@@ -12,7 +12,7 @@ from models import focus_sweep as fs
 from models.image_io import linear_to_srgb
 
 from test_color_correction import _component
-from test_focus_sweep import BEST, FakeCamera, _stub_analyze
+from test_focus_sweep import BEST, FakeCamera, _failing, _stub_analyze
 from test_sharpness import PATTERN, _board_image, _expected_mtf50
 
 
@@ -24,7 +24,8 @@ def cc(tmp_path, monkeypatch):
     return component, cam
 
 
-SWEEP = {"pattern": "11x8", "start": 53000, "stop": 65535, "repeat": 1, "compare": [59142]}
+SWEEP = {"pattern": "11x8", "start": 53000, "stop": 65535, "repeat": 1, "compare": [59142],
+         "settle_s": 0}
 
 
 def test_focus_sweep_runs_in_background_and_reports(cc, tmp_path):
@@ -71,6 +72,23 @@ def test_camera_guarded_while_sweep_runs_then_cancel_restores(cc):
     assert cam.moves[-1] == 59142
     # The guard lifts once the sweep is over.
     assert asyncio.run(component.do_command({"get_focus_position": {}}))["position"] == 59142
+
+
+def test_focus_sweep_that_cannot_capture_reports_failed(cc):
+    component, cam = cc
+    _failing(cam, lambda: True)
+
+    async def run():
+        await component.do_command({"focus_sweep": SWEEP})
+        return (await component.do_command(
+            {"focus_sweep_status": {"wait_sec": 30}}
+        ))["focus_sweep_status"]
+
+    status = asyncio.run(run())
+    assert status["status"] == "failed"
+    assert "3 frames in a row failed" in status["error"]
+    assert all("no file appeared" in r["error"] for r in status["rows"])
+    assert cam.moves[-1] == 59142
 
 
 def test_focus_sweep_rejects_bad_options(cc):

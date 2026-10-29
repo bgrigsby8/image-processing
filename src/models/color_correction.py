@@ -152,6 +152,12 @@ Focus (see sharpness.py and focus_sweep.py):
               usable_range), ``repeat`` scatter and a text ``report``.
        {"focus_sweep_cancel": {}}
            -> stop it (focus is still restored).
+       Every ``capture`` / ``capture_result`` also carries a ``focus_check``:
+              the lens focus byte the camera wrote into the RAW
+              (raw_focus.py) against what the last forwarded
+              ``set_focus_position`` should give - ``ok``, ``missed`` (logged
+              as a warning) or ``unchecked``. Configured by
+              ``raw_focus_table`` / ``raw_focus_tolerance``.
               While a sweep runs, this component refuses ``capture``,
               ``calibrate_color`` and forwarded camera commands other than
               ``get_*``, so nothing else moves the lens or fires the shutter
@@ -248,6 +254,12 @@ from models.focus_sweep import (
     peak_of,
 )
 from models.focus_sweep import _jsonable as _focus_jsonable
+from models.raw_focus import (
+    DEFAULT_RAW_FOCUS_TOLERANCE,
+    FocusTable,
+    check_focus,
+    read_raw_focus,
+)
 from models.sharpness import analyze_raw
 from models.image_io import (
     DEFAULT_DEMOSAIC,
@@ -405,6 +417,13 @@ class ColorCorrection(Camera, EasyResource):
             if flag in attrs and not isinstance(attrs[flag], bool):
                 raise ValueError(f"`{flag}` must be true or false")
 
+        FocusTable.from_config(attrs.get("raw_focus_table"))
+        tolerance = attrs.get("raw_focus_tolerance")
+        if tolerance is not None and (
+            not isinstance(tolerance, (int, float)) or tolerance < 0
+        ):
+            raise ValueError("`raw_focus_tolerance` must be a non-negative number of steps")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -508,6 +527,16 @@ class ColorCorrection(Camera, EasyResource):
         # started_at}. Preserved across reconfigure like pending captures -
         # a sweep outlives a config change, and its result stays collectable.
         self._focus_sweep: Optional[Dict[str, Any]] = getattr(self, "_focus_sweep", None)
+
+        # The per-shot focus check (raw_focus.py): each RAW's own focus byte
+        # against what the last `set_focus_position` forwarded to the source
+        # should give. The request outlives a reconfigure - the lens hasn't
+        # moved because the config did.
+        self._raw_focus_table = FocusTable.from_config(attrs.get("raw_focus_table"))
+        self._raw_focus_tolerance: float = float(
+            attrs.get("raw_focus_tolerance", DEFAULT_RAW_FOCUS_TOLERANCE)
+        )
+        self._requested_focus: Optional[int] = getattr(self, "_requested_focus", None)
 
         # What the wrapped camera says about itself (sony-remote's get_status:
         # model, capture_dir, lens; the ptp model has no such command). Probed
@@ -644,7 +673,11 @@ class ColorCorrection(Camera, EasyResource):
             # get here - the branches above claim them first. Only the
             # command and timeout are forwarded: kwargs holds server-side
             # call context (grpc metadata) that a client call can't accept.
-            return await self.camera.do_command(command, timeout=timeout)
+            # Focus moves are noted on the way through for the focus check.
+            try:
+                return await self.camera.do_command(command, timeout=timeout)
+            finally:
+                self._note_focus_command(command)
         return resp
 
     # ------------------------------------------------------------------
@@ -1003,6 +1036,7 @@ class ColorCorrection(Camera, EasyResource):
         # When nothing is being exported, the decode only feeds the preview -
         # a half-resolution demosaic is ~4x faster and indistinguishable there.
         preview_only = not formats
+        requested_focus = self._requested_focus
 
         start = time.perf_counter()
         source_resp = await self.camera.do_command({"capture": capture_opts}, timeout=timeout)
@@ -1061,6 +1095,8 @@ class ColorCorrection(Camera, EasyResource):
         )
         if file_format:
             result["source_file_format"] = file_format
+        if source_path:
+            result["focus_check"] = await self._focus_check(source_path, requested_focus)
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
         )
@@ -1109,7 +1145,7 @@ class ColorCorrection(Camera, EasyResource):
         self._pending_captures[capture_id] = asyncio.create_task(
             self._finish_deferred_capture(
                 capture_id, str(camera_path), white_balance, exposure_stops,
-                tone, sharpen, corrector,
+                tone, sharpen, corrector, requested_focus=self._requested_focus,
             )
         )
         # Drop completed-and-collected stragglers if a caller never fetched
@@ -1135,12 +1171,15 @@ class ColorCorrection(Camera, EasyResource):
         tone: Optional[str] = None,
         sharpen: Optional[str] = None,
         corrector: Optional[ColorCorrector] = None,
+        *,
+        requested_focus: Optional[int] = None,
     ) -> Dict[str, ValueTypes]:
         """Background half of a deferred capture: download the still from the
         camera, decode at half size, apply the CCM, and build the preview. No
         exports or sidecar - the RAW on disk is the handoff to ``develop``.
         ``corrector`` is the per-call CCM override the caller resolved before
-        the shutter fired; None means the configured matrix."""
+        the shutter fired; None means the configured matrix.
+        ``requested_focus`` is the focus position asked for when it fired."""
         if corrector is None:
             corrector = self.corrector
         start = time.perf_counter()
@@ -1198,6 +1237,7 @@ class ColorCorrection(Camera, EasyResource):
             "color_space": "sRGB",
             "sensor_mean_luminance": sensor_mean,
             "sensor_highlight_fraction": sensor_highlights,
+            "focus_check": await self._focus_check(saved, requested_focus, capture_id),
         }
         if file_format:
             result["source_file_format"] = file_format
@@ -2353,6 +2393,55 @@ class ColorCorrection(Camera, EasyResource):
                 f"with `focus_sweep_cancel`"
             )
 
+    #: Forwarded commands that move the lens some other way than to a known
+    #: position: after one, no shot can be checked until the next
+    #: ``set_focus_position``.
+    _FOCUS_FORGETTING_COMMANDS = (
+        "autofocus_once", "focus_near_far", "home_focus", "set_property_raw",
+        "zoom_preset_load", "trace_focus_read",
+    )
+    # Focus-check defaults until reconfigure sets them from the config.
+    _raw_focus_table = FocusTable.from_config(None)
+    _raw_focus_tolerance: float = DEFAULT_RAW_FOCUS_TOLERANCE
+    _requested_focus: Optional[int] = None
+
+    def _note_focus_command(self, command: Mapping[str, Any]) -> None:
+        """Remember the target of a forwarded ``set_focus_position`` - hit or
+        miss, it is what the next shots should have been focused at - and
+        forget it after anything else that moves focus."""
+        names = {str(command["command"])} if "command" in command else set(command)
+        if "set_focus_position" in names:
+            args = command.get("set_focus_position")
+            if not isinstance(args, Mapping):
+                args = command
+            position = args.get("position")
+            self._requested_focus = (
+                int(position) if isinstance(position, (int, float)) else None
+            )
+        elif names & set(self._FOCUS_FORGETTING_COMMANDS):
+            self._requested_focus = None
+
+    async def _focus_check(
+        self, path: str, requested: Optional[int], label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Check one shot's RAW focus byte against its requested focus
+        position (raw_focus.check_focus), warning when it missed."""
+        try:
+            raw = await asyncio.to_thread(read_raw_focus, path)
+        except OSError as exc:
+            return {"status": "unchecked", "reason": f"could not read {path}: {exc}",
+                    "requested_position": requested}
+        check = check_focus(raw, requested, self._raw_focus_table, self._raw_focus_tolerance)
+        if check["status"] == "missed":
+            self.logger.warning(
+                f"{label or os.path.basename(path)}: lens focus in the RAW is "
+                f"{check['focus_position2']}, but focus position {requested} should "
+                f"give about {check['expected_focus_position2']:.0f} at "
+                f"{check['focal_length_mm']:g} mm ({check['delta']:+.0f} steps); "
+                f"this shot was likely taken out of focus"
+            )
+        return check
+
     async def _measure_sharpness(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
         Slanted-edge MTF50 of a checkerboard frame already on disk.
@@ -2373,6 +2462,10 @@ class ColorCorrection(Camera, EasyResource):
             analyze_raw, path, pattern, demosaic=self._demosaic
         )
         out: Dict[str, Any] = result.summary()
+        raw_focus = await asyncio.to_thread(read_raw_focus, path)
+        if raw_focus is not None:
+            out["focus_position2"] = raw_focus.focus_position2
+            out["focal_length_mm"] = raw_focus.focal_length_mm
         if opts.get("edges"):
             out["edges"] = [
                 {"kind": e.kind, "center": list(e.center), "angle_deg": e.angle_deg,
@@ -2470,6 +2563,9 @@ class ColorCorrection(Camera, EasyResource):
         elif task.exception() is not None:
             out["status"] = "failed"
             out["error"] = f"{type(task.exception()).__name__}: {task.exception()}"
+        elif sweeper.manifest.get("aborted"):
+            out["status"] = "failed"
+            out["error"] = sweeper.manifest["aborted"]
         else:
             out["status"] = "done"
         if task.done():

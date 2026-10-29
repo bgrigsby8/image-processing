@@ -76,6 +76,8 @@ installs those automatically on Debian/Ubuntu.
 | `correct_lateral_ca` | boolean  | Optional  | Also remap R and B by the calibration's lateral CA model (G is the reference). Default `true`; moot for a file without a `lateral_ca` block. |
 | `undistort_interpolation` | string | Optional | Resampling filter on the 16-bit linear data: `cubic` (default), `lanczos4`, or `linear`. |
 | `strict_calibration_match` | boolean | Optional | A lens / `zoom_position` / `focus_position` mismatch between the calibration and what the source camera reported fails the develop instead of warning. Default `false`. A frame-size mismatch is always an error. |
+| `raw_focus_table` | object | Optional | For the per-shot focus check: focal length in mm -> list of `[follow-focus position, FocusPosition2]` pairs measured on your lens. Default: the rig's FE PZ 16-35mm F4 G at 16 and 35 mm. See [Focus check on every shot](#focus-check-on-every-shot). |
+| `raw_focus_tolerance` | number | Optional | How many `FocusPosition2` steps a shot may be off and still pass the focus check. Default `3`. |
 | `cache_undistort_maps` | boolean | Optional | Keep the remap tables in memory after the first develop (~1.4 GB at 61 MP with CA, ~0.5 GB without; a few seconds to rebuild). Default `true`; set `false` on a memory-constrained rig PC. |
 
 If no `ccm` is given, the component passes images through unchanged (identity
@@ -345,7 +347,16 @@ The sweep runs four phases:
 4. **Compare:** one frame at each `compare` position.
 
 Focus is put back where it started at the end, unless you pass
-`"leave_at_best": true`. Other options: `approach_margin`, `tolerance`,
+`"leave_at_best": true`.
+
+Each capture waits `settle_s` (default 3) after the focus move. A capture
+straight after the camera switches from movie mode back to stills can produce
+no file. A failed capture is retried `capture_retries` times (default 1). If a
+frame still fails, it is recorded with its error and the sweep moves on. After
+`max_failures` failed frames in a row (default 3), the sweep stops with status
+`failed`.
+
+Other options: `approach_margin`, `tolerance`,
 `out_dir` (default `<output_dir>/focus_sweeps/<timestamp>`), `copy_to`,
 `focus_timeout_s`, `capture_timeout_s`. Unknown options are refused.
 
@@ -364,9 +375,44 @@ has `rows` (one per frame: target, read-back, MTF50, path) and shows
 
 `{ "focus_sweep_cancel": {} }` stops a sweep. Focus is still restored.
 
+Each sweep row and `measure_sharpness` also report `focus_position2`, the
+lens's own focus reading from the RAW (see below).
+
 While a sweep runs, this component refuses `capture`, `calibrate_color` and
 any forwarded camera command except `get_*`. Commands sent straight to the
 camera component are not blocked, so pause the webapp first.
+
+### Focus check on every shot
+
+Sony bodies write the lens's focus position at the moment of exposure into
+each RAW: a private MakerNote byte that ExifTool calls `FocusPosition2`
+(0-255, 255 = infinity, larger = farther). The camera writes it, so it is
+true even when the camera's focus read-back over USB is late or wrong.
+
+This component remembers the `position` of the last `set_focus_position`
+forwarded through it to the camera. Every `capture` result (and every
+deferred `capture_result`) then carries a `focus_check`:
+
+```json
+{ "status": "missed", "requested_position": 50000, "focus_position2": 176,
+  "expected_focus_position2": 158.4, "delta": 17.6, "focal_length_mm": 35.0 }
+```
+
+`status` is `ok`, `missed` (more than `raw_focus_tolerance` steps off; also
+logged as a warning) or `unchecked` with a `reason`: not a Sony RAW, no
+`set_focus_position` since another focus command (`home_focus`,
+`focus_near_far`, `autofocus_once`, ...) moved the lens, or no
+`raw_focus_table` entry for the shot's focal length.
+
+`FocusPosition2` is not in the camera's follow-focus units, and its scale
+changes with zoom, so `raw_focus_table` maps one to the other per focal
+length. To measure a new lens: at each zoom, move focus to a few positions
+across the range, read `get_focus_position` twice (trust the second), take a
+photo, and read its `FocusPosition2` (`measure_sharpness`, or
+`exiftool -FocusPosition2`).
+
+The check catches a focus move that missed. It does not tell you whether the
+product is inside the sharp zone; that is what the focus sweep is for.
 
 ## Typical workflows
 

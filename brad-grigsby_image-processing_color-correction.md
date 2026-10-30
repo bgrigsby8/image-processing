@@ -316,7 +316,15 @@ things that remove files behind this component's back: another component's
 ### Focus: measure sharpness and sweep for best focus
 
 Sharpness is ISO 12233 slanted-edge MTF50, measured on every square edge of
-a checkerboard. Turn the board ~5° so the edges are slanted.
+a checkerboard, or on the patch edges of a ColorChecker Classic (`"pattern":
+"colorchecker"`). Turn the board or chart ~5° so the edges are slanted.
+
+The ColorChecker works, with two limits. Each patch edge meets a thin black
+border, so the measurement only reaches to the middle of that border: very
+blurry frames read sharper than they are (the ranking stays right, so a sweep
+still finds its peak). And the patches must be at least ~100 px apart in the
+photo; at the outfit spot (2.6 m, 35 mm) they are ~150 px. Dark patches
+blend into the border and are skipped, leaving ~80 of the 96 edges.
 
 `measure_sharpness` scores a frame already on disk:
 
@@ -377,6 +385,12 @@ has `rows` (one per frame: target, read-back, MTF50, path) and shows
 
 Each sweep row and `measure_sharpness` also report `focus_position2`, the
 lens's own focus reading from the RAW (see below).
+
+`calibrate_color` measures the same on its chart frame: a RAW calibration
+returns `sharpness` (MTF50, edges used, and `focus_position2`), so every
+color calibration also records how well the chart plane was in focus. It
+never fails the calibration; problems show up in `sharpness.error`. Pass
+`"measure_sharpness": false` to skip it.
 
 While a sweep runs, this component refuses `capture`, `calibrate_color` and
 any forwarded camera command except `get_*`. Commands sent straight to the

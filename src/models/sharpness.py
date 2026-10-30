@@ -1,6 +1,8 @@
 """
 Focus quality from a photographed checkerboard: ISO 12233 slanted-edge
-(e-SFR) MTF50 on every square edge of the board.
+(e-SFR) MTF50 on every square edge of the board. A ColorChecker Classic
+works too (``measure_colorchecker``): the four sides of each patch, where it
+meets the chart's black border.
 
 Why the checkerboard. It is already on the rig, and every edge between two
 inner corners is a straight, high-contrast step. Turn the board ~5 degrees on
@@ -40,7 +42,7 @@ comparison is what a focus sweep needs.
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -67,6 +69,14 @@ MIN_EDGES = 5
 # Detection scales tried in order (a small board at 2.6 m can be too small
 # for the 1/4-scale pass that suits a frame-filling board).
 DETECT_SCALES = (0.25, 0.5, 1.0)
+
+# The ColorChecker Classic as a sharpness target (``measure_colorchecker``):
+# pass this instead of a checkerboard's inner-corner counts.
+COLORCHECKER = "colorchecker"
+Pattern = Union[Tuple[int, int], str]
+
+BOARD_NOT_FOUND = "checkerboard not found (whole board must be visible)"
+CHART_NOT_FOUND = "ColorChecker not found (whole chart must be visible)"
 
 
 @dataclass
@@ -327,6 +337,107 @@ def measure_board(
     return edges, spacing
 
 
+# ---------------------------------------------------------------------------
+# ColorChecker frames
+# ---------------------------------------------------------------------------
+
+def _patch_side(
+    channel: np.ndarray, centre: np.ndarray, out_vec: np.ndarray, along_vec: np.ndarray,
+) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray, float]], Optional[str]]:
+    """
+    Find one side of a ColorChecker patch: the step from the patch to the
+    black border, walking from the patch centre along ``out_vec`` (one patch
+    pitch, toward the neighbour or the chart frame). ``along_vec`` is the
+    pitch the other way. Returns ``((p0, p1, across_px), None)`` for
+    ``edge_mtf``, or ``(None, reason)``.
+    """
+    pitch = float(np.linalg.norm(out_vec))
+    ts = np.arange(0.0, 0.75 * pitch) / pitch          # 1 px steps, as pitch fractions
+    offs = np.linspace(-0.2, 0.2, 9)                   # parallel lines, averaged
+    pts = (centre[None, None, :] + ts[None, :, None] * out_vec[None, None, :]
+           + offs[:, None, None] * along_vec[None, None, :]).astype(np.float32)
+    prof = cv2.remap(channel.astype(np.float32, copy=False), pts[..., 0], pts[..., 1],
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).mean(axis=0)
+    patch = float(np.median(prof[ts < 0.25]))
+    in_gap = (ts > 0.35) & (ts < 0.65)
+    if not in_gap.any():
+        return None, "patch too small"
+    gap = float(prof[in_gap].min())
+    if patch <= 0 or (gap > 0 and patch / gap < MIN_EDGE_CONTRAST):
+        return None, "too little edge contrast"
+    mid = 0.5 * (patch + gap)
+    below = np.flatnonzero((prof <= mid) & (ts < 0.65))
+    if below.size == 0 or below[0] == 0:
+        return None, "patch edge not found"
+    i = int(below[0])
+    p_a, p_b = prof[i - 1], prof[i]
+    t_edge = float(ts[i - 1] + (p_a - mid) / (p_a - p_b) * (ts[i] - ts[i - 1]))
+    # Sample no further than the middle of the black gap: past it the next
+    # patch's edge would leak into this one's spread function.
+    across = 0.9 * (0.5 - t_edge) * pitch
+    mid_pt = centre + t_edge * out_vec
+    return (mid_pt - t_edge * along_vec, mid_pt + t_edge * along_vec, across), None
+
+
+def measure_colorchecker(
+    channel: np.ndarray, centers: np.ndarray, rows: int = 4, cols: int = 6,
+) -> Tuple[List[EdgeMTF], float]:
+    """
+    MTF50 of the four sides of every ColorChecker patch, each where it meets
+    the black border, from the 24 patch ``centers`` (calibration.py's
+    ``detect_colorchecker``, row-major). Edge positions are found from the
+    data, so only the centres are needed. Dark patches have too little
+    contrast against the border and are reported as such. Also returns the
+    patch pitch in pixels.
+
+    The black gap between patches is narrow (~15 % of the pitch), so each
+    edge is sampled only out to the middle of its gap - a shorter spread
+    function than a checkerboard square gives, which reads blurry frames a
+    little sharp. Fine for ranking a focus sweep; compare values between
+    frames of one chart, not against checkerboard numbers.
+    """
+    grid = np.asarray(centers, dtype=np.float64).reshape(rows, cols, 2)
+
+    def step(r: int, c: int, dr: int, dc: int) -> np.ndarray:
+        r2, c2 = r + dr, c + dc
+        if 0 <= r2 < rows and 0 <= c2 < cols:
+            return grid[r2, c2] - grid[r, c]
+        return grid[r, c] - grid[r - dr, c - dc]     # outer side: mirror the inner step
+
+    edges: List[EdgeMTF] = []
+    pitches = []
+    for r in range(rows):
+        for c in range(cols):
+            centre = grid[r, c]
+            u_next, v_next = step(r, c, 0, 1), step(r, c, 1, 0)
+            pitches += [float(np.linalg.norm(u_next)), float(np.linalg.norm(v_next))]
+            for out_vec, along_vec in ((u_next, v_next), (step(r, c, 0, -1), v_next),
+                                       (v_next, u_next), (step(r, c, -1, 0), u_next)):
+                dx, dy = np.abs(along_vec)
+                kind = "vertical" if dy > dx else "horizontal"
+                side, reason = _patch_side(channel, centre, out_vec, along_vec)
+                if side is None:
+                    at = centre + 0.4 * out_vec
+                    edges.append(EdgeMTF(kind, (float(at[0]), float(at[1])), 0.0, error=reason))
+                    continue
+                p0, p1, across = side
+                edges.append(edge_mtf(channel, p0, p1, across, kind=kind))
+    return edges, float(np.median(pitches))
+
+
+def find_colorchecker_centers(linear_rgb: np.ndarray) -> Optional[np.ndarray]:
+    """Detect a ColorChecker Classic in a linear RGB frame (calibration.py's
+    detector, on an sRGB render of it); its 24 patch centres or None."""
+    from models.calibration import detect_colorchecker
+    from models.image_io import linear_to_srgb
+    rgb8 = (linear_to_srgb(np.clip(linear_rgb, 0.0, 1.0)) * 255.0).astype(np.uint8)
+    try:
+        found = detect_colorchecker(rgb8)
+    except ValueError:              # chart cut off by the frame edge
+        return None
+    return None if found is None else np.asarray(found["centers"], dtype=np.float32)
+
+
 def summarize_edges(result: FrameSharpness) -> None:
     """Fill the frame's medians from its per-edge results."""
     values = [e.mtf50 for e in result.edges if e.mtf50 is not None]
@@ -373,23 +484,60 @@ def find_board_corners(
     return None
 
 
+def measure_linear(
+    linear: np.ndarray,
+    pattern: Pattern,
+    *,
+    corners_hint: Optional[np.ndarray] = None,
+    corners: Optional[np.ndarray] = None,
+    path: str = "",
+) -> Tuple[FrameSharpness, Optional[np.ndarray]]:
+    """Find the target in a linear RGB frame (sensor frame, no tone or
+    sharpening) and measure its MTF50 on the green channel. ``pattern`` is a
+    checkerboard's inner corners or ``COLORCHECKER``. ``corners`` skips the
+    detection (a caller that already found the target); see ``analyze_raw``
+    for ``corners_hint``. Returns the result and the corners (checkerboard)
+    or patch centres (ColorChecker) used. Never raises for a frame problem."""
+    result = FrameSharpness(path=path)
+    green = np.ascontiguousarray(linear[..., 1])
+    result.image_size = (green.shape[1], green.shape[0])
+    chart = pattern == COLORCHECKER
+    if corners is None:
+        corners = (find_colorchecker_centers(linear) if chart
+                   else find_board_corners(green, pattern))
+    if corners is None and corners_hint is not None:
+        corners = np.asarray(corners_hint, dtype=np.float32)
+        result.corners_from_hint = True
+    if corners is None:
+        result.error = CHART_NOT_FOUND if chart else BOARD_NOT_FOUND
+        return result, None
+    if chart:
+        result.edges, _ = measure_colorchecker(green, corners)
+    else:
+        result.edges, _ = measure_board(green, corners, pattern)
+    summarize_edges(result)
+    return result, corners
+
+
 def analyze_raw(
     path: str,
-    pattern: Tuple[int, int],
+    pattern: Pattern,
     *,
     corners_hint: Optional[np.ndarray] = None,
     demosaic: Optional[str] = None,
 ) -> Tuple[FrameSharpness, Optional[np.ndarray]]:
     """
     Develop one capture to linear (sensor frame, camera WB, no tone or
-    sharpening) and measure the board's MTF50 on the green channel.
+    sharpening) and measure the target's MTF50 on the green channel: a
+    checkerboard (``pattern`` = inner corners) or a ColorChecker Classic
+    (``pattern`` = ``COLORCHECKER``).
 
-    ``corners_hint``: corners from another frame of the same sweep. Used when
-    this frame's board cannot be detected - far out of focus the detector
-    gives up long before the edges stop being measurable, and neither the
-    board nor the camera moves during a sweep. Returns the result and the
-    corners used (for the next frame's hint). Never raises for a frame
-    problem; it is reported in ``error``.
+    ``corners_hint``: corners (or patch centres) from another frame of the
+    same sweep. Used when this frame's target cannot be detected - far out
+    of focus the detector gives up long before the edges stop being
+    measurable, and neither the target nor the camera moves during a sweep.
+    Returns the result and the corners used (for the next frame's hint).
+    Never raises for a frame problem; it is reported in ``error``.
     """
     from models.image_io import DEFAULT_DEMOSAIC, SENSOR_FRAME_KWARGS, load_linear_rgb
 
@@ -401,18 +549,8 @@ def analyze_raw(
             path, white_balance="camera", demosaic=demosaic or DEFAULT_DEMOSAIC,
             **SENSOR_FRAME_KWARGS,
         )
-        green = np.ascontiguousarray(linear[..., 1])
+        result, corners = measure_linear(linear, pattern, corners_hint=corners_hint, path=path)
         del linear
-        result.image_size = (green.shape[1], green.shape[0])
-        corners = find_board_corners(green, pattern)
-        if corners is None and corners_hint is not None:
-            corners = np.asarray(corners_hint, dtype=np.float32)
-            result.corners_from_hint = True
-        if corners is None:
-            result.error = "checkerboard not found (whole board must be visible)"
-            return result, None
-        result.edges, _ = measure_board(green, corners, pattern)
-        summarize_edges(result)
     except Exception as exc:  # noqa: BLE001 - reported per frame
         result.error = f"{type(exc).__name__}: {exc}"
     finally:

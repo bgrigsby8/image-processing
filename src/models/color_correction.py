@@ -573,11 +573,14 @@ class ColorCorrection(Camera, EasyResource):
         timeout: Optional[float] = None,
         **kwargs,
     ) -> Tuple[Sequence[NamedImage], ResponseMetadata]:
+        # kwargs is server-side call context (grpc metadata) that the source
+        # camera's client can't accept - forwarding it made every GetImages
+        # fail with "'MultiDict' object has no attribute 'proto'". Same rule
+        # as do_command's passthrough.
         images, metadata = await self.camera.get_images(
             filter_source_names=filter_source_names,
             extra=extra,
             timeout=timeout,
-            **kwargs,
         )
 
         corrected: List[NamedImage] = []
@@ -603,14 +606,14 @@ class ColorCorrection(Camera, EasyResource):
         **kwargs,
     ) -> Tuple[bytes, str]:
         # Color correction doesn't apply to point clouds; proxy the source.
-        return await self.camera.get_point_cloud(extra=extra, timeout=timeout, **kwargs)
+        return await self.camera.get_point_cloud(extra=extra, timeout=timeout)
 
     async def get_properties(
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> Camera.Properties:
         # Report the source camera's properties; we don't change resolution,
         # mime types, or intrinsics.
-        return await self.camera.get_properties(timeout=timeout, **kwargs)
+        return await self.camera.get_properties(timeout=timeout)
 
     async def do_command(
         self,

@@ -529,6 +529,26 @@ def test_do_command_passthrough_forwards_to_source():
     assert source.commands == [{"home_focus": {}}]
 
 
+class _StrictStreamSource:
+    """A source with the SDK CameraClient's keyword-only get_images signature:
+    a server-side kwarg (metadata) forwarded into it raises TypeError, as the
+    real client fails on it."""
+
+    async def get_images(self, *, filter_source_names=None, extra=None, timeout=None):
+        from viam.media.video import NamedImage
+
+        return [NamedImage("live_view", b"depth", "image/vnd.viam.dep")], "metadata"
+
+
+def test_get_images_does_not_forward_server_kwargs():
+    """Called with a `metadata` kwarg the way viam-server calls a component
+    server; forwarding it made every live-view GetImages fail."""
+    cc = _component(_StrictStreamSource())
+    images, metadata = asyncio.run(cc.get_images(metadata=object()))
+    assert [i.name for i in images] == ["live_view"]
+    assert metadata == "metadata"
+
+
 def test_do_command_passthrough_surfaces_source_rejection():
     """A command unknown to both layers fails with the source's error."""
     source = _FakeSource(saved_path=None)

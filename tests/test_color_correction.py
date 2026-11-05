@@ -1972,3 +1972,197 @@ def test_delete_allows_the_source_capture_dir_alongside_output_dir(tmp_path):
     assert not raw.exists()
     assert [f["path"] for f in out["failed"]] == [str(elsewhere)]
     assert elsewhere.exists()
+
+
+# ---------------------------------------------------------------------------
+# CONSULT-2300: a one-off UNAVAILABLE from app.viam.com's proxy (Envoy 503,
+# "reset before headers") dropped one file of a set. Transient errors are now
+# retried with backoff (and a redialed DataClient before the last try);
+# permanent ones are not.
+# ---------------------------------------------------------------------------
+
+
+def _flaky_uploader(tmp_path, monkeypatch, errors_for):
+    """Uploader whose chunked upload raises ``errors_for(path, attempt)`` when
+    that returns an exception, and succeeds otherwise. Records each attempt on
+    ``cc._attempts`` and stubs out the backoff sleeps and channel close."""
+    from models import color_correction as cc_mod
+
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    cc._part_id = "part-1"
+    cc._attempts = []
+    cc._sleeps = []
+    cc._closes = 0
+
+    async def fake_get_data_client():
+        return _FakeDataClient()
+
+    async def fake_upload_chunked(client, path, **kwargs):
+        n = sum(1 for p in cc._attempts if p == path) + 1
+        cc._attempts.append(path)
+        exc = errors_for(path, n)
+        if exc is not None:
+            raise exc
+        return "fake-binary-id"
+
+    async def fake_sleep(s):
+        cc._sleeps.append(s)
+
+    def fake_close():
+        cc._closes += 1
+
+    monkeypatch.setattr(cc, "_get_data_client", fake_get_data_client)
+    monkeypatch.setattr(cc, "_retire_data_client", fake_close)
+    monkeypatch.setattr(ColorCorrection, "_file_upload_chunked",
+                        staticmethod(fake_upload_chunked))
+    monkeypatch.setattr(cc_mod.asyncio, "sleep", fake_sleep)
+    return cc
+
+
+def _unavailable():
+    from grpclib.const import Status
+    from grpclib.exceptions import GRPCError
+
+    return GRPCError(
+        Status.UNAVAILABLE,
+        "upstream connect error or disconnect/reset before headers. "
+        "reset reason: protocol error",
+    )
+
+
+def test_upload_retries_a_transient_unavailable(tmp_path, monkeypatch):
+    """The ticket's repro: one UNAVAILABLE on one path, then success."""
+    ok = tmp_path / "DSC00359.ARW"
+    png = tmp_path / "DSC00359_16.png"
+    ok.write_bytes(b"raw")
+    png.write_bytes(b"png")
+    cc = _flaky_uploader(
+        tmp_path, monkeypatch,
+        lambda p, n: _unavailable() if p == str(png) and n == 1 else None,
+    )
+
+    out = asyncio.run(cc._upload({"paths": [str(ok), str(png)]}))
+
+    assert out["uploaded"] == [str(ok), str(png)]
+    assert out["failed"] == []
+    assert cc._attempts.count(str(png)) == 2
+    assert cc._sleeps == [2.0]
+
+
+def test_upload_reports_attempts_when_unavailable_persists(tmp_path, monkeypatch):
+    png = tmp_path / "DSC00359_16.png"
+    png.write_bytes(b"png")
+    cc = _flaky_uploader(tmp_path, monkeypatch, lambda p, n: _unavailable())
+
+    out = asyncio.run(cc._upload({"paths": [str(png)]}))
+
+    assert out["uploaded"] == []
+    assert len(out["failed"]) == 1
+    entry = out["failed"][0]
+    assert entry["path"] == str(png)
+    assert entry["attempts"] == 3
+    assert "UNAVAILABLE" in entry["error"] or "reset before headers" in entry["error"]
+    assert cc._attempts.count(str(png)) == 3
+    assert cc._sleeps == [2.0, 5.0]
+    # The channel is redialed once, before the final try.
+    assert cc._closes == 1
+    assert png.exists()
+
+
+def test_upload_retries_a_stream_terminated_error(tmp_path, monkeypatch):
+    from grpclib.exceptions import StreamTerminatedError
+
+    png = tmp_path / "a_16.png"
+    png.write_bytes(b"png")
+    cc = _flaky_uploader(
+        tmp_path, monkeypatch,
+        lambda p, n: StreamTerminatedError("Connection lost") if n == 1 else None,
+    )
+
+    out = asyncio.run(cc._upload({"paths": [str(png)]}))
+    assert out["uploaded"] == [str(png)]
+    assert cc._attempts.count(str(png)) == 2
+
+
+def test_upload_does_not_retry_invalid_argument(tmp_path, monkeypatch):
+    from grpclib.const import Status
+    from grpclib.exceptions import GRPCError
+
+    png = tmp_path / "a_16.png"
+    png.write_bytes(b"png")
+    cc = _flaky_uploader(
+        tmp_path, monkeypatch,
+        lambda p, n: GRPCError(Status.INVALID_ARGUMENT, "bad metadata"),
+    )
+
+    out = asyncio.run(cc._upload({"paths": [str(png)]}))
+    assert [f["path"] for f in out["failed"]] == [str(png)]
+    assert out["failed"][0]["attempts"] == 1
+    assert cc._attempts == [str(png)]
+    assert cc._sleeps == []
+    assert cc._closes == 0
+
+
+def test_upload_does_not_retry_a_missing_file(tmp_path, monkeypatch):
+    gone = tmp_path / "gone_16.png"   # never written
+    cc = _flaky_uploader(tmp_path, monkeypatch, lambda p, n: _unavailable())
+
+    out = asyncio.run(cc._upload({"paths": [str(gone)]}))
+    assert [f["path"] for f in out["failed"]] == [str(gone)]
+    assert out["failed"][0]["attempts"] == 1
+    assert cc._attempts == []      # getsize fails before any upload try
+    assert cc._sleeps == []
+
+
+def test_upload_does_not_retry_a_timeout(tmp_path, monkeypatch):
+    png = tmp_path / "a_16.png"
+    png.write_bytes(b"png")
+    cc = _flaky_uploader(
+        tmp_path, monkeypatch, lambda p, n: asyncio.TimeoutError()
+    )
+
+    out = asyncio.run(cc._upload({"paths": [str(png)]}))
+    assert out["failed"][0]["attempts"] == 1
+    assert "timed out" in out["failed"][0]["error"]
+    assert cc._attempts == [str(png)]
+
+
+def test_retire_data_client_closes_the_old_channel_only_later(tmp_path):
+    """Redialing for a retry must not cut off another upload still streaming
+    on the shared channel: the old channel is closed after a delay."""
+    import asyncio
+
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    cc._upload_file_timeout_s = 0.01
+
+    class _Chan:
+        closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Client:
+        _channel = _Chan()
+
+    old = _Client()
+    cc._data_client = old
+
+    async def run():
+        cc._retire_data_client()
+        assert cc._data_client is None
+        assert old._channel.closed == 0  # still usable by in-flight uploads
+        await asyncio.sleep(0)
+        return old._channel.closed
+
+    # call_later uses timeout + 30 s; patch the loop clock by shrinking it.
+    import models.color_correction as cc_mod  # noqa: F401
+
+    loop = asyncio.new_event_loop()
+    try:
+        assert loop.run_until_complete(run()) == 0
+        later = [h for h in loop._scheduled if not h.cancelled()]
+        assert len(later) == 1 and later[0].when() - loop.time() > 25
+        later[0]._run()
+        assert old._channel.closed == 1
+    finally:
+        loop.close()

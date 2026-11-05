@@ -1977,7 +1977,7 @@ def _flaky_uploader(tmp_path, monkeypatch, errors_for):
         cc._closes += 1
 
     monkeypatch.setattr(cc, "_get_data_client", fake_get_data_client)
-    monkeypatch.setattr(cc, "_close_data_client", fake_close)
+    monkeypatch.setattr(cc, "_retire_data_client", fake_close)
     monkeypatch.setattr(ColorCorrection, "_file_upload_chunked",
                         staticmethod(fake_upload_chunked))
     monkeypatch.setattr(cc_mod.asyncio, "sleep", fake_sleep)
@@ -2090,3 +2090,44 @@ def test_upload_does_not_retry_a_timeout(tmp_path, monkeypatch):
     assert out["failed"][0]["attempts"] == 1
     assert "timed out" in out["failed"][0]["error"]
     assert cc._attempts == [str(png)]
+
+
+def test_retire_data_client_closes_the_old_channel_only_later(tmp_path):
+    """Redialing for a retry must not cut off another upload still streaming
+    on the shared channel: the old channel is closed after a delay."""
+    import asyncio
+
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    cc._upload_file_timeout_s = 0.01
+
+    class _Chan:
+        closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Client:
+        _channel = _Chan()
+
+    old = _Client()
+    cc._data_client = old
+
+    async def run():
+        cc._retire_data_client()
+        assert cc._data_client is None
+        assert old._channel.closed == 0  # still usable by in-flight uploads
+        await asyncio.sleep(0)
+        return old._channel.closed
+
+    # call_later uses timeout + 30 s; patch the loop clock by shrinking it.
+    import models.color_correction as cc_mod  # noqa: F401
+
+    loop = asyncio.new_event_loop()
+    try:
+        assert loop.run_until_complete(run()) == 0
+        later = [h for h in loop._scheduled if not h.cancelled()]
+        assert len(later) == 1 and later[0].when() - loop.time() > 25
+        later[0]._run()
+        assert old._channel.closed == 1
+    finally:
+        loop.close()

@@ -2091,6 +2091,25 @@ class ColorCorrection(Camera, EasyResource):
         except Exception as exc:
             self.logger.debug(f"Closing app.viam.com channel failed: {exc}")
 
+    def _retire_data_client(self) -> None:
+        """Stop handing out the cached cloud channel so the next
+        ``_get_data_client`` dials a fresh one, but close the old channel only
+        later: another upload (a second submit job) may still be streaming on
+        it, and closing it now would fail that upload too."""
+        client = getattr(self, "_data_client", None)
+        self._data_client = None
+        if client is None:
+            return
+
+        def _close_old() -> None:
+            try:
+                client._channel.close()
+            except Exception as exc:
+                self.logger.debug(f"Closing retired app.viam.com channel failed: {exc}")
+
+        # Long enough for any upload already on it to finish or time out.
+        asyncio.get_running_loop().call_later(self._upload_file_timeout_s + 30, _close_old)
+
     async def _get_data_client(self) -> DataClient:
         """
         Lazily build (and cache) a cloud ``DataClient`` from the API key Viam
@@ -2248,8 +2267,9 @@ class ColorCorrection(Camera, EasyResource):
                         await asyncio.sleep(wait_s)
                         if attempt + 1 == max_attempts:
                             # Last try: in case the channel itself is broken,
-                            # redial app.viam.com rather than reuse it.
-                            self._close_data_client()
+                            # redial app.viam.com rather than reuse it. Retire
+                            # (not close) the old one: other uploads may share it.
+                            self._retire_data_client()
                             data_client = await self._get_data_client()
                 self.logger.info(
                     f"[timing] uploaded {os.path.basename(path)} "

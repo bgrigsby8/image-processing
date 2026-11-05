@@ -395,9 +395,11 @@ class _FakeSource:
     """Fake PTP-style source camera: `trigger` hands back an on-camera path,
     `download` "saves" a file that already exists at `saved_path`."""
 
-    def __init__(self, saved_path, supports_trigger=True, saves_to_disk=True):
+    def __init__(self, saved_path, supports_trigger=True, saves_to_disk=True,
+                 trigger_error=None):
         self.saved_path = saved_path
         self.supports_trigger = supports_trigger
+        self.trigger_error = trigger_error
         self.saves_to_disk = saves_to_disk
         self.commands = []
 
@@ -409,6 +411,8 @@ class _FakeSource:
         if "trigger" in command:
             if not self.supports_trigger:
                 raise ValueError("no recognized command")
+            if self.trigger_error is not None:
+                raise self.trigger_error
             return {"trigger": {"path": "/store/DCIM/IMG_0042.PNG",
                                 "name": "IMG_0042.PNG"}}
         if "download" in command:
@@ -497,8 +501,39 @@ def test_deferred_capture_round_trip(tmp_path):
 def test_deferred_capture_requires_trigger_support():
     source = _FakeSource(saved_path=None, supports_trigger=False)
     cc = _component(source)
-    with pytest.raises(RuntimeError, match="`trigger`"):
+    with pytest.raises(RuntimeError, match="needs a source camera with a `trigger`"):
         asyncio.run(cc.do_command({"capture": {"defer": True}}))
+
+
+@pytest.mark.parametrize("error", [
+    NotImplementedError("do_command"),
+    RuntimeError("<Status.UNIMPLEMENTED: 12>, 'Method not found'"),
+    ValueError("unknown command 'trigger'. Supported: capture"),
+])
+def test_deferred_capture_recognizes_other_missing_command_errors(error):
+    source = _FakeSource(saved_path=None, trigger_error=error)
+    cc = _component(source)
+    with pytest.raises(RuntimeError, match="needs a source camera with a `trigger`"):
+        asyncio.run(cc.do_command({"capture": {"defer": True}}))
+
+
+def test_deferred_capture_passes_a_failed_trigger_through():
+    """CONSULT-2301: the source has `trigger` and it timed out. The error must
+    carry the source's own text, not claim a missing DoCommand."""
+    original = RuntimeError(
+        "CaptureTimeoutError - [timeout] no file appeared in /home/viam/images "
+        "within the capture timeout"
+    )
+    source = _FakeSource(saved_path=None, trigger_error=original)
+    cc = _component(source)
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(cc.do_command({"capture": {"defer": True}}))
+    message = str(exc.value)
+    assert message.startswith("source camera `trigger` failed: ")
+    assert str(original) in message
+    assert "needs a source camera" not in message
+    assert "ptp model" not in message
+    assert exc.value.__cause__ is original
 
 
 def test_deferred_capture_surfaces_background_failure(tmp_path):

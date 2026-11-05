@@ -327,6 +327,26 @@ def _format_expects_raw(file_format: Optional[str]) -> bool:
     return bool(file_format) and "raw" in str(file_format)
 
 
+# How sources say "I don't have that DoCommand": ptp and sony-remote raise
+# "no recognized command" / "unknown command"; a camera with no do_command at
+# all comes back as gRPC UNIMPLEMENTED or NotImplementedError.
+_UNKNOWN_COMMAND_MARKERS = (
+    "no recognized command",
+    "unknown command",
+    "unimplemented",
+    "not implemented",
+)
+
+
+def _is_unknown_command_error(exc: BaseException) -> bool:
+    """True when ``exc`` means the source lacks the command, as opposed to the
+    command existing and failing."""
+    if isinstance(exc, NotImplementedError):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _UNKNOWN_COMMAND_MARKERS)
+
+
 class ColorCorrection(Camera, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug option,
     # or configure your resource/machine to display debug logs.
@@ -1167,10 +1187,15 @@ class ColorCorrection(Camera, EasyResource):
                 {"trigger": opts.get("capture_options", {})}, timeout=timeout
             )
         except Exception as exc:
-            raise RuntimeError(
-                f"deferred capture needs a source camera with a `trigger` "
-                f"DoCommand (the ptp model); triggering failed: {exc}"
-            ) from exc
+            if _is_unknown_command_error(exc):
+                raise RuntimeError(
+                    f"deferred capture needs a source camera with a `trigger` "
+                    f"DoCommand (the ptp or sony-remote model); the source "
+                    f"rejected it: {exc}"
+                ) from exc
+            # The source has `trigger` and it failed (e.g. a capture timeout):
+            # pass its own error through rather than blame the config.
+            raise RuntimeError(f"source camera `trigger` failed: {exc}") from exc
         trig = resp.get("trigger") or {}
         camera_path = trig.get("path")
         if not camera_path:

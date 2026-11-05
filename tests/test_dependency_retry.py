@@ -35,19 +35,6 @@ def _run(call, **kwargs):
     return asyncio.run(dependency_retry.call_with_retry(call, **kwargs))
 
 
-@pytest.fixture(autouse=True)
-def _no_real_restart(monkeypatch):
-    requests = []
-
-    async def fake_restart(logger):
-        requests.append(logger)
-        return True
-
-    monkeypatch.setattr(dependency_retry, "request_module_restart", fake_restart)
-    monkeypatch.setattr(dependency_retry, "_restart_requested", False)
-    return requests
-
-
 @pytest.mark.parametrize(
     "error",
     [
@@ -86,7 +73,7 @@ def test_retry_false_runs_once():
     assert call.count == 1
 
 
-def test_repeated_different_loop_logs_error_and_requests_one_restart(_no_real_restart, caplog):
+def test_repeated_different_loop_logs_error(caplog):
     async def twice():
         for _ in range(2):
             call = _Calls(DIFFERENT_LOOP, DIFFERENT_LOOP)
@@ -95,21 +82,18 @@ def test_repeated_different_loop_logs_error_and_requests_one_restart(_no_real_re
                     call, what="source camera set_zoom",
                     logger=logging.getLogger("dependency-retry-test"), delay=0,
                 )
-        await asyncio.sleep(0)  # let the restart task run
 
     with caplog.at_level(logging.ERROR):
         asyncio.run(twice())
     assert "connection to viam-server is stuck" in caplog.text
-    assert len(_no_real_restart) == 1  # once per process, not per failure
 
 
-def test_relayed_different_loop_does_not_restart_this_module(_no_real_restart):
+def test_relayed_different_loop_is_retried_once():
     relayed = Exception("rpc error: code = Unknown desc = RuntimeError - <Lock> is bound to a different event loop")
     call = _Calls(relayed, relayed)
     with pytest.raises(Exception):
         _run(call)
     assert call.count == 2
-    assert _no_real_restart == []
 
 
 @pytest.mark.parametrize(

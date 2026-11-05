@@ -18,12 +18,11 @@ arrive after the far side already did the work, and a retry would do it again.
 If the retry hits "different event loop" again, the connection is stuck: the
 lock stays bound to the other loop, so every later call that has to reconnect
 fails the same way. The Python SDK can't mark a module unhealthy, so we log
-at error and ask viam-server to restart this module (``RestartModule``, once
-per process) over a fresh connection, since the stuck one can't carry it.
+at error saying the module needs a restart. (We deliberately don't call
+``RestartModule`` on ourselves: that path is untested on a real viam-server.)
 """
 
 import asyncio
-import os
 from typing import Any, Awaitable, Callable, Mapping, Optional, Set, TypeVar
 
 T = TypeVar("T")
@@ -54,9 +53,6 @@ RETRY_SAFE_COMMANDS = frozenset(
         "focus_sweep_status",
     }
 )
-
-_restart_requested = False
-_background: Set["asyncio.Task[Any]"] = set()
 
 
 def command_names(command: Mapping[str, Any]) -> Set[str]:
@@ -117,50 +113,6 @@ async def call_with_retry(
                 f"{what} failed twice with '{DIFFERENT_LOOP}': this module's "
                 f"connection to viam-server is stuck and calls through it will "
                 f"keep failing until the module restarts (CONSULT-2298). "
-                f"Asking viam-server to restart this module."
+                f"Restart this module."
             )
-            _schedule_restart(logger)
         raise
-
-
-def _schedule_restart(logger: Any) -> None:
-    global _restart_requested
-    if _restart_requested:
-        return
-    _restart_requested = True
-    task = asyncio.get_running_loop().create_task(request_module_restart(logger))
-    _background.add(task)
-    task.add_done_callback(_background.discard)
-
-
-async def request_module_restart(logger: Any) -> bool:
-    """Ask viam-server to restart this module, over a new connection."""
-    name = os.environ.get("VIAM_MODULE_NAME")
-    try:
-        import viam.logging as vlog
-        from grpclib.client import Channel
-        from viam.proto.robot import RestartModuleRequest, RobotServiceStub
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"can't request a module restart ({exc}); restart it by hand")
-        return False
-    parent_channel = getattr(getattr(vlog, "_MODULE_PARENT", None), "_channel", None)
-    path = getattr(parent_channel, "_path", None)
-    host = getattr(parent_channel, "_host", None)
-    port = getattr(parent_channel, "_port", None)
-    if not name or not (path or (host and port)):
-        logger.error(
-            "can't request a module restart (no VIAM_MODULE_NAME or parent "
-            "address); restart this module by hand"
-        )
-        return False
-    channel = Channel(path=path) if path else Channel(host=host, port=port, ssl=None)
-    try:
-        await RobotServiceStub(channel).RestartModule(
-            RestartModuleRequest(module_name=name), timeout=10
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001 - the restart itself may cut the reply
-        logger.error(f"RestartModule for {name!r} returned {type(exc).__name__}: {exc}")
-        return False
-    finally:
-        channel.close()

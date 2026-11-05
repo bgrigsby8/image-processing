@@ -195,6 +195,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
     Any,
+    Awaitable,
     Callable,
     ClassVar,
     Dict,
@@ -228,6 +229,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
+from models import dependency_retry
 from models.calibration import (
     CCM_FIT_WEIGHTS,
     REFERENCE_SRGB,
@@ -577,10 +579,13 @@ class ColorCorrection(Camera, EasyResource):
         # camera's client can't accept - forwarding it made every GetImages
         # fail with "'MultiDict' object has no attribute 'proto'". Same rule
         # as do_command's passthrough.
-        images, metadata = await self.camera.get_images(
-            filter_source_names=filter_source_names,
-            extra=extra,
-            timeout=timeout,
+        images, metadata = await self._source_call(
+            "get_images",
+            lambda: self.camera.get_images(
+                filter_source_names=filter_source_names,
+                extra=extra,
+                timeout=timeout,
+            ),
         )
 
         corrected: List[NamedImage] = []
@@ -606,14 +611,19 @@ class ColorCorrection(Camera, EasyResource):
         **kwargs,
     ) -> Tuple[bytes, str]:
         # Color correction doesn't apply to point clouds; proxy the source.
-        return await self.camera.get_point_cloud(extra=extra, timeout=timeout)
+        return await self._source_call(
+            "get_point_cloud",
+            lambda: self.camera.get_point_cloud(extra=extra, timeout=timeout),
+        )
 
     async def get_properties(
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> Camera.Properties:
         # Report the source camera's properties; we don't change resolution,
         # mime types, or intrinsics.
-        return await self.camera.get_properties(timeout=timeout)
+        return await self._source_call(
+            "get_properties", lambda: self.camera.get_properties(timeout=timeout)
+        )
 
     async def do_command(
         self,
@@ -679,11 +689,31 @@ class ColorCorrection(Camera, EasyResource):
             # command and timeout are forwarded: kwargs holds server-side
             # call context (grpc metadata) that a client call can't accept.
             # Focus moves are noted on the way through for the focus check.
+            # Short, repeatable commands (set_zoom, get_status, ...) get one
+            # retry on a parent-connection error; the rest go exactly once.
             try:
-                return await self.camera.do_command(command, timeout=timeout)
+                return await self._source_call(
+                    "do_command " + ",".join(sorted(dependency_retry.command_names(command))),
+                    lambda: self.camera.do_command(command, timeout=timeout),
+                    retry=dependency_retry.is_retry_safe(command),
+                )
             finally:
                 self._note_focus_command(command)
         return resp
+
+    async def _source_call(
+        self,
+        what: str,
+        call: Callable[[], Awaitable[Any]],
+        retry: bool = True,
+    ) -> Any:
+        """A call to the source camera over the module's parent connection,
+        retried once if that connection drops or its reconnect trips over the
+        SDK's logging loop (CONSULT-2296/2298). Only for short calls that are
+        safe to repeat; see models/dependency_retry.py."""
+        return await dependency_retry.call_with_retry(
+            call, what=f"source camera {what}", logger=self.logger, retry=retry
+        )
 
     # ------------------------------------------------------------------
     # DoCommand handlers
@@ -815,7 +845,9 @@ class ColorCorrection(Camera, EasyResource):
                 "(no RAW `saved_to`, file `path`, or inline `image_base64`)"
             )
 
-        images, _ = await self.camera.get_images(timeout=timeout)
+        images, _ = await self._source_call(
+            "get_images", lambda: self.camera.get_images(timeout=timeout)
+        )
         for image in images:
             if image.mime_type in (CameraMimeType.JPEG, CameraMimeType.PNG):
                 return None, np.array(viam_to_pil_image(image).convert("RGB"))
@@ -1968,7 +2000,10 @@ class ColorCorrection(Camera, EasyResource):
         ptp model does not). Caches the last good answer; a failure leaves the
         cache alone and returns it."""
         try:
-            resp = await self.camera.do_command({"get_status": {}}, timeout=timeout)
+            resp = await self._source_call(
+                "get_status",
+                lambda: self.camera.do_command({"get_status": {}}, timeout=timeout),
+            )
         except Exception as exc:  # noqa: BLE001 - optional metadata
             self.logger.debug(f"source camera get_status unavailable: {exc}")
             return self._source_status
@@ -2008,7 +2043,10 @@ class ColorCorrection(Camera, EasyResource):
         if fmt:
             return fmt
         try:
-            resp = await self.camera.do_command({"get_settings": {}}, timeout=timeout)
+            resp = await self._source_call(
+                "get_settings",
+                lambda: self.camera.do_command({"get_settings": {}}, timeout=timeout),
+            )
         except Exception as exc:  # noqa: BLE001 - optional metadata
             self.logger.debug(
                 f"source camera get_settings unavailable; file_format not checked: {exc}"
@@ -2629,7 +2667,10 @@ class ColorCorrection(Camera, EasyResource):
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
     ) -> Sequence[Geometry]:
-        return await self.camera.get_geometries(extra=extra, timeout=timeout)
+        return await self._source_call(
+            "get_geometries",
+            lambda: self.camera.get_geometries(extra=extra, timeout=timeout),
+        )
 
     async def close(self):
         job = getattr(self, "_focus_sweep", None)

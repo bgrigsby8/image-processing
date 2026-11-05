@@ -209,6 +209,8 @@ import numpy as np
 from PIL import Image
 from typing_extensions import Self
 
+from grpclib.const import Status as GRPCStatus
+from grpclib.exceptions import GRPCError, StreamTerminatedError
 from viam.app.data_client import DataClient
 from viam.components.camera import Camera
 from viam.media.utils.pil import pil_to_viam_image, viam_to_pil_image
@@ -291,6 +293,23 @@ DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
 # 16-bit TIFF (~250 MB). The FileUpload RPC is client-streaming, so we send
 # the file ourselves in chunks safely under that cap.
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# Waits (seconds) between tries of one file's upload when it fails with an
+# error that may go away on its own (CONSULT-2300: app.viam.com's proxy
+# occasionally answers one stream with a 503 / "reset before headers", which
+# gRPC reports as UNAVAILABLE, while the next request on the same channel is
+# fine). len + 1 tries in total; the DataClient is redialed before the last.
+UPLOAD_RETRY_BACKOFF_S = (2.0, 5.0)
+
+def _is_transient_upload_error(exc: BaseException) -> bool:
+    """True for upload errors worth retrying: the cloud (or its proxy) said
+    UNAVAILABLE, or the stream / connection was reset mid-request. Timeouts,
+    missing files and every other gRPC status (INVALID_ARGUMENT, ...) are not:
+    retrying them would only repeat the same failure or stall the submit."""
+    if isinstance(exc, GRPCError):
+        return exc.status == GRPCStatus.UNAVAILABLE
+    return isinstance(exc, (StreamTerminatedError, ConnectionResetError))
+
 
 # ---------------------------------------------------------------------------
 # Image <-> base64 / PIL helpers (used on the DoCommand boundary)
@@ -2152,6 +2171,10 @@ class ColorCorrection(Camera, EasyResource):
           ``delete_after_upload`` override the config attribute: remove each
                                   local file once its upload succeeds (failed
                                   uploads keep their files for retry)
+
+        A file whose upload fails with UNAVAILABLE or a reset stream is tried
+        again (``UPLOAD_RETRY_BACKOFF_S``) before it is reported; each
+        ``failed`` entry is ``{"path", "error", "attempts"}``.
         """
         raw_paths = opts.get("paths") or []
         if not raw_paths:
@@ -2182,33 +2205,56 @@ class ColorCorrection(Camera, EasyResource):
         data_client = await self._get_data_client()
 
         uploaded: List[str] = []
-        failed: List[Dict[str, str]] = []
+        failed: List[Dict[str, Any]] = []
+        max_attempts = len(UPLOAD_RETRY_BACKOFF_S) + 1
         for i, path in enumerate(paths):
+            attempt = 0
             try:
                 size = os.path.getsize(path)
-                self.logger.info(
-                    f"uploading {os.path.basename(path)} ({size / 1e6:.1f} MB) "
-                    f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
-                )
-                t_upload = time.perf_counter()
                 file_name = (
                     self._renamed_basename(path, name, capture_stem)
                     if name else None
                 )
-                await asyncio.wait_for(
-                    self._file_upload_chunked(
-                        data_client,
-                        path,
-                        part_id=str(part_id),
-                        component_name=str(component_name),
-                        tags=tags or None,
-                        file_name=file_name,
-                    ),
-                    timeout=self._upload_file_timeout_s,
-                )
+                while True:
+                    attempt += 1
+                    self.logger.info(
+                        f"uploading {os.path.basename(path)} ({size / 1e6:.1f} MB) "
+                        f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
+                        + (f" (try {attempt}/{max_attempts})" if attempt > 1 else "")
+                    )
+                    t_upload = time.perf_counter()
+                    try:
+                        # Each try gets its own per-file deadline.
+                        await asyncio.wait_for(
+                            self._file_upload_chunked(
+                                data_client,
+                                path,
+                                part_id=str(part_id),
+                                component_name=str(component_name),
+                                tags=tags or None,
+                                file_name=file_name,
+                            ),
+                            timeout=self._upload_file_timeout_s,
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001 - classified below
+                        if attempt >= max_attempts or not _is_transient_upload_error(exc):
+                            raise
+                        wait_s = UPLOAD_RETRY_BACKOFF_S[attempt - 1]
+                        self.logger.warning(
+                            f"upload of {os.path.basename(path)} failed on try "
+                            f"{attempt}/{max_attempts} ({exc}); retrying in {wait_s:.0f}s"
+                        )
+                        await asyncio.sleep(wait_s)
+                        if attempt + 1 == max_attempts:
+                            # Last try: in case the channel itself is broken,
+                            # redial app.viam.com rather than reuse it.
+                            self._close_data_client()
+                            data_client = await self._get_data_client()
                 self.logger.info(
                     f"[timing] uploaded {os.path.basename(path)} "
                     f"({size / 1e6:.1f} MB) in {time.perf_counter() - t_upload:.2f}s"
+                    + (f" on try {attempt}/{max_attempts}" if attempt > 1 else "")
                 )
                 uploaded.append(path)
             except asyncio.TimeoutError:
@@ -2218,16 +2264,19 @@ class ColorCorrection(Camera, EasyResource):
                     f"upload timed out after {self._upload_file_timeout_s:.0f}s"
                 )
                 self.logger.error(f"failed to upload {path}: {msg}")
-                failed.append({"path": path, "error": msg})
+                failed.append({"path": path, "error": msg, "attempts": max(attempt, 1)})
             except FileNotFoundError:
                 # Gone before we got to it: say who is likely to have taken it
                 # rather than echoing a bare "No such file".
                 msg = str(self._missing_file_error(path))
                 self.logger.error(f"failed to upload {path}: {msg}")
-                failed.append({"path": path, "error": msg})
+                failed.append({"path": path, "error": msg, "attempts": max(attempt, 1)})
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
-                self.logger.error(f"failed to upload {path}: {exc}")
-                failed.append({"path": path, "error": str(exc)})
+                self.logger.error(
+                    f"failed to upload {path} after {attempt} tr"
+                    f"{'y' if attempt == 1 else 'ies'}: {exc}"
+                )
+                failed.append({"path": path, "error": str(exc), "attempts": max(attempt, 1)})
 
         deleted: List[str] = []
         if delete_after:

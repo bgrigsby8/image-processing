@@ -388,6 +388,8 @@ import os
 
 from PIL import Image
 
+from grpclib.exceptions import StreamTerminatedError
+
 from models.color_correction import ColorCorrection, SourceFormatMismatch
 
 
@@ -591,6 +593,76 @@ def test_do_command_passthrough_surfaces_source_rejection():
     with pytest.raises(ValueError, match="no recognized command"):
         asyncio.run(cc.do_command({"definitely_not_a_command": {}}))
     assert source.commands == [{"definitely_not_a_command": {}}]
+
+
+class _FlakySource:
+    """A source whose first `fail` calls die the way calls over a broken
+    parent connection do (CONSULT-2296/2298), then answer."""
+
+    def __init__(self, error, fail=1):
+        self.error = error
+        self.fail = fail
+        self.commands = []
+
+    async def do_command(self, command, *, timeout=None):
+        self.commands.append(command)
+        if len(self.commands) <= self.fail:
+            raise self.error
+        return {"ok": True}
+
+    async def get_images(self, *, filter_source_names=None, extra=None, timeout=None):
+        self.commands.append("get_images")
+        if len(self.commands) <= self.fail:
+            raise self.error
+        return [], "metadata"
+
+
+_DIFFERENT_LOOP = RuntimeError(
+    "<asyncio.locks.Lock object at 0x71a749bbaba0 [locked]> is bound to a different event loop"
+)
+
+
+@pytest.fixture
+def _no_retry_delay(monkeypatch):
+    from models import dependency_retry
+
+    monkeypatch.setattr(dependency_retry, "RETRY_DELAY_S", 0)
+
+
+@pytest.mark.parametrize("error", [_DIFFERENT_LOOP, StreamTerminatedError("Connection lost")])
+def test_passthrough_set_zoom_is_retried_once_on_parent_connection_error(error, _no_retry_delay):
+    source = _FlakySource(error)
+    cc = _component(source)
+    resp = asyncio.run(cc.do_command({"set_zoom": {"focal_length_mm": 50}}))
+    assert resp == {"ok": True}
+    assert source.commands == [{"set_zoom": {"focal_length_mm": 50}}] * 2
+
+
+def test_passthrough_retries_only_once(_no_retry_delay):
+    source = _FlakySource(StreamTerminatedError("Connection lost"), fail=2)
+    cc = _component(source)
+    with pytest.raises(StreamTerminatedError):
+        asyncio.run(cc.do_command({"get_status": {}}))
+    assert len(source.commands) == 2
+
+
+@pytest.mark.parametrize("command", [{"trigger": {}}, {"focus_near_far": {"step": 2}}])
+def test_passthrough_does_not_retry_commands_unsafe_to_repeat(command, _no_retry_delay):
+    """A relative nudge or a shutter release may already have happened when
+    the connection dropped; running it again would do it twice."""
+    source = _FlakySource(StreamTerminatedError("Connection lost"))
+    cc = _component(source)
+    with pytest.raises(StreamTerminatedError):
+        asyncio.run(cc.do_command(command))
+    assert source.commands == [command]
+
+
+def test_get_images_is_retried_once_on_parent_connection_error(_no_retry_delay):
+    source = _FlakySource(_DIFFERENT_LOOP)
+    cc = _component(source)
+    images, metadata = asyncio.run(cc.get_images())
+    assert (images, metadata) == ([], "metadata")
+    assert source.commands == ["get_images", "get_images"]
 
 
 def test_preview_only_capture_skips_exports(tmp_path):

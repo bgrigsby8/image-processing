@@ -130,3 +130,87 @@ def test_calibrate_color_reports_chart_sharpness(sharp_chart, monkeypatch):
         "compute_wb": False, "radius": 10, "measure_sharpness": False,
     }}))["calibrate_color"]
     assert "sharpness" not in skipped
+
+
+# --- calibration shot upload ------------------------------------------------
+
+def _calibrating_component(sharp_chart, monkeypatch, *, upload_raises=None):
+    """A component whose source "shoots" /photos/chart.ARW, with `_upload`
+    replaced by a recorder."""
+    import models.color_correction as cc_mod
+
+    linear, _ = sharp_chart
+    monkeypatch.setattr(cc_mod, "load_linear_rgb", lambda path, **kw: linear)
+    monkeypatch.setattr(cc_mod, "render_raw_for_detection",
+                        lambda path: (linear_to_srgb(linear) * 255).astype(np.uint8))
+    cc = _component(_FakeSource(saved_path="/photos/chart.ARW"))
+    cc._upload_calibration_shots = True
+    uploads = []
+
+    async def fake_upload(opts):
+        uploads.append(opts)
+        if upload_raises:
+            raise upload_raises
+        return {"uploaded": opts["paths"], "count": 1, "failed": [], "deleted": []}
+
+    cc._upload = fake_upload
+    return cc, uploads
+
+
+def _calibrate(cc, opts):
+    async def run():
+        try:
+            return (await cc.do_command({"calibrate_color": opts}))["calibrate_color"]
+        finally:
+            if cc._calibration_uploads:
+                await asyncio.gather(*cc._calibration_uploads)
+    return asyncio.run(run())
+
+
+def _capture_opts(centers, **extra):
+    return {"use_capture": True, "patch_centers": centers.tolist(),
+            "compute_wb": False, "radius": 10, "measure_sharpness": False, **extra}
+
+
+def test_calibration_shot_is_uploaded(sharp_chart, monkeypatch):
+    cc, uploads = _calibrating_component(sharp_chart, monkeypatch)
+    out = _calibrate(cc, _capture_opts(sharp_chart[1], upload={"tags": ["laneige"]}))
+    assert out["shot_path"] == "/photos/chart.ARW"
+    assert out["shot_upload"] == "started"
+    assert uploads == [{"paths": ["/photos/chart.ARW"], "tags": ["calibration", "laneige"]}]
+
+
+def test_calibration_shot_upload_can_be_turned_off(sharp_chart, monkeypatch):
+    cc, uploads = _calibrating_component(sharp_chart, monkeypatch)
+    out = _calibrate(cc, _capture_opts(sharp_chart[1], upload=False))
+    assert out["shot_upload"] == "off" and uploads == []
+
+    cc._upload_calibration_shots = False
+    assert _calibrate(cc, _capture_opts(sharp_chart[1]))["shot_upload"] == "off"
+    assert uploads == []
+
+
+def test_failed_calibration_still_uploads_its_shot(sharp_chart, monkeypatch):
+    import models.color_correction as cc_mod
+
+    cc, uploads = _calibrating_component(sharp_chart, monkeypatch)
+    monkeypatch.setattr(cc_mod, "detect_colorchecker", lambda img: None)
+    opts = {"use_capture": True, "compute_wb": False, "measure_sharpness": False}
+    with pytest.raises(ValueError, match="could not auto-detect"):
+        _calibrate(cc, opts)
+    assert uploads[0]["tags"] == ["calibration", "calibration-failed"]
+
+
+def test_upload_error_does_not_fail_calibration(sharp_chart, monkeypatch):
+    cc, uploads = _calibrating_component(
+        sharp_chart, monkeypatch, upload_raises=RuntimeError("no part id"))
+    out = _calibrate(cc, _capture_opts(sharp_chart[1]))
+    assert out["shot_upload"] == "started" and "ccm" in out and len(uploads) == 1
+
+
+def test_calibrating_from_a_file_on_disk_uploads_nothing(sharp_chart, monkeypatch):
+    cc, uploads = _calibrating_component(sharp_chart, monkeypatch)
+    opts = _capture_opts(sharp_chart[1])
+    del opts["use_capture"]
+    out = _calibrate(cc, {**opts, "path": "/photos/chart.ARW"})
+    assert "shot_path" not in out and uploads == []

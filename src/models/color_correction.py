@@ -72,7 +72,9 @@ Two ways to get corrected images out of this component:
    ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
    since RAW is soft before sharpening), ``demosaic`` ("DHT" - RAW demosaic
    algorithm, sharper than libraw's stock AHD), ``write_sidecar`` (true),
-   and ``delete_after_upload`` (false).
+   ``delete_after_upload`` (false), and ``upload_calibration_shots`` (true:
+   ``calibrate_color`` with ``use_capture`` uploads its chart frame to Viam,
+   tagged ``calibration``).
 
    ``capture``, ``develop``, and ``preview`` also take a per-call ``ccm``
    option — a 3x3 nested list applied instead of the configured matrix for
@@ -530,6 +532,13 @@ class ColorCorrection(Camera, EasyResource):
         # that fail to upload are kept for retry.
         self._delete_after_upload: bool = bool(attrs.get("delete_after_upload", False))
 
+        # The chart frame `calibrate_color` shoots with `use_capture` is the
+        # only record of what a calibration measured; without this it sat in
+        # the source camera's capture directory until retention deleted it.
+        self._upload_calibration_shots: bool = bool(
+            attrs.get("upload_calibration_shots", True)
+        )
+
         # The `upload` DoCommand authenticates to the cloud with the API key
         # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
         # so no credentials are configured here. part_id falls back to the
@@ -565,6 +574,11 @@ class ColorCorrection(Camera, EasyResource):
             self, "_pending_captures", {}
         )
         self._capture_seq: int = getattr(self, "_capture_seq", 0)
+        # Background uploads of calibration shots: held so the tasks aren't
+        # garbage-collected mid-flight, and preserved across reconfigure.
+        self._calibration_uploads: "set[asyncio.Task]" = getattr(
+            self, "_calibration_uploads", set()
+        )
 
         # The running (or last) `focus_sweep` job: {id, task, sweeper,
         # started_at}. Preserved across reconfigure like pending captures -
@@ -837,13 +851,17 @@ class ColorCorrection(Camera, EasyResource):
 
     async def _acquire_calibration_source(
         self, opts: Mapping[str, Any], timeout: Optional[float]
-    ) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[str], Optional[np.ndarray], Optional[str]]:
         """
-        Get the source to calibrate from, as ``(raw_path, rgb8)``.
+        Get the source to calibrate from, as ``(raw_path, rgb8, shot_path)``.
 
         ``raw_path`` is set when a RAW file is on disk - the path that unlocks
         raw-CFA white balance. Otherwise ``rgb8`` is an 8-bit sRGB frame for
-        CCM-only calibration. Exactly one is non-None.
+        CCM-only calibration. Exactly one of the two is non-None.
+
+        ``shot_path`` is the file this call had the source camera shoot
+        (``use_capture``), so the caller can archive it; None when nothing was
+        shot or the still came back inline.
 
         Resolution order: explicit ``path`` -> ``use_capture`` (trigger a still
         on the source, prefer its ``saved_to`` RAW) -> the streaming frame.
@@ -857,8 +875,8 @@ class ColorCorrection(Camera, EasyResource):
         path = opts.get("path")
         if path:
             if is_raw(str(path)):
-                return str(path), None
-            return None, _file_to_rgb8(str(path))
+                return str(path), None, None
+            return None, _file_to_rgb8(str(path)), None
 
         if opts.get("use_capture"):
             capture_opts = opts.get("capture_options", {"af": True})
@@ -873,12 +891,12 @@ class ColorCorrection(Camera, EasyResource):
                         str(p), await self._source_file_format(capture, timeout)
                     )
                 if p and is_raw(str(p)):
-                    return str(p), None
+                    return str(p), None, str(p)
                 if p:
-                    return None, _file_to_rgb8(str(p))
+                    return None, _file_to_rgb8(str(p)), str(p)
                 b64 = capture.get("image_base64")
                 if b64:
-                    return None, _base64_to_rgb(b64)
+                    return None, _base64_to_rgb(b64), None
             raise ValueError(
                 "source `capture` returned nothing usable for calibration "
                 "(no RAW `saved_to`, file `path`, or inline `image_base64`)"
@@ -889,7 +907,7 @@ class ColorCorrection(Camera, EasyResource):
         )
         for image in images:
             if image.mime_type in (CameraMimeType.JPEG, CameraMimeType.PNG):
-                return None, np.array(viam_to_pil_image(image).convert("RGB"))
+                return None, np.array(viam_to_pil_image(image).convert("RGB")), None
         raise ValueError("source camera returned no JPEG/PNG image to use")
 
     async def _calibrate_color(
@@ -913,6 +931,15 @@ class ColorCorrection(Camera, EasyResource):
                              the detected patch size, or 10 with manual centers).
           ``measure_sharpness`` false to skip the focus measurement (default
                              true; RAW sources only).
+          ``upload``         archive the chart frame a ``use_capture`` call
+                             shot to Viam, in the background (default: the
+                             ``upload_calibration_shots`` config attribute,
+                             true). ``false`` skips it; an object is passed
+                             to ``upload`` (e.g. extra ``tags``, ``name``,
+                             ``delete_after_upload``). Files are tagged
+                             ``calibration``, plus ``calibration-failed``
+                             when the fit raised. Upload problems are logged
+                             and never fail the calibration.
 
         Returns ``ccm`` (pure-colour, ~unity-gain), ``white_balance``
         ([r,g,b,g2] or null), ``exposure_stops`` (the brightness offset the chart
@@ -930,8 +957,68 @@ class ColorCorrection(Camera, EasyResource):
         ``sharpness``: slanted-edge MTF50 on the patch edges (sharpness.py's
         ColorChecker mode) with the RAW's own focus byte, so every
         calibration also records how well the chart plane was in focus.
+        A ``use_capture`` call also returns ``shot_path`` (the chart frame on
+        disk) and ``shot_upload`` ("started" or "off").
         """
-        raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
+        raw_path, rgb8, shot_path = await self._acquire_calibration_source(opts, timeout)
+        upload_opts = self._calibration_upload_opts(opts) if shot_path else None
+        try:
+            result = self._fit_calibration(raw_path, rgb8, opts)
+        except Exception:
+            if upload_opts is not None:
+                self._start_calibration_upload(shot_path, upload_opts, failed=True)
+            raise
+        if shot_path:
+            result["shot_path"] = shot_path
+            result["shot_upload"] = "off"
+            if upload_opts is not None:
+                self._start_calibration_upload(shot_path, upload_opts, failed=False)
+                result["shot_upload"] = "started"
+        return result
+
+    def _calibration_upload_opts(
+        self, opts: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The ``upload`` options for a calibration shot, or None to skip it."""
+        want = opts.get("upload", self._upload_calibration_shots)
+        if isinstance(want, Mapping):
+            return dict(want)
+        return {} if want else None
+
+    def _start_calibration_upload(
+        self, path: str, upload_opts: Dict[str, Any], failed: bool
+    ) -> None:
+        """Upload a calibration shot without holding up the calibration: the
+        operator is waiting on the result, the archive copy can trail it."""
+        tags = ["calibration"] + (["calibration-failed"] if failed else [])
+        tags += [str(t) for t in (upload_opts.get("tags") or []) if str(t) not in tags]
+        upload_opts = {**upload_opts, "paths": [path], "tags": tags}
+
+        async def _run() -> None:
+            try:
+                out = await self._upload(upload_opts)
+            except Exception as exc:  # noqa: BLE001 - archival must not fail the caller
+                self.logger.error(f"calibration shot {path} was not uploaded: {exc}")
+                return
+            if out.get("failed"):
+                self.logger.error(
+                    f"calibration shot {path} was not uploaded: {out['failed']}"
+                )
+            else:
+                self.logger.info(f"calibration shot {path} uploaded (tags {tags})")
+
+        task = asyncio.get_running_loop().create_task(_run())
+        self._calibration_uploads.add(task)
+        task.add_done_callback(self._calibration_uploads.discard)
+
+    def _fit_calibration(
+        self,
+        raw_path: Optional[str],
+        rgb8: Optional[np.ndarray],
+        opts: Mapping[str, Any],
+    ) -> Dict[str, ValueTypes]:
+        """The measurement half of ``calibrate_color``: detect the chart in
+        the acquired frame, measure white balance, and fit the CCM."""
         compute_wb = bool(opts.get("compute_wb", True))
         radius = int(opts["radius"]) if "radius" in opts else None
         manual_centers = opts.get("patch_centers")
@@ -2773,4 +2860,10 @@ class ColorCorrection(Camera, EasyResource):
             # manifest written); give it a moment to finish that.
             job["task"].cancel()
             await asyncio.wait({job["task"]}, timeout=30)
+        uploads = set(getattr(self, "_calibration_uploads", ()))
+        if uploads:
+            # Let an in-flight calibration-shot upload finish before the data
+            # client goes; past the per-file timeout it is abandoned (the file
+            # stays on disk).
+            await asyncio.wait(uploads, timeout=self._upload_file_timeout_s)
         self._close_data_client()

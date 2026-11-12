@@ -69,6 +69,7 @@ installs those automatically on Debian/Ubuntu.
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
+| `upload_calibration_shots` | boolean | Optional  | Upload the chart frame `calibrate_color` shoots with `use_capture` to Viam, tagged `calibration` (plus `calibration-failed` when the fit failed). Runs in the background after the result returns; follows `delete_after_upload`. Default `true`. |
 | `upload_dial_timeout_s` | number | Optional  | Deadline for authenticating to app.viam.com on the first `upload`. Default `30`. |
 | `upload_file_timeout_s` | number | Optional  | Per-file deadline for an `upload` transfer (a stalled file fails on its own rather than wedging the submit). Default `180`. |
 | `distortion_calibration` | string | Optional | Path of a lens distortion + lateral CA calibration JSON from `scripts/calibrate_distortion.py` (see the [module README](README.md#lens-distortion-calibration) and [`calibration/README.md`](calibration/README.md)). Every full-size `develop`/`capture` is undistorted right after the demosaic, before the EXIF rotation, WB, CCM, and export. A configured file that is missing or invalid is a configuration error. Absent: the pipeline is unchanged. |
@@ -115,7 +116,9 @@ Options: `use_capture` (bool), `capture_options` (object forwarded to the source
 capture, default `{"af": true}`), `white_balance` (used when developing the RAW
 for calibration), `patch_centers` (24 `[x, y]` pixel coords in ColorChecker
 order — use this when the chart does not fill the frame), `radius` (int, patch
-sampling radius).
+sampling radius), `upload` (`false` to skip archiving the chart frame, or an
+object of `upload` options such as extra `tags`; default
+`upload_calibration_shots`).
 
 Returns the fitted `ccm`, the measured `white_balance`, and `exposure_stops` —
 copy all three into the matching config attributes to persist the calibration.
